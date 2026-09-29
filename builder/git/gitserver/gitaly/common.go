@@ -1,0 +1,36 @@
+package gitaly
+
+import (
+	"context"
+	"fmt"
+
+	"opencsg.com/csghub-server/common/types"
+	"opencsg.com/csghub-server/common/utils/common"
+)
+
+// resolveRelativePath uses a caller-provided Gitaly path and falls back to repository metadata lookup.
+func (c *Client) resolveRelativePath(
+	ctx context.Context,
+	relativePath string,
+	repoType types.RepositoryType,
+	namespace, name string,
+) (string, error) {
+	if relativePath != "" {
+		return relativePath, nil
+	}
+	return c.BuildRelativePath(ctx, repoType, namespace, name)
+}
+
+func (c *Client) BuildRelativePath(ctx context.Context, repoType types.RepositoryType, namespace, name string) (string, error) {
+	if repoType != types.RepositoryType(c.config.RepoTemplate.EmptyRepoType) {
+		repo, err := c.repoStore.FindByPath(ctx, repoType, namespace, name)
+		if err != nil {
+			return "", fmt.Errorf("failed to find repository: %w", err)
+		}
+		if repo.Hashed {
+			return common.BuildHashedRelativePath(repo.ID), nil
+		}
+	}
+	repoTypeS := fmt.Sprintf("%ss", string(repoType))
+	return common.BuildRelativePath(repoTypeS, namespace, name) + ".git", nil
+}

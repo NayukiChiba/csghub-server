@@ -1,0 +1,29 @@
+{
+    "error.REPO-ERR-0": {
+        "other": "A repository with the same name already exists."
+    },
+    "error.REPO-ERR-1": {
+        "other": "The repository name is invalid."
+    },
+    "error.REPO-ERR-2": {
+        "other": "The namespace does not exist."
+    },
+    "error.REPO-ERR-3": {
+        "other": "Repository not found"
+    },
+    "error.REPO-ERR-4": {
+        "other": "No revision specified. Please specify a revision."
+    },
+    "error.REPO-ERR-5": {
+        "other": "Failed to download code zip archive"
+    },
+    "error.REPO-ERR-6": {
+        "other": "Failed to batch get repository extra information"
+    },
+    "error.REPO-ERR-7": {
+        "other": "Cannot change repository path because the following dependent entities exist: {{.entity}}. Please remove them first."
+    },
+    "error.REPO-ERR-8": {
+        "other": "Compliance scan not passed, cannot make repository public."
+    }
+}

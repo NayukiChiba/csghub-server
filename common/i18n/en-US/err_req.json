@@ -1,0 +1,50 @@
+{
+    "error.REQ-ERR-0": {
+        "other": "Bad request"
+    },
+    "error.REQ-ERR-1": {
+        "other": "Invalid request body format"
+    },
+    "error.REQ-ERR-10": {
+        "other": "Too many requests, captcha is required"
+    },
+    "error.REQ-ERR-11": {
+        "other": "Requests from this IP location are restricted, captcha is required"
+    },
+    "error.REQ-ERR-12": {
+        "other": "Captcha verification failed"
+    },
+    "error.REQ-ERR-13": {
+        "other": "Target namespace not found"
+    },
+    "error.REQ-ERR-14": {
+        "other": "New namespace must be different from current namespace"
+    },
+    "error.REQ-ERR-15": {
+        "other": "A repository with the same name already exists in the target namespace"
+    },
+    "error.REQ-ERR-16": {
+        "other": "Repository not supported to transfer ownership"
+    },
+    "error.REQ-ERR-17": {
+        "other": "The upstream API does not support connection testing"
+    },
+    "error.REQ-ERR-18": {
+        "other": "The upstream API does not support health checks"
+    },
+    "error.REQ-ERR-2": {
+        "other": "Request body cannot be empty"
+    },
+    "error.REQ-ERR-3": {
+        "other": "Request body too large"
+    },
+    "error.REQ-ERR-5": {
+        "other": "Duplicate request parameter"
+    },
+    "error.REQ-ERR-6": {
+        "other": "Invalid request parameter"
+    },
+    "error.REQ-ERR-9": {
+        "other": "Unsupported content type"
+    }
+}

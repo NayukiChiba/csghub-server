@@ -1,0 +1,1342 @@
+package deploy
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"opencsg.com/csghub-server/builder/deploy/common"
+	"opencsg.com/csghub-server/builder/loki"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/types"
+	hubcom "opencsg.com/csghub-server/common/utils/common"
+	runnerTypes "opencsg.com/csghub-server/runner/types"
+)
+
+type DeployWorkflowFunc func(buildTask, runTask *database.DeployTask)
+
+var DeployWorkflow DeployWorkflowFunc
+
+type DeployRunningCallbackFunc func(ctx context.Context, deploy *database.Deploy, sourceDeployTaskID int64) error
+
+var DeployRunningCallback DeployRunningCallbackFunc
+
+type LaunchDeployBenchmarkFunc func(ctx context.Context, req types.DeployBenchmarkLaunchReq) (*types.DeployBenchmarkTriggerResp, error)
+
+var LaunchDeployBenchmark LaunchDeployBenchmarkFunc
+
+type Deployer interface {
+	SandboxV2Deployer
+	Deploy(ctx context.Context, dr types.DeployRequest) (deployID int64, err error)
+	Status(ctx context.Context, dr types.DeployRequest, needDetails bool) (srvName string, status int, instances []types.Instance, err error)
+	Logs(ctx context.Context, dr types.DeployRequest) (*MultiLogReader, error)
+	Stop(ctx context.Context, dr types.DeployRequest) (err error)
+	StopBuild(ctx context.Context, req types.ImageBuildStopReq) (err error)
+	Purge(ctx context.Context, dr types.DeployRequest) (err error)
+	Wakeup(ctx context.Context, dr types.DeployRequest) (err error)
+	Exist(ctx context.Context, dr types.DeployRequest) (bool, error)
+	GetReplica(ctx context.Context, dr types.DeployRequest) (int, int, []types.Instance, error)
+	InstanceLogs(ctx context.Context, dr types.DeployRequest) (*MultiLogReader, error)
+	InstanceLastLogs(ctx context.Context, dr types.DeployRequest) (*loki.LokiQueryResponse, error)
+	ListCluster(ctx context.Context) ([]types.ClusterRes, error)
+	GetClusterById(ctx context.Context, clusterId string) (*types.ClusterRes, error)
+	UpdateCluster(ctx context.Context, data types.ClusterRequest) (*types.UpdateClusterResponse, error)
+	UpdateDeploy(ctx context.Context, dur *types.DeployUpdateReq, deploy *database.Deploy) error
+	StartDeploy(ctx context.Context, deploy *database.Deploy) error
+	CheckResourceAvailable(ctx context.Context, clusterId string, orderDetailID int64, hardWare *types.HardWare) (bool, []types.ResourceAvailableStatus, error)
+	SubmitEvaluation(ctx context.Context, req types.EvaluationReq) (*types.ArgoWorkFlowRes, error)
+	SubmitClawEvaluation(ctx context.Context, req types.ClawEvaluationReq) (*types.ArgoWorkFlowRes, error)
+	DeleteEvaluation(ctx context.Context, req types.ArgoWorkFlowDeleteReq) error
+	GetEvaluation(ctx context.Context, req types.EvaluationGetReq) (*types.ArgoWorkFlowRes, error)
+	CheckHeartbeatTimeout(ctx context.Context, clusterId string) (bool, error)
+	SubmitFinetuneJob(ctx context.Context, req types.FinetuneReq) (*types.ArgoWorkFlowRes, error)
+	DeleteFinetuneJob(ctx context.Context, req types.ArgoWorkFlowDeleteReq) error
+	GetWorkflowLogsInStream(ctx context.Context, req types.WorkflowLogReq, labels map[string]string) (*MultiLogReader, error)
+	GetWorkflowLogsNonStream(ctx context.Context, req types.WorkflowLogReq, labels map[string]string) (*loki.LokiQueryResponse, error)
+	IsDefaultScheduler(VXPUConfig map[string]string) bool
+	GetSharedModeResourceName(VXPUConfig map[string]string) string
+	LabelNode(ctx context.Context, req *types.NodeLabel) error
+	CreateDataflowJob(ctx context.Context, req *types.DataflowArgoJobReq) (*types.DataflowArgoJobResp, error)
+	DeleteDataflowJob(ctx context.Context, req *types.DataflowArgoReq) error
+	DeleteSandbox(ctx context.Context, req *runnerTypes.SandboxDeleteRequest) error
+	GetWorkFlow(ctx context.Context, req types.ArgoWorkFlowDeleteReq) (*types.ArgoWorkFlowRes, error)
+	GetSandbox(ctx context.Context, clusterID, sandboxName string) (*runnerTypes.SandboxDetail, error)
+	BatchStatus(ctx context.Context, req *runnerTypes.BatchStatusRequest) (*runnerTypes.BatchStatusResponse, error)
+	CheckClusterHealthy(ctx context.Context, clusterId string) (bool, error)
+}
+
+func (d *deployer) generateUniqueSvcName(dr types.DeployRequest) string {
+	uniqueSvcName := ""
+	switch dr.Type {
+	case types.SpaceType:
+		// space
+		fields := strings.Split(dr.Path, "/")
+		uniqueSvcName = common.UniqueSpaceAppName("u", fields[0], fields[1], dr.SpaceID)
+	case types.ServerlessType:
+		// model serverless
+		fields := strings.Split(dr.Path, "/")
+		uniqueSvcName = common.UniqueSpaceAppName("s", fields[0], fields[1], dr.RepoID)
+	case types.SandboxType, types.SandboxEphemeralType:
+		// sandbox: persistent keeps the caller-provided svc_name; ephemeral leaves it empty
+		// and lets the runner generate the name (backfilled after creation).
+		uniqueSvcName = dr.SvcName
+	default:
+		// model inference
+		// generate unique service name from uuid when create new deploy by snowflake
+		uniqueSvcName = d.snowflakeNode.Generate().Base36()
+	}
+	return uniqueSvcName
+}
+
+func (d *deployer) serverlessDeploy(ctx context.Context, dr types.DeployRequest) (*database.Deploy, error) {
+	var (
+		deploy *database.Deploy
+		err    error
+	)
+	slog.Debug("do deployer.serverlessDeploy check type", slog.Any("dr.Type", dr.Type))
+	if dr.Type == types.SpaceType {
+		deploy, err = d.deployTaskStore.GetLatestDeployBySpaceID(ctx, dr.SpaceID)
+	} else if types.IsSandboxType(dr.Type) {
+		deploy, err = d.deployTaskStore.FindByDeployNameAndType(ctx, dr.UserUUID, dr.DeployName, dr.Type)
+	} else {
+		deploy, err = d.deployTaskStore.GetServerlessDeployByRepID(ctx, dr.RepoID)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to find space or serverless deploy, space_id:%d, repo_id:%d, %w", dr.SpaceID, dr.RepoID, err)
+	}
+	if deploy == nil {
+		return nil, nil
+	}
+	deploy.UserUUID = dr.UserUUID
+	deploy.SKU = dr.SKU
+	// dr.ImageID is not null for nginx space, otherwise it's ""
+	deploy.ImageID = dr.ImageID
+	deploy.Annotation = dr.Annotation
+	deploy.Env = dr.Env
+	deploy.Hardware = dr.Hardware
+	deploy.RuntimeFramework = dr.RuntimeFramework
+	deploy.Secret = dr.Secret
+	deploy.SecureLevel = dr.SecureLevel
+	deploy.ContainerPort = dr.ContainerPort
+	deploy.Template = dr.Template
+	deploy.MinReplica = dr.MinReplica
+	deploy.MaxReplica = dr.MaxReplica
+	deploy.EngineArgs = dr.EngineArgs
+	deploy.Variables = dr.Variables
+	deploy.ClusterID = dr.ClusterID
+	deploy.Task = types.PipelineTask(dr.Task)
+	deploy.OwnerNamespace = dr.OwnerNamespace
+	deploy.NodeAffinity = dr.NodeAffinity
+	deploy.Tolerations = dr.Tolerations
+	deploy.PD = dr.PD
+	deploy.VolumeMounts = dr.VolumeMounts
+	if types.IsSandboxType(dr.Type) {
+		// Sandbox-only fields and state reset: a reused sandbox deploy must restart from
+		// Pending. Space/serverless reset their status via StartDeploy instead, and
+		// dr.Sandbox is zero-valued for them (overwriting Timeout here would clear it).
+		deploy.RuntimeFramework = types.SandboxV2RuntimeFramework
+		deploy.Timeout = int(dr.Sandbox.Timeout)
+		deploy.ReadinessProbe = dr.Sandbox.ReadinessProbe
+		deploy.Status = common.Pending
+		deploy.StatusUpdateAt = time.Now()
+	}
+	slog.Debug("do deployer.serverlessDeploy", slog.Any("dr", dr), slog.Any("deploy", deploy))
+	err = d.deployTaskStore.UpdateDeploy(ctx, deploy)
+	if err != nil {
+		return nil, fmt.Errorf("fail reset deploy image, %w", err)
+	}
+	slog.Debug("return deployer.serverlessDeploy", slog.Any("dr", dr), slog.Any("deploy", deploy))
+	return deploy, nil
+}
+
+func (d *deployer) dedicatedDeploy(ctx context.Context, dr types.DeployRequest) (*database.Deploy, error) {
+	uniqueSvcName := d.generateUniqueSvcName(dr)
+	if len(uniqueSvcName) < 1 && !types.IsSandboxType(dr.Type) {
+		err := fmt.Errorf("failed to generate uuid for deploy")
+		return nil, errorx.InternalServerError(err,
+			errorx.Ctx().
+				Set("deploy_type", dr.Type).
+				Set("path", dr.Path).
+				Set("repo_id", dr.RepoID).
+				Set("model_id", dr.ModelID).
+				Set("space_id", dr.SpaceID),
+		)
+	}
+	deploy := &database.Deploy{
+		DeployName:       dr.DeployName,
+		SpaceID:          dr.SpaceID,
+		GitPath:          dr.Path,
+		GitBranch:        dr.GitBranch,
+		Secret:           dr.Secret,
+		Template:         dr.Template,
+		Env:              dr.Env,
+		Hardware:         dr.Hardware,
+		ImageID:          dr.ImageID,
+		ModelID:          dr.ModelID,
+		UserID:           dr.UserID,
+		RepoID:           dr.RepoID,
+		RuntimeFramework: dr.RuntimeFramework,
+		ContainerPort:    dr.ContainerPort,
+		Annotation:       dr.Annotation,
+		MinReplica:       dr.MinReplica,
+		MaxReplica:       dr.MaxReplica,
+		ClusterID:        dr.ClusterID,
+		SecureLevel:      dr.SecureLevel,
+		SvcName:          uniqueSvcName,
+		Type:             dr.Type,
+		UserUUID:         dr.UserUUID,
+		SKU:              dr.SKU,
+		Task:             types.PipelineTask(dr.Task),
+		EngineArgs:       dr.EngineArgs,
+		Variables:        dr.Variables,
+		OwnerNamespace:   dr.OwnerNamespace,
+		NodeAffinity:     dr.NodeAffinity,
+		Tolerations:      dr.Tolerations,
+		PD:               dr.PD,
+		VolumeMounts:     dr.VolumeMounts,
+	}
+	if types.IsSandboxType(dr.Type) {
+		deploy.RuntimeFramework = types.SandboxV2RuntimeFramework
+		deploy.ReadinessProbe = dr.Sandbox.ReadinessProbe
+		deploy.Timeout = int(dr.Sandbox.Timeout)
+	}
+	updateDatabaseDeploy(deploy, dr)
+	err := d.deployTaskStore.CreateDeploy(ctx, deploy)
+	return deploy, err
+}
+
+func (d *deployer) buildDeploy(ctx context.Context, dr types.DeployRequest) (*database.Deploy, error) {
+	var deploy *database.Deploy = nil
+	var err error = nil
+	slog.Debug("do deployer.buildDeploy check type", slog.Any("dr.Type", dr.Type))
+	if dr.Type == types.SpaceType || dr.Type == types.ServerlessType || types.IsSandboxType(dr.Type) {
+		// space case: SpaceID>0 and ModelID=0, reuse latest deploy of spaces
+		// sandbox case: DeployName is not empty, reuse deploy by deployName
+		deploy, err = d.serverlessDeploy(ctx, dr)
+		if err != nil {
+			return nil, fmt.Errorf("fail to check serverless deploy for spaceID %v, %w", dr.SpaceID, err)
+		}
+	}
+	slog.Debug("do deployer.buildDeploy", slog.Any("dr", dr), slog.Any("deploy", deploy))
+	if deploy == nil {
+		// create new deploy for:
+		// 1. create inference/finetune/notebook
+		// 2. create space/serverless first time
+		deploy, err = d.dedicatedDeploy(ctx, dr)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	slog.Debug("return deployer.buildDeploy", slog.Any("dr", dr), slog.Any("deploy", deploy))
+	return deploy, nil
+}
+
+func (d *deployer) Deploy(ctx context.Context, dr types.DeployRequest) (int64, error) {
+	//check reserved resource
+	err := d.checkOrderDetail(ctx, dr)
+	if err != nil {
+		return -1, err
+	}
+
+	deploy, err := d.buildDeploy(ctx, dr)
+	slog.Debug("do deployer.Deploy", slog.Any("dr", dr), slog.Any("deploy", deploy))
+	if err != nil || deploy == nil {
+		return -1, fmt.Errorf("failed to create deploy in db, %w", err)
+	}
+
+	bldTaskStatus := common.TaskStatusBuildPending
+	bldTaskMsg := ""
+
+	imgStrLen := len(strings.Trim(deploy.ImageID, " "))
+	slog.Debug("do deployer.Deploy check image", slog.Any("deploy.ImageID", deploy.ImageID), slog.Any("imgStrLen", imgStrLen))
+	if imgStrLen > 0 {
+		// skip build step for model as inference or finetune
+		bldTaskStatus = common.TaskStatusBuildSkip
+		bldTaskMsg = "Skip"
+	}
+	slog.Debug("create build task", slog.Any("bldTaskStatus", bldTaskStatus), slog.Any("bldTaskMsg", bldTaskMsg))
+	buildTask := &database.DeployTask{
+		DeployID: deploy.ID,
+		TaskType: common.TaskTypeBuild, // build task
+		Status:   bldTaskStatus,
+		Message:  bldTaskMsg,
+	}
+	err = d.deployTaskStore.CreateDeployTask(ctx, buildTask)
+	if err != nil {
+		return -1, fmt.Errorf("create build task for repo %d failed: %w", dr.RepoID, err)
+	}
+	runTask := &database.DeployTask{
+		DeployID: deploy.ID,
+		TaskType: common.TaskTypeDeploy, // deploy task
+	}
+	err = d.deployTaskStore.CreateDeployTask(ctx, runTask)
+	if err != nil {
+		return -1, fmt.Errorf("create deploy task for repo %d failed: %w", dr.RepoID, err)
+	}
+
+	buildTask.Deploy = deploy
+	runTask.Deploy = deploy
+
+	go DeployWorkflow(buildTask, runTask)
+
+	d.logReporter.Report(types.LogEntry{
+		Message:  types.PreBuildSubmit.String(),
+		DeployID: strconv.FormatInt(deploy.ID, 10),
+		Stage:    types.StagePreBuild,
+		Step:     types.StepWaitingForResource,
+		Labels: map[string]string{
+			types.LogLabelTypeKey:       types.LogLabelImageBuilder,
+			types.StreamKeyDeployType:   strconv.Itoa(deploy.Type),
+			types.StreamKeyDeployTaskID: strconv.FormatInt(buildTask.ID, 10),
+		},
+	})
+	return deploy.ID, nil
+}
+
+func (d *deployer) Status(ctx context.Context, dr types.DeployRequest, needDetails bool) (string, int, []types.Instance, error) {
+	if dr.DeployID == 0 {
+		slog.ErrorContext(ctx, "failed to get deploy: deploy_id not provided")
+		return "", common.Stopped, nil, fmt.Errorf("can't get deploy: deploy_id not provided")
+	}
+	deploy, err := d.deployTaskStore.GetDeployByID(ctx, dr.DeployID)
+	if err != nil || deploy == nil {
+		slog.ErrorContext(ctx, "failed to get deploy", slog.Any("DeployID", dr.DeployID), slog.Any("error", err))
+		return "", common.Stopped, nil, fmt.Errorf("can't get deploy, %w", err)
+	}
+
+	healthy, err := d.CheckClusterHealthy(ctx, deploy.ClusterID)
+	if !healthy {
+		slog.WarnContext(ctx, "cluster resources unhealthy", slog.Any("error", err), slog.Any("clusterID", deploy.ClusterID))
+		return "", common.ResourceUnhealthy, nil, nil
+	}
+	// deploy status and instances reported from runner
+	return deploy.SvcName, deploy.Status, deploy.Instances, nil
+}
+
+func (d *deployer) Logs(ctx context.Context, dr types.DeployRequest) (*MultiLogReader, error) {
+	deploy, err := d.deployTaskStore.GetLatestDeployBySpaceID(ctx, dr.SpaceID)
+	if err != nil {
+		return nil, fmt.Errorf("can't get space latest deploy,%w", err)
+	}
+	deployTasks, err := d.deployTaskStore.GetDeployTasksOfDeploy(ctx, deploy.ID)
+	if err != nil {
+		return nil, fmt.Errorf("can't get space delopyment task%w", err)
+	}
+
+	sort.Slice(deployTasks, func(i, j int) bool {
+		return deployTasks[i].ID > deployTasks[j].ID
+	})
+
+	runTask := deployTasks[0]
+	buildTask := deployTasks[1]
+
+	deployId := fmt.Sprintf("%d", buildTask.DeployID)
+
+	// read build log from loki
+	labels := map[string]string{
+		types.LogLabelTypeKey:       types.LogLabelImageBuilder,
+		types.StreamKeyDeployID:     deployId,
+		types.StreamKeyDeployTaskID: fmt.Sprintf("%d", buildTask.ID),
+	}
+
+	if dr.InstanceName != "" {
+		labels[types.StreamKeyInstanceName] = dr.InstanceName
+	}
+
+	buildLog, err := d.readLogsFromLoki(ctx, types.ReadLogRequest{
+		DeployID:  deployId,
+		StartTime: buildTask.CreatedAt,
+		Labels:    labels,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// read deploy log from loki
+	labels = map[string]string{
+		types.LogLabelTypeKey:       types.LogLabelDeploy,
+		types.StreamKeyDeployID:     deployId,
+		types.StreamKeyDeployTaskID: fmt.Sprintf("%d", runTask.ID),
+	}
+	if dr.InstanceName != "" {
+		labels[types.StreamKeyInstanceName] = dr.InstanceName
+	}
+
+	var startTime = deploy.CreatedAt
+	if dr.Since != "" {
+		startTime = parseSinceTime(dr.Since)
+	}
+
+	runLog, err := d.readLogsFromLoki(ctx, types.ReadLogRequest{
+		DeployID:  deployId,
+		StartTime: startTime,
+		Labels:    labels,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return NewMultiLogReader(buildLog, runLog), nil
+}
+
+func (d *deployer) readLogsFromLoki(ctx context.Context, params types.ReadLogRequest) (<-chan string, error) {
+	if params.Limit < 1 {
+		params.Limit = loki.MaxLimit
+	}
+	log, err := d.lokiClient.StreamAllLogs(ctx, params.DeployID, params.StartTime, params.Labels, params.TimeLoc, params.Limit)
+	if err != nil {
+		return nil, err
+	}
+
+	return log, nil
+}
+
+func (d *deployer) Stop(ctx context.Context, dr types.DeployRequest) error {
+	targetID := dr.SpaceID // support space only one instance
+	if dr.SpaceID == 0 {
+		targetID = dr.DeployID // support model deploy with multi-instance
+	}
+	// set independent timeout for remote runner call to prevent blocking when cluster is unreachable
+	stopCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	resp, err := d.imageRunner.Stop(stopCtx, &types.StopRequest{
+		ID:        targetID,
+		OrgName:   dr.Namespace,
+		RepoName:  dr.Name,
+		SvcName:   dr.SvcName,
+		ClusterID: dr.ClusterID,
+	})
+	if err != nil {
+		slog.Error("deployer stop deploy", slog.Any("runner_resp", resp), slog.Int64("space_id", dr.SpaceID), slog.Any("deploy_id", dr.DeployID), slog.Any("error", err))
+	}
+	// release resource if it's a order case, use original ctx to not be affected by stop timeout
+	err = d.releaseUserResourceByOrder(ctx, dr)
+	if err != nil {
+		return err
+	}
+	return err
+}
+
+func (d *deployer) StopBuild(ctx context.Context, req types.ImageBuildStopReq) error {
+	slog.Debug("deployer stop build", slog.Any("req", req))
+	err := d.imageBuilder.Stop(ctx, req)
+	if err != nil {
+		slog.Error("deployer stop build failed", slog.Any("req", req), slog.Any("error", err))
+		return fmt.Errorf("deployer stop build failed, %w", err)
+	}
+	slog.Info("deployer stop build success", slog.Any("req", req))
+	return nil
+}
+
+func (d *deployer) Purge(ctx context.Context, dr types.DeployRequest) error {
+	targetID := dr.SpaceID // support space only one instance
+	if dr.SpaceID == 0 {
+		targetID = dr.DeployID // support model deploy with multi-instance
+	}
+	resp, err := d.imageRunner.Purge(ctx, &types.PurgeRequest{
+		ID:         targetID,
+		OrgName:    dr.Namespace,
+		RepoName:   dr.Name,
+		SvcName:    dr.SvcName,
+		ClusterID:  dr.ClusterID,
+		DeployType: dr.Type,
+		UserID:     dr.UserUUID,
+	})
+	if err != nil {
+		slog.Error("deployer stop deploy", slog.Any("runner_resp", resp), slog.Int64("space_id", dr.SpaceID), slog.Any("deploy_id", dr.DeployID), slog.Any("error", err))
+	}
+	return err
+}
+
+func (d *deployer) Wakeup(ctx context.Context, dr types.DeployRequest) error {
+	svcName := dr.SvcName
+	svcURL := fmt.Sprintf("http://%s.%s", svcName, d.internalRootDomain)
+
+	cluster, err := d.clusterStore.ByClusterID(ctx, dr.ClusterID)
+	if err != nil {
+		return err
+	}
+
+	svcReq := types.EndpointReq{
+		ClusterID: dr.ClusterID,
+		Target:    svcURL,
+		Host:      svcName,
+		Endpoint:  dr.Endpoint,
+		SvcName:   svcName,
+	}
+
+	target, host, err := hubcom.ExtractDeployTargetAndHost(ctx, &cluster, svcReq)
+	if err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "wakeup service endpoint", slog.String("svc_name", svcName),
+		slog.String("svc_url", target), slog.String("host", host))
+
+	// Spawn goroutine to handle HTTP request asynchronously
+	// This ensures the client.Timeout (20s) takes effect instead of the upstream context deadline
+	if len(cluster.AppEndpoint) < 1 {
+		// host is required for remote cluster with app endpoint
+		host = ""
+	}
+	go d.wakeUpDeploy(target, host, dr)
+
+	// Return immediately without waiting for the HTTP request to complete
+	return nil
+}
+
+func (d *deployer) wakeUpDeploy(target, host string, dr types.DeployRequest) {
+	timeout := 20 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, target, nil)
+	if err != nil {
+		slog.ErrorContext(ctx, "failed to create wakeup request",
+			slog.String("path", fmt.Sprintf("%s/%s", dr.Namespace, dr.Name)),
+			slog.String("svc_name", dr.SvcName),
+			slog.String("svc_url", target),
+			slog.Any("error", err))
+		return
+	}
+	if len(host) > 0 {
+		req.Host = host
+	}
+
+	// Create a new HTTP client with a timeout
+	client := &http.Client{
+		Timeout: timeout,
+	}
+	// Send the request
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.ErrorContext(ctx, "wakeup sending request to Knative service",
+			slog.String("path", fmt.Sprintf("%s/%s", dr.Namespace, dr.Name)),
+			slog.String("svc_name", dr.SvcName),
+			slog.String("svc_url", target),
+			slog.Any("error", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	// Check if the request was successful
+	if resp.StatusCode == http.StatusOK {
+		return
+	} else {
+		var err error
+		switch resp.StatusCode {
+		case http.StatusNotFound:
+			err = fmt.Errorf("service endpoint not found, status: %d", resp.StatusCode)
+		case http.StatusUnauthorized:
+			err = fmt.Errorf("unauthorized access to service endpoint, status: %d", resp.StatusCode)
+		case http.StatusForbidden:
+			err = fmt.Errorf("forbidden access to service endpoint, status: %d", resp.StatusCode)
+		case http.StatusBadRequest:
+			err = fmt.Errorf("bad request to service endpoint, status: %d", resp.StatusCode)
+		case http.StatusInternalServerError:
+			err = fmt.Errorf("internal server error from service endpoint, status: %d", resp.StatusCode)
+		case http.StatusBadGateway:
+			err = fmt.Errorf("bad gateway error from service endpoint, status: %d", resp.StatusCode)
+		case http.StatusServiceUnavailable:
+			err = fmt.Errorf("service unavailable, status: %d", resp.StatusCode)
+		case http.StatusGatewayTimeout:
+			err = fmt.Errorf("gateway timeout when accessing service endpoint, status: %d", resp.StatusCode)
+		default:
+			err = fmt.Errorf("unexpected response from service endpoint, status: %d", resp.StatusCode)
+		}
+		slog.ErrorContext(ctx, "wakeup service endpoint failed",
+			slog.String("path", fmt.Sprintf("%s/%s", dr.Namespace, dr.Name)),
+			slog.String("svc_name", dr.SvcName),
+			slog.Any("error", err))
+	}
+}
+
+func (d *deployer) Exist(ctx context.Context, dr types.DeployRequest) (bool, error) {
+	targetID := dr.SpaceID // support space only one instance
+	if dr.SpaceID == 0 {
+		targetID = dr.DeployID // support model deploy with multi-instance
+	}
+	req := &types.CheckRequest{
+		ID:        targetID,
+		OrgName:   dr.Namespace,
+		RepoName:  dr.Name,
+		SvcName:   dr.SvcName,
+		ClusterID: dr.ClusterID,
+	}
+	resp, err := d.imageRunner.Exist(ctx, req)
+	if err != nil {
+		slog.Error("failed to check if deploy exists", slog.Any("req", req), slog.Any("error", err))
+		return true, err
+	}
+
+	switch resp.Code {
+	case -1:
+		// service check with error
+		slog.Warn("deploy exist check result", slog.Any("resp", resp))
+		return true, errors.New("fail to check deploy instance in cluster")
+	case common.Stopped:
+		// service not exist
+		return false, nil
+	}
+	return true, nil
+}
+
+func (d *deployer) GetReplica(ctx context.Context, dr types.DeployRequest) (int, int, []types.Instance, error) {
+	targetID := dr.SpaceID // support space only one instance
+	if dr.SpaceID == 0 {
+		targetID = dr.DeployID // support model deploy with multi-instance
+	}
+	req := &types.StatusRequest{
+		ID:        targetID,
+		OrgName:   dr.Namespace,
+		RepoName:  dr.Name,
+		ClusterID: dr.ClusterID,
+		SvcName:   dr.SvcName,
+	}
+	resp, err := d.imageRunner.GetReplica(ctx, req)
+	if err != nil {
+		slog.Warn("fail to get deploy replica with error", slog.Any("req", req), slog.Any("error", err))
+		return 0, 0, []types.Instance{}, err
+	}
+	return resp.ActualReplica, resp.DesiredReplica, resp.Instances, nil
+}
+
+func parseSinceTime(since string) time.Time {
+	return time.Now().Add(-parseSinceDuration(since))
+}
+
+func parseSinceDuration(since string) time.Duration {
+	switch since {
+	case "10mins":
+		return 10 * time.Minute
+	case "30mins":
+		return 30 * time.Minute
+	case "1hour":
+		return 1 * time.Hour
+	case "6hours":
+		return 6 * time.Hour
+	case "1day":
+		return 24 * time.Hour
+	case "2days":
+		return 48 * time.Hour
+	case "1week":
+		return 7 * 24 * time.Hour
+	default:
+		return 10 * time.Minute
+	}
+}
+
+func (d *deployer) InstanceLogs(ctx context.Context, dr types.DeployRequest) (*MultiLogReader, error) {
+	deploy, err := d.deployTaskStore.GetDeployByID(ctx, dr.DeployID)
+	if err != nil {
+		return nil, fmt.Errorf("can't get deployment %d error: %w", dr.DeployID, err)
+	}
+
+	labels := map[string]string{
+		types.LogLabelTypeKey:   types.LogLabelDeploy,
+		types.StreamKeyDeployID: fmt.Sprintf("%d", deploy.ID),
+	}
+	if dr.CommitID != "" {
+		labels[types.StreamKeyDeployCommitID] = dr.CommitID
+	}
+
+	if dr.InstanceName != "" {
+		labels[types.StreamKeyInstanceName] = dr.InstanceName
+	}
+
+	deployId := fmt.Sprintf("%d", deploy.ID)
+
+	var startTime = deploy.CreatedAt
+	if dr.Since != "" {
+		startTime = parseSinceTime(dr.Since)
+	}
+
+	runLog, err := d.readLogsFromLoki(ctx, types.ReadLogRequest{
+		DeployID:  deployId,
+		StartTime: startTime,
+		Labels:    labels,
+		Limit:     dr.Limit,
+	})
+	if err != nil {
+		slog.Error("failed to read deploy logs", slog.Any("deploy", deploy), slog.Any("error", err))
+		return nil, err
+	}
+
+	return NewMultiLogReader(nil, runLog), nil
+}
+
+func (d *deployer) InstanceLastLogs(ctx context.Context, dr types.DeployRequest) (*loki.LokiQueryResponse, error) {
+	deploy, err := d.deployTaskStore.GetDeployByID(ctx, dr.DeployID)
+	if err != nil {
+		return nil, fmt.Errorf("can't get deployment %d error: %w", dr.DeployID, err)
+	}
+
+	labels := map[string]string{
+		types.LogLabelTypeKey:   types.LogLabelDeploy,
+		types.StreamKeyDeployID: fmt.Sprintf("%d", deploy.ID),
+	}
+	if len(dr.CommitID) > 0 {
+		labels[types.StreamKeyDeployCommitID] = dr.CommitID
+	}
+	if len(dr.InstanceName) > 0 {
+		labels[types.StreamKeyInstanceName] = dr.InstanceName
+	}
+
+	labels[types.LogLabelCategoryKey] = string(types.LogCategoryContainer.String())
+
+	query := d.lokiClient.GenerateLabelQuery(labels)
+	limit := dr.Limit
+
+	params := loki.QueryLastParams{
+		Query:     query,
+		Limit:     limit,
+		Since:     parseSinceDuration(dr.Since),
+		Direction: "backward",
+	}
+
+	return d.lokiClient.QueryLast(ctx, params)
+}
+
+func (d *deployer) ListCluster(ctx context.Context) ([]types.ClusterRes, error) {
+	resp, err := d.imageRunner.ListCluster(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var result []types.ClusterRes
+	for _, c := range resp {
+		result = append(result, types.ClusterRes{
+			ClusterID:      c.ClusterID,
+			Region:         c.Region,
+			Zone:           c.Zone,
+			Provider:       c.Provider,
+			Resources:      c.Resources,
+			LastUpdateTime: c.LastUpdateTime,
+		})
+	}
+	return result, err
+}
+
+func (d *deployer) UpdateCluster(ctx context.Context, data types.ClusterRequest) (*types.UpdateClusterResponse, error) {
+	return d.imageRunner.UpdateCluster(ctx, &data)
+}
+
+// UpdateDeploy implements Deployer.
+func (d *deployer) UpdateDeploy(ctx context.Context, dur *types.DeployUpdateReq, deploy *database.Deploy) error {
+	var (
+		frame    *database.RuntimeFramework
+		resource *database.SpaceResource
+		hardware *types.HardWare
+		err      error
+	)
+
+	if dur.RuntimeFrameworkID != nil {
+		frame, err = d.runtimeFrameworkStore.FindEnabledByID(ctx, *dur.RuntimeFrameworkID)
+		if err != nil || frame == nil {
+			return fmt.Errorf("can't find available runtime framework %v, %w", *dur.RuntimeFrameworkID, err)
+		}
+	}
+
+	if dur.ResourceID != nil {
+		resource, err = d.spaceResourceStore.FindByID(ctx, *dur.ResourceID)
+		if err != nil {
+			return fmt.Errorf("error finding space resource %d, %w", *dur.ResourceID, err)
+		}
+		err = json.Unmarshal([]byte(resource.Resources), &hardware)
+		if err != nil {
+			return fmt.Errorf("invalid resource hardware setting, %w", err)
+		}
+		deploy.Hardware = resource.Resources
+		deploy.SKU = strconv.FormatInt(resource.ID, 10)
+	} else {
+		err = json.Unmarshal([]byte(deploy.Hardware), &hardware)
+		if err != nil {
+			return fmt.Errorf("invalid deploy hardware setting, %w", err)
+		}
+	}
+
+	if dur.DeployName != nil {
+		deploy.DeployName = *dur.DeployName
+	}
+	if dur.Env != nil {
+		deploy.Env = *dur.Env
+	}
+
+	if frame != nil {
+		// choose image
+		containerImg := frame.FrameImage
+		deploy.ImageID = containerImg
+		deploy.RuntimeFramework = frame.FrameName
+		deploy.ContainerPort = frame.ContainerPort
+	}
+
+	if dur.MinReplica != nil {
+		deploy.MinReplica = *dur.MinReplica
+	}
+
+	if dur.MaxReplica != nil {
+		deploy.MaxReplica = *dur.MaxReplica
+	}
+
+	if deploy.MaxReplica < deploy.MinReplica {
+		return fmt.Errorf("invalid min/max replica %d/%d", deploy.MinReplica, deploy.MaxReplica)
+	}
+
+	if dur.Revision != nil {
+		deploy.GitBranch = *dur.Revision
+	}
+
+	if dur.SecureLevel != nil {
+		deploy.SecureLevel = *dur.SecureLevel
+	}
+
+	if dur.ClusterID != nil {
+		deploy.ClusterID = *dur.ClusterID
+	}
+
+	if dur.EngineArgs != nil {
+		deploy.EngineArgs = *dur.EngineArgs
+	}
+
+	if isGGUFRuntime(deploy.RuntimeFramework) {
+		if dur.Entrypoint != nil {
+			newVarStr, err := buildVariables(deploy.Variables, dur)
+			if err != nil {
+				return fmt.Errorf("build variables for llama cpp error: %w", err)
+			}
+			dur.Variables = &newVarStr
+		}
+		if !hasGGUFEntryPoint(dur.Variables, deploy.Variables) {
+			return fmt.Errorf("entrypoint is required for llama.cpp or ktransformers")
+		}
+	}
+
+	if dur.Variables != nil {
+		deploy.Variables = *dur.Variables
+	}
+
+	if dur.NodeAffinity != nil {
+		deploy.NodeAffinity = dur.NodeAffinity
+	}
+	if len(dur.Tolerations) != 0 {
+		deploy.Tolerations = dur.Tolerations
+	}
+	if dur.PD != nil {
+		deploy.PD = dur.PD
+	}
+
+	// update deploy table
+	err = d.deployTaskStore.UpdateDeploy(ctx, deploy)
+	if err != nil {
+		return fmt.Errorf("failed to update deploy, error: %w", err)
+	}
+
+	return nil
+}
+
+func isGGUFRuntime(runtimeFramework string) bool {
+	name := strings.ToLower(runtimeFramework)
+	return strings.Contains(name, string(types.LlamaCpp)) || strings.Contains(name, string(types.Ktransformers))
+}
+
+func buildVariables(existingVariables string, dur *types.DeployUpdateReq) (string, error) {
+	varStr := existingVariables
+	if dur.Variables != nil {
+		varStr = *dur.Variables
+	}
+	varMap, err := hubcom.JsonStrToMap(varStr)
+	if err != nil {
+		return "", fmt.Errorf("invalid json format of variables error: %w", err)
+	}
+	varMap[types.GGUFEntryPoint] = *dur.Entrypoint
+	varBytes, err := json.Marshal(varMap)
+	if err != nil {
+		return "", fmt.Errorf("marshal variables error: %w", err)
+	}
+	varStr = string(varBytes)
+	return varStr, nil
+}
+
+func hasGGUFEntryPoint(variables *string, existingVariables string) bool {
+	varStr := existingVariables
+	if variables != nil {
+		varStr = *variables
+	}
+	varMap, err := hubcom.JsonStrToMap(varStr)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(varMap[types.GGUFEntryPoint]) != ""
+}
+
+func (d *deployer) StartDeploy(ctx context.Context, deploy *database.Deploy) error {
+	deploy.Status = common.Pending
+	deploy.StatusUpdateAt = time.Now()
+	// update deploy table
+	err := d.deployTaskStore.UpdateDeploy(ctx, deploy)
+	if err != nil {
+		return fmt.Errorf("failed to update deploy, %w", err)
+	}
+
+	// start model as inference/serverless task
+	runTask := &database.DeployTask{
+		DeployID: deploy.ID,
+		TaskType: 1,
+	}
+	err = d.deployTaskStore.CreateDeployTask(ctx, runTask)
+	if err != nil {
+		return fmt.Errorf("create deploy task failed: %w", err)
+	}
+
+	// go func() { _ = d.scheduler.Queue(runTask.ID) }()
+	runTask.Deploy = deploy
+	go DeployWorkflow(nil, runTask) // runTask is the only task
+
+	// update resource if it's a order case
+	err = d.updateUserResourceByOrder(ctx, deploy)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *deployer) startJobs() {
+	go d.startAccounting()
+}
+
+// SubmitEvaluation
+func (d *deployer) SubmitEvaluation(ctx context.Context, req types.EvaluationReq) (*types.ArgoWorkFlowRes, error) {
+	cluster, err := d.clusterStore.ByClusterID(ctx, req.ClusterID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster %s for evaluation job, error: %w", req.ClusterID, err)
+	}
+
+	env := make(map[string]string)
+	env["REVISIONS"] = strings.Join(req.Revisions, ",")
+	env["DATASET_REVISIONS"] = strings.Join(req.DatasetRevisions, ",")
+	env["MODEL_IDS"] = strings.Join(req.ModelIds, ",")
+	env["DATASET_IDS"] = strings.Join(req.Datasets, ",")
+	env["USE_CUSTOM_DATASETS"] = strconv.FormatBool(req.UseCustomDataset)
+	// The configuration arrives normalized, so both knobs are always present and the
+	// image defaults never apply: what is sent here is what the snapshot records.
+	if cfg := req.FrameworkConfig; cfg != "" {
+		var parsed types.EvaluationFrameworkConfig
+		if err := json.Unmarshal([]byte(cfg), &parsed); err != nil {
+			return nil, fmt.Errorf("invalid framework_config: %w", err)
+		}
+		generation, err := json.Marshal(parsed.GenerationConfig)
+		if err != nil {
+			return nil, fmt.Errorf("invalid framework_config generation_config: %w", err)
+		}
+		env["EVALSCOPE_GENERATION_CONFIG"] = string(generation)
+		if parsed.Limit != nil {
+			env["EVALUATION_LIMIT"] = strconv.Itoa(*parsed.Limit)
+		}
+	}
+	env["ACCESS_TOKEN"] = req.Token
+	env["HF_ENDPOINT"] = req.DownloadEndpoint
+	env["HF_HUB_DOWNLOAD_TIMEOUT"] = "30"
+
+	common.UpdateEvaluationEnvHardware(env, req.Hardware)
+
+	templates := []types.ArgoFlowTemplate{}
+	templates = append(templates, types.ArgoFlowTemplate{
+		Name:     "evaluation",
+		Env:      env,
+		HardWare: req.Hardware,
+		Image:    req.Image,
+	},
+	)
+	uniqueFlowName := d.snowflakeNode.Generate().Base36()
+	flowReq := &types.ArgoWorkFlowReq{
+		TaskName:     req.TaskName,
+		TaskId:       uniqueFlowName,
+		TaskType:     req.TaskType,
+		TaskDesc:     req.TaskDesc,
+		Image:        req.Image,
+		Datasets:     req.Datasets,
+		Username:     req.Username,
+		UserUUID:     req.UserUUID,
+		RepoIds:      req.ModelIds,
+		Entrypoint:   "evaluation",
+		ClusterID:    req.ClusterID,
+		Templates:    templates,
+		RepoType:     req.RepoType,
+		ResourceId:   req.ResourceId,
+		ResourceName: req.ResourceName,
+		Nodes:        req.Nodes,
+		Scheduler:    common.GenerateScheduler(cluster.VXPUConfig),
+		DeployExtend: types.DeployExtend{
+			NodeAffinity: req.NodeAffinity,
+			Tolerations:  req.Tolerations,
+		},
+		// Snapshot of what the task was submitted with, persisted by the runner.
+		// Models are pinned to the commits the image downloads, datasets record the
+		// commit their branch pointed at while the image still downloads by branch.
+		RepoRevisions:    req.Revisions,
+		DatasetRevisions: req.DatasetCommits,
+		FrameworkConfig:  req.FrameworkConfig,
+		Hardware:         &req.Hardware,
+	}
+	if req.ResourceId == 0 {
+		flowReq.ShareMode = true
+	}
+	return d.imageRunner.SubmitWorkFlow(ctx, flowReq)
+}
+
+func (d *deployer) SubmitClawEvaluation(ctx context.Context, req types.ClawEvaluationReq) (*types.ArgoWorkFlowRes, error) {
+	cluster, err := d.clusterStore.ByClusterID(ctx, req.ClusterID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster %s for claw evaluation job, error: %w", req.ClusterID, err)
+	}
+
+	command := req.Command
+	if command == "" {
+		command = "batch"
+	}
+
+	env := make(map[string]string)
+	env["CLAW_EVAL_COMMAND"] = command
+	env["CLAW_EVAL_MODEL"] = req.Model
+	env["CLAW_EVAL_BASE_URL"] = req.BaseURL
+	if req.ApiKey != "" {
+		env["CLAW_EVAL_API_KEY"] = req.ApiKey
+	}
+	if req.JudgeBaseURL != "" {
+		env["CLAW_EVAL_JUDGE_BASE_URL"] = req.JudgeBaseURL
+	}
+	if req.JudgeApiKey != "" {
+		env["CLAW_EVAL_JUDGE_API_KEY"] = req.JudgeApiKey
+	}
+	if req.Config != "" {
+		env["CLAW_EVAL_CONFIG"] = req.Config
+	}
+	if req.Tasks != "" {
+		env["CLAW_EVAL_TASKS"] = req.Tasks
+	} else {
+		env["CLAW_EVAL_TASKS"] = types.ClawEvalTasksNormal
+	}
+	trials := req.Trials
+	if trials <= 0 {
+		trials = types.ClawEvalDefaultTrials
+	}
+	env["CLAW_EVAL_TRIALS"] = strconv.Itoa(trials)
+	parallel := req.Parallel
+	if parallel <= 0 {
+		parallel = types.ClawEvalDefaultParallel
+	}
+	env["CLAW_EVAL_PARALLEL"] = strconv.Itoa(parallel)
+	if req.JudgeModel != "" {
+		env["CLAW_EVAL_JUDGE_MODEL"] = req.JudgeModel
+	} else if !req.NoJudge {
+		env["CLAW_EVAL_JUDGE_MODEL"] = types.ClawEvalDefaultJudgeModel
+	}
+	if req.NoJudge {
+		env["CLAW_EVAL_NO_JUDGE"] = "true"
+	}
+	if req.TraceDir != "" {
+		env["CLAW_EVAL_TRACE_DIR"] = req.TraceDir
+	}
+	if req.Proxy != "" {
+		env["CLAW_EVAL_PROXY"] = req.Proxy
+	}
+
+	common.UpdateEvaluationEnvHardware(env, req.Hardware)
+
+	templates := []types.ArgoFlowTemplate{
+		{
+			Name:     "claw-eval",
+			Env:      env,
+			HardWare: req.Hardware,
+			Image:    req.Image,
+		},
+	}
+	uniqueFlowName := d.snowflakeNode.Generate().Base36()
+	flowReq := &types.ArgoWorkFlowReq{
+		TaskName:     req.TaskName,
+		TaskId:       uniqueFlowName,
+		TaskType:     req.TaskType,
+		TaskDesc:     req.TaskDesc,
+		Image:        req.Image,
+		Username:     req.Username,
+		UserUUID:     req.UserUUID,
+		RepoIds:      []string{req.Model},
+		Entrypoint:   "claw-eval",
+		ClusterID:    req.ClusterID,
+		Templates:    templates,
+		RepoType:     req.RepoType,
+		ResourceId:   req.ResourceId,
+		ResourceName: req.ResourceName,
+		Nodes:        req.Nodes,
+		Scheduler:    common.GenerateScheduler(cluster.VXPUConfig),
+		DeployExtend: types.DeployExtend{
+			NodeAffinity: req.NodeAffinity,
+			Tolerations:  req.Tolerations,
+		},
+	}
+	return d.imageRunner.SubmitWorkFlow(ctx, flowReq)
+}
+
+func (d *deployer) DeleteEvaluation(ctx context.Context, req types.ArgoWorkFlowDeleteReq) error {
+	_, err := d.imageRunner.DeleteWorkFlow(ctx, req)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *deployer) GetEvaluation(ctx context.Context, req types.EvaluationGetReq) (*types.ArgoWorkFlowRes, error) {
+	wf, err := d.imageRunner.GetWorkFlow(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return wf, err
+}
+
+// CheckHeartbeatTimeout checks if any cluster has not sent a heartbeat within the timeout duration.
+// It returns true if a timeout is detected, otherwise false.
+func (d *deployer) CheckHeartbeatTimeout(ctx context.Context, clusterId string) (bool, error) {
+	timeoutDuration := 2 * d.deployConfig.HeartBeatTimeInSec
+	cluster, err := d.clusterStore.ByClusterID(ctx, clusterId)
+	if err != nil {
+		return false, fmt.Errorf("failed to get clusters: %w", err)
+	}
+
+	now := time.Now().UTC()
+
+	if cluster.Status == types.ClusterStatusUnavailable {
+		return true, nil
+	}
+
+	if int64(now.Sub(cluster.UpdatedAt.UTC()).Seconds()) > int64(timeoutDuration) {
+		slog.Warn("detected cluster heartbeat timeout",
+			slog.String("cluster_id", cluster.ClusterID),
+			slog.Time("last_heartbeat", cluster.UpdatedAt))
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func (d *deployer) SubmitFinetuneJob(ctx context.Context, req types.FinetuneReq) (*types.ArgoWorkFlowRes, error) {
+	cluster, err := d.clusterStore.ByClusterID(ctx, req.ClusterID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster %s for finetune job, error: %w", req.ClusterID, err)
+	}
+
+	finetunedModelName := ""
+	orgModelNames := strings.Split(req.ModelId, "/")
+	if len(orgModelNames) == 2 {
+		// "Qwen3-0.6B-finetuned-20251023_134013"
+		suffix := time.Now().Format("20060102-150405")
+		finetunedModelName = fmt.Sprintf("%s-finetuned-%s", orgModelNames[1], suffix)
+	}
+
+	env := make(map[string]string)
+	env["MODEL_ID"] = req.ModelId
+	env["DATASET_ID"] = req.DatasetId
+	env["ACCESS_TOKEN"] = req.Token
+	env["HF_TOKEN"] = req.Token
+	env["HF_ENDPOINT"], _ = url.JoinPath(req.DownloadEndpoint, "hf")
+	env["HF_HUB_DOWNLOAD_TIMEOUT"] = "30"
+	env["HF_USERNAME"] = req.Username
+	env["EPOCHS"] = strconv.Itoa(req.Epochs)
+	env["LEARNING_RATE"] = strconv.FormatFloat(req.LearningRate, 'f', -1, 64)
+	env["CUSTOM_ARGS"] = req.CustomeArgs
+	env["REVISION"] = req.Revision
+	env["DATASET_REVISION"] = req.DatasetRevision
+	env["SWIFT_COMMAND"] = req.SwiftCommand
+	if len(finetunedModelName) > 0 {
+		env["FINETUNED_MODEL_NAME"] = finetunedModelName
+	}
+
+	common.UpdateEvaluationEnvHardware(env, req.Hardware)
+
+	uniqueFlowName := d.snowflakeNode.Generate().Base36()
+	templates := []types.ArgoFlowTemplate{
+		{
+			Name:     "finetune",
+			Env:      env,
+			HardWare: req.Hardware,
+			Image:    req.Image,
+		},
+	}
+	entrypoint := "finetune"
+	if req.WorkflowVersion >= 2 {
+		env["FINETUNE_WORK_DIR"] = "/workspace/finetune/" + uniqueFlowName
+		env["EXPORT_TO_HF"] = "true"
+		env["KEEP_FINETUNE_WORK_DIR"] = strconv.FormatBool(req.KeepWorkDir)
+		transferHardware := types.HardWare{
+			Cpu: types.CPU{
+				Num: req.Hardware.Cpu.Num,
+			},
+			Memory:           req.Hardware.Memory,
+			EphemeralStorage: req.Hardware.EphemeralStorage,
+		}
+		templates = append(templates,
+			types.ArgoFlowTemplate{
+				Name:     "finetune-download",
+				Env:      env,
+				HardWare: transferHardware,
+				Image:    req.Image,
+				Command:  []string{"/etc/csghub/download-job.sh"},
+			},
+			types.ArgoFlowTemplate{
+				Name:     "finetune-train",
+				Env:      env,
+				HardWare: req.Hardware,
+				Image:    req.Image,
+				Command:  []string{"/etc/csghub/train-job.sh"},
+			},
+			types.ArgoFlowTemplate{
+				Name:     "finetune-upload",
+				Env:      env,
+				HardWare: transferHardware,
+				Image:    req.Image,
+				Command:  []string{"/etc/csghub/upload-job.sh"},
+			},
+			types.ArgoFlowTemplate{
+				Name:     "finetune-cleanup",
+				Env:      env,
+				HardWare: transferHardware,
+				Image:    req.Image,
+				Command:  []string{"/etc/csghub/cleanup-job.sh"},
+			},
+		)
+		entrypoint = "finetune-v2"
+	}
+	flowReq := &types.ArgoWorkFlowReq{
+		TaskName:           req.TaskName,
+		TaskId:             uniqueFlowName,
+		TaskType:           req.TaskType,
+		TaskDesc:           req.TaskDesc,
+		Image:              req.Image,
+		Username:           req.Username,
+		UserUUID:           req.UserUUID,
+		Entrypoint:         entrypoint,
+		ClusterID:          req.ClusterID,
+		WorkflowVersion:    req.WorkflowVersion,
+		Templates:          templates,
+		Datasets:           []string{req.DatasetId},
+		RepoIds:            []string{req.ModelId},
+		RepoType:           req.RepoType,
+		ResourceId:         req.ResourceId,
+		ResourceName:       req.ResourceName,
+		FinetunedModelName: finetunedModelName,
+		Nodes:              req.Nodes,
+		Scheduler:          common.GenerateScheduler(cluster.VXPUConfig),
+		DeployExtend: types.DeployExtend{
+			NodeAffinity: req.NodeAffinity,
+			Tolerations:  req.Tolerations,
+		},
+	}
+	if req.ResourceId == 0 {
+		flowReq.ShareMode = true
+	}
+
+	slog.Debug("submit finetune workflow request to runner", slog.Any("flowReq", flowReq))
+	return d.imageRunner.SubmitFinetuneJob(ctx, flowReq)
+}
+
+func (d *deployer) DeleteFinetuneJob(ctx context.Context, req types.ArgoWorkFlowDeleteReq) error {
+	_, err := d.imageRunner.DeleteWorkFlow(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed delete finetune workflow by runner error: %w", err)
+	}
+	return nil
+}
+
+func (d *deployer) GetWorkflowLogsInStream(ctx context.Context, req types.WorkflowLogReq, labels map[string]string) (*MultiLogReader, error) {
+
+	var startTime = req.SubmitTime
+	if len(req.Since) > 0 {
+		startTime = parseSinceTime(req.Since)
+	}
+
+	runLog, err := d.readLogsFromLoki(ctx, types.ReadLogRequest{
+		DeployID:  req.PodName,
+		StartTime: startTime,
+		Labels:    labels,
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get workflow job logs error: %w", err)
+	}
+
+	return NewMultiLogReader(nil, runLog), nil
+}
+
+func (d *deployer) GetWorkflowLogsNonStream(ctx context.Context, req types.WorkflowLogReq, labels map[string]string) (*loki.LokiQueryResponse, error) {
+
+	query := d.lokiClient.GenerateLabelQuery(labels)
+	var startTime = req.SubmitTime
+	if req.Since != "" {
+		startTime = parseSinceTime(req.Since)
+	}
+
+	params := loki.QueryRangeParams{
+		Query:     query,
+		Start:     startTime,
+		Direction: "forward",
+		Limit:     loki.MaxLimit,
+	}
+
+	return d.lokiClient.QueryRange(ctx, params)
+}
+
+func (d *deployer) CheckClusterHealthy(ctx context.Context, clusterId string) (bool, error) {
+	clusterRes, err := d.clusterStore.GetClusterResources(ctx, clusterId)
+	if err != nil {
+		return false, fmt.Errorf("failed to get cluster resources, clusterID: %s, error: %w", clusterId, err)
+	}
+
+	if !clusterRes.Enable {
+		return false, fmt.Errorf("cluster resources unhealthy, cluster is disabled")
+	}
+
+	if clusterRes.Status != types.ClusterStatusRunning {
+		return false, fmt.Errorf("cluster resources unhealthy, cluster status is not running")
+	}
+
+	timePassed := time.Since(time.Unix(clusterRes.LastUpdateTime, 0))
+	maxDuration := time.Duration(d.config.Runner.HearBeatIntervalInSec * 2 * int(time.Second))
+	if timePassed > maxDuration {
+		return false, fmt.Errorf("cluster resources unhealthy, last update duration is greater than %s", maxDuration.String())
+	}
+	return true, nil
+}
+
+func (d *deployer) IsDefaultScheduler(VXPUConfig map[string]string) bool {
+	return common.GenerateScheduler(VXPUConfig) == nil
+}
+func (d *deployer) GetWorkFlow(ctx context.Context, req types.ArgoWorkFlowDeleteReq) (*types.ArgoWorkFlowRes, error) {
+	return d.imageRunner.GetWorkFlow(ctx, req)
+}
+func (d *deployer) GetSandbox(ctx context.Context, clusterID, sandboxName string) (*runnerTypes.SandboxDetail, error) {
+	return d.imageRunner.GetSandbox(ctx, clusterID, sandboxName)
+}
+
+func (d *deployer) GetSharedModeResourceName(VXPUConfig map[string]string) string {
+	resourceName := common.DefaultResourceName
+	if !d.IsDefaultScheduler(VXPUConfig) {
+		resourceName = VXPUConfig[types.ClusterCFGVGPUResourceReqKey]
+	}
+	return resourceName
+}
+
+func (d *deployer) BatchStatus(ctx context.Context, req *runnerTypes.BatchStatusRequest) (*runnerTypes.BatchStatusResponse, error) {
+	return d.imageRunner.BatchStatus(ctx, req)
+}

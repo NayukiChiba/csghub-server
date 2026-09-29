@@ -1,0 +1,482 @@
+package types
+
+import (
+	"strings"
+	"time"
+
+	"opencsg.com/csghub-server/builder/rebac"
+)
+
+// UserRole represents a user's permission level in an organization.
+type UserRole string
+
+const (
+	// UserAdmin grants organization administration permission.
+	UserAdmin UserRole = "admin"
+	// UserWrite grants organization write permission.
+	UserWrite UserRole = "write"
+	// UserRead grants organization read permission.
+	UserRead UserRole = "read"
+)
+
+// ReBACRelation maps the organization role to the corresponding direct ReBAC relation.
+func (role UserRole) ReBACRelation() (rebac.Relation, bool) {
+	switch role {
+	case UserAdmin:
+		return rebac.RelationAdmin, true
+	case UserWrite:
+		return rebac.RelationWriter, true
+	case UserRead:
+		return rebac.RelationReader, true
+	default:
+		return "", false
+	}
+}
+
+type CreateUserRequest struct {
+	// Display name of the user
+	Name string `json:"name"`
+	// the login name
+	Username string `json:"username"`
+	Email    string `json:"email" binding:"email"`
+	Phone    string `json:"phone"`
+	UUID     string `json:"uuid"`
+	// user registered from default login page, from casdoor, etc. Possible values:
+	//
+	// - "default"
+	// - "casdoor"
+	RegProvider string `json:"reg_provider"`
+}
+
+type UpdateUserRequest struct {
+	// Display name of the user
+	Nickname *string `json:"name,omitempty"`
+	// the login name
+	Username              string  `json:"-"`
+	Email                 *string `json:"email,omitempty" binding:"omitnil,email"`
+	EmailVerificationCode *string `json:"email_verification_code,omitempty"`
+	Phone                 *string `json:"phone,omitempty"`
+	PhoneArea             *string `json:"phone_area,omitempty"`
+	UUID                  *string `json:"-"`
+	// should be updated by admin
+	Roles    *[]string `json:"roles,omitempty" example:"[super_user, admin, personal_user]"`
+	Avatar   *string   `json:"avatar,omitempty"`
+	Homepage *string   `json:"homepage,omitempty"`
+	Bio      *string   `json:"bio,omitempty"`
+
+	//if use want to change username, this should be the only field to send in request body
+	NewUserName *string `json:"new_username,omitempty"`
+
+	OpUser string  `json:"-"` // the user who perform this action, used for audit and permission check
+	TagIDs []int64 `json:"tag_ids,omitempty"`
+}
+
+type SendSMSCodeRequest struct {
+	PhoneArea string `json:"phone_area" binding:"required"`
+	Phone     string `json:"phone" binding:"required"`
+}
+
+type SendSMSCodeResponse struct {
+	ExpiredAt time.Time `json:"expired_at"`
+}
+
+type SendPublicSMSCodeRequest struct {
+	Scene     string `json:"scene" binding:"required"`
+	PhoneArea string `json:"phone_area" binding:"required"`
+	Phone     string `json:"phone" binding:"required"`
+}
+
+type VerifyPublicSMSCodeRequest struct {
+	Scene            string `json:"scene" binding:"required"`
+	Phone            string `json:"phone" binding:"required"`
+	PhoneArea        string `json:"phone_area" binding:"required"`
+	VerificationCode string `json:"verification_code" binding:"required,len=6"`
+}
+
+type UpdateUserPhoneRequest struct {
+	Phone            *string `json:"phone" binding:"required"`
+	PhoneArea        *string `json:"phone_area,omitempty"`
+	VerificationCode *string `json:"verification_code" binding:"required"`
+}
+
+var _ SensitiveRequestV2 = (*UpdateUserRequest)(nil)
+
+func (u *UpdateUserRequest) GetSensitiveFields() []SensitiveField {
+	var fields []SensitiveField
+	if u.NewUserName != nil {
+		fields = append(fields, SensitiveField{
+			Name: "new_username",
+			Value: func() string {
+				return *u.NewUserName
+			},
+			Scenario: "nickname_detection",
+		})
+	}
+
+	if u.Nickname != nil {
+		fields = append(fields, SensitiveField{
+			Name: "nickname",
+			Value: func() string {
+				return *u.Nickname
+			},
+			Scenario: "nickname_detection",
+		})
+	}
+
+	if u.Bio != nil {
+		fields = append(fields, SensitiveField{
+			Name: "bio",
+			Value: func() string {
+				return *u.Bio
+			},
+			Scenario: "comment_detection",
+		})
+	}
+
+	if u.Homepage != nil {
+		fields = append(fields, SensitiveField{
+			Name: "homepage",
+			Value: func() string {
+				return *u.Homepage
+			},
+			Scenario: "chat_detection",
+		})
+	}
+	return fields
+}
+
+type UpdateUserResp struct {
+	Username string `json:"username"`
+	Email    string `json:"email"`
+}
+
+// OAuthExchangeTokenReq contains the payload for exchanging a Casdoor JWT
+// access token for a locally issued JWT.
+type OAuthExchangeTokenReq struct {
+	// AccessToken is the Casdoor-issued JWT access token.
+	AccessToken string `json:"access_token" binding:"required"`
+	// Scopes is a reserved field for future authorization checks.
+	// The current implementation keeps the parameter for forward compatibility
+	// but does not validate or enforce any scope values yet.
+	Scopes []string `json:"scopes"`
+}
+
+// OAuthExchangeTokenResp contains the locally issued JWT and mapped user
+// identity after a successful token exchange.
+type OAuthExchangeTokenResp struct {
+	JWT         string `json:"jwt"`
+	CurrentUser string `json:"current_user"`
+	UserUUID    string `json:"user_uuid"`
+}
+
+type CreateUserTokenRequest struct {
+	ID        int64  `json:"-"`
+	Username  string `json:"-" `
+	OpUUID    string `json:"-"`
+	NSUUID    string `json:"-"`
+	TokenName string `json:"name"`
+	// default to csghub
+	Application AccessTokenApp `json:"application,omitempty"`
+	// default to empty, means full permission
+	Permission string    `json:"permission,omitempty"`
+	ExpiredAt  time.Time `json:"expired_at"`
+	// Quotas supports submitting multiple quota records in one create request.
+	Quotas []UpdateAPIKeyQuotaItem `json:"quotas"`
+}
+
+// CreateUserTokenRequest implements SensitiveRequestV2
+var _ SensitiveRequestV2 = (*CreateUserTokenRequest)(nil)
+
+func (c *CreateUserTokenRequest) GetSensitiveFields() []SensitiveField {
+	return []SensitiveField{
+		{
+			Name: "name",
+			Value: func() string {
+				return c.TokenName
+			},
+			Scenario: "nickname_detection",
+		},
+	}
+}
+
+type CheckAccessTokenReq struct {
+	Token string `json:"token" binding:"required"`
+	// Optional, if given only check the token belongs to this application
+	Application string `json:"application"`
+}
+
+type CheckAccessTokenResp struct {
+	ID          int64          `json:"id"`
+	Token       string         `json:"token"`
+	TokenName   string         `json:"token_name"`
+	Application AccessTokenApp `json:"application"`
+	Permission  string         `json:"permission,omitempty"`
+	// the login name
+	Username  string                        `json:"user_name"`
+	UserUUID  string                        `json:"user_uuid"`
+	ExpireAt  time.Time                     `json:"expire_at"`
+	NSUUID    string                        `json:"ns_uuid"`
+	Quotas    []AccountAccessTokenQuotaResp `json:"quotas"`
+	CreatedAt time.Time                     `json:"created_at"`
+	UpdatedAt time.Time                     `json:"updated_at"`
+	TokenType string                        `json:"token_type"`
+}
+
+// AccountAccessTokenQuotaResp is the response representation of a single quota
+// record for an API key.
+type AccountAccessTokenQuotaResp struct {
+	ID             int64                    `json:"id"`
+	QuotaType      AccountingQuotaType      `json:"quota_type"`
+	QuotaValueType AccountingQuotaValueType `json:"quota_value_type"`
+	Usage          float64                  `json:"usage"`
+	Quota          float64                  `json:"quota"`
+	PeriodStart    int64                    `json:"period_start"`
+	PeriodEnd      int64                    `json:"period_end"`
+	Allocation     string                   `json:"allocation"`
+	LastUsedAt     *time.Time               `json:"last_used_at"`
+}
+
+type GetAccessTokenRequest struct {
+	Username    string         `json:"username"`
+	OpUUID      string         `json:"op_uuid"`
+	NSUUID      string         `json:"ns_uuid"`
+	Application AccessTokenApp `json:"application"`
+}
+
+type CreateAPIKeyRequest struct {
+	KeyName   string     `json:"name" binding:"required"`
+	ExpiredAt *time.Time `json:"expired_at"`
+	// Quotas supports submitting multiple quota records in one request.
+	Quotas []UpdateAPIKeyQuotaItem `json:"quotas" binding:"required,min=1,dive"`
+}
+
+type UpdateAPIKeyRequest struct {
+	CurrentUser string     `json:"-"`
+	OpUUID      string     `json:"-"`
+	NSUUID      string     `json:"-"`
+	ID          int64      `json:"-"`
+	KeyName     *string    `json:"name"`
+	ExpiredAt   *time.Time `json:"expired_at"`
+	// Quotas supports submitting multiple quota records in one request.
+	Quotas []UpdateAPIKeyQuotaItem `json:"quotas"`
+}
+
+// UpdateAPIKeyQuotaItem describes a single quota entry within a batch update.
+type UpdateAPIKeyQuotaItem struct {
+	ID         int64                    `json:"id"`
+	QuotaType  AccountingQuotaType      `json:"quota_type"`
+	ValueType  AccountingQuotaValueType `json:"quota_value_type"`
+	Quota      float64                  `json:"quota"`
+	Allocation string                   `json:"allocation"`
+}
+
+type UserDatasetsReq struct {
+	Owner       string `json:"owner"`
+	CurrentUser string `json:"current_user"`
+	Filter      *RepoFilter
+	PageOpts
+}
+
+type UserSpacesReq struct {
+	SDK         string `json:"sdk"`
+	Owner       string `json:"owner"`
+	CurrentUser string `json:"current_user"`
+	Filter      *RepoFilter
+	PageOpts
+}
+
+type (
+	UserModelsReq          = UserDatasetsReq
+	UserCodesReq           = UserDatasetsReq
+	UserCollectionReq      = UserSpacesReq
+	DeleteUserTokenRequest = CreateUserTokenRequest
+	UserPromptsReq         = UserDatasetsReq
+	UserEvaluationReq      = UserDatasetsReq
+	UserMCPsReq            = UserDatasetsReq
+	UserSkillsReq          = UserDatasetsReq
+)
+
+type PageOpts struct {
+	Page     int `json:"page"`
+	PageSize int `json:"page_size"`
+}
+
+type OffsetPagination struct {
+	Limit  int `json:"limit"`
+	Offset int `json:"offset"`
+}
+
+type User struct {
+	ID                int64          `json:"id,omitempty"`
+	Username          string         `json:"username"`
+	Nickname          string         `json:"nickname"`
+	Phone             string         `json:"phone,omitempty"`
+	PhoneArea         string         `json:"phone_area,omitempty"`
+	Email             string         `json:"email,omitempty"`
+	UUID              string         `json:"uuid,omitempty"`
+	Avatar            string         `json:"avatar,omitempty"`
+	Bio               string         `json:"bio,omitempty"`
+	Homepage          string         `json:"homepage,omitempty"`
+	Roles             []string       `json:"roles,omitempty"`
+	LastLoginAt       string         `json:"last_login_at,omitempty"`
+	Orgs              []Organization `json:"orgs,omitempty"`
+	CanChangeUserName bool           `json:"can_change_username,omitempty"`
+	VerifyStatus      string         `json:"verify_status,omitempty"`
+	Labels            []string       `json:"labels,omitempty"`
+	CreatedAt         time.Time      `json:"created_at"`
+	Tags              []RepoTag      `json:"tags,omitempty"`
+	Namespaces        []Namespace    `json:"namespaces,omitempty"`
+}
+
+func (u User) IsAdmin() bool {
+	for _, role := range u.Roles {
+		if role == "admin" || role == "super_user" {
+			return true
+		}
+	}
+	return false
+}
+
+type UserLikesRequest struct {
+	Username     string `json:"username"`
+	RepoID       int64  `json:"repo_id"`
+	CollectionID int64  `json:"collection_id"`
+	CurrentUser  string `json:"current_user"`
+}
+
+/* for HF compatible apis  */
+type WhoamiResponse struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+	Auth  Auth   `json:"auth"`
+}
+
+type AccessToken struct {
+	DisplayName string `json:"displayName,omitempty"`
+	Role        string `json:"role,omitempty"`
+}
+
+type Auth struct {
+	AccessToken `json:"accessToken,omitempty"`
+	Type        string `json:"type,omitempty"`
+}
+
+type UserRepoReq struct {
+	CurrentUser string `json:"current_user"`
+	PageOpts
+}
+
+type AccessTokenApp string
+
+const (
+	AccessTokenAppGit       AccessTokenApp = "git"
+	AccessTokenAppCSGHub                   = AccessTokenAppGit
+	AccessTokenAppMirror    AccessTokenApp = "mirror"
+	AccessTokenAppStarship  AccessTokenApp = "starship"
+	AccessTokenAppAIGateway AccessTokenApp = "aigateway"
+)
+
+type AccessTokenType string
+
+const (
+	AccessTokenTypeBuiltIn AccessTokenType = "builtin"
+	AccessTokenTypeOwner   AccessTokenType = "owner"
+)
+
+type UserRepoPermission struct {
+	CanRead  bool `json:"can_read"`
+	CanWrite bool `json:"can_write"`
+	CanAdmin bool `json:"can_admin"`
+}
+
+type VerifyStatus string
+
+const (
+	VerifyStatusPending  VerifyStatus = "pending"
+	VerifyStatusApproved VerifyStatus = "approved"
+	VerifyStatusRejected VerifyStatus = "rejected"
+)
+
+type UserVerifyReq struct {
+	UUID        string       `json:"id" binding:"required"`
+	RealName    string       `json:"real_name" binding:"required"`
+	IDCardFront string       `json:"id_card_front" binding:"required"`
+	IDCardBack  string       `json:"id_card_back" binding:"required"`
+	Username    string       `json:"username"`
+	Status      VerifyStatus `json:"status"`
+}
+
+type UserVerifyStatusReq struct {
+	Status VerifyStatus `json:"status" binding:"required"` // approved,  rejected
+	Reason string       `json:"reason"`
+}
+
+type UserLabelsRequest struct {
+	Labels []string `json:"labels"`
+	UUID   string   `json:"id" binding:"required"`
+	OpUser string   `json:"-"`
+}
+
+var ValidLabels = map[string]bool{
+	"basic":     true,
+	"advanced":  true,
+	"vip":       true,
+	"blacklist": true,
+}
+
+func ParseLabels(rawLabels []string) []string {
+	labelSet := make(map[string]struct{})
+	var result []string
+
+	for _, label := range rawLabels {
+		label = strings.ToLower(strings.TrimSpace(label))
+		if label == "" {
+			continue
+		}
+		if _, exists := labelSet[label]; !exists {
+			labelSet[label] = struct{}{}
+			result = append(result, label)
+		}
+	}
+
+	return result
+}
+
+type CloseAccountReq struct {
+	Repository bool `json:"repository"`
+	Discussion bool `json:"discussion"`
+}
+
+type UserIndexReq struct {
+	Search       string       `json:"search"`
+	VerifyStatus VerifyStatus `json:"verify_status"`
+	Labels       []string     `json:"labels"`
+	Per          int          `json:"per"`
+	ExactMatch   bool         `json:"exact_match"`
+}
+
+type UserIndexResp struct {
+	Users []*User `json:"users"`
+	Error error   `json:"error"`
+}
+
+type UserListReq struct {
+	VisitorName  string   `json:"visitor_name"`
+	Search       string   `json:"search"`
+	VerifyStatus string   `json:"verify_status"`
+	Labels       []string `json:"labels"`
+	Per          int      `json:"per"`
+	Page         int      `json:"page"`
+	SortBy       string   `json:"sort_by"`
+	SortOrder    string   `json:"sort_order"`
+	ExactMatch   bool     `json:"exact_match"`
+}
+
+type RefreshTokenReq struct {
+	NSUUID       string    `json:"ns_uuid"`
+	OpUUID       string    `json:"op_uuid"`
+	Username     string    `json:"username"`
+	TokenName    string    `json:"token_name"`
+	App          string    `json:"app"`
+	NewExpiredAt time.Time `json:"new_expired_at"`
+}

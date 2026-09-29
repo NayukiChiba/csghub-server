@@ -1,0 +1,717 @@
+//go:build !saas
+
+package component
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"opencsg.com/csghub-server/builder/git/gitserver"
+	"opencsg.com/csghub-server/builder/rebac"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/types"
+)
+
+// evalModelCommit and evalDatasetCommit are the commits every repository lookup in these
+// tests resolves to, standing in for the head of the default branch at submit time.
+const (
+	evalModelCommit   = "1111111111111111111111111111111111111111"
+	evalDatasetCommit = "2222222222222222222222222222222222222222"
+)
+
+// expectEvaluationCommitLookups pins the model and dataset revisions an evaluation
+// request resolves to. Expectations are optional because the error cases below fail
+// before every lookup is reached.
+func expectEvaluationCommitLookups(c *testEvaluationWithMocks, ctx context.Context) {
+	c.mocks.gitServer.EXPECT().GetRepoLastCommit(ctx, gitserver.GetRepoLastCommitReq{
+		Namespace: "opencsg", Name: "wukong", Ref: "main", RepoType: types.ModelRepo,
+	}).Return(&types.Commit{ID: evalModelCommit}, nil).Maybe()
+	c.mocks.gitServer.EXPECT().GetRepoLastCommit(ctx, gitserver.GetRepoLastCommitReq{
+		Namespace: "opencsg", Name: "hellaswag", Ref: "main", RepoType: types.DatasetRepo,
+	}).Return(&types.Commit{ID: evalDatasetCommit}, nil).Maybe()
+}
+
+func TestEvaluationComponent_CreateEvaluation(t *testing.T) {
+	req := types.EvaluationReq{
+		TaskName:           "test",
+		ModelIds:           []string{"opencsg/wukong"},
+		Username:           "test",
+		ResourceId:         0,
+		Datasets:           []string{"opencsg/hellaswag"},
+		RuntimeFrameworkId: 1,
+	}
+	ctx := context.TODO()
+	req2 := types.EvaluationReq{
+		UserUUID:           "test",
+		TaskName:           "test",
+		ModelIds:           []string{"opencsg/wukong"},
+		Username:           "test",
+		OwnerNamespace:     "test",
+		ResourceId:         0,
+		Datasets:           []string{"Rowan/hellaswag"},
+		DatasetRevisions:   []string{"main"},
+		DatasetCommits:     []string{evalDatasetCommit},
+		RuntimeFrameworkId: 1,
+		Revisions:          []string{evalModelCommit},
+		Hardware: types.HardWare{
+			Gpu: types.Processor{
+				Num:          "1",
+				ResourceName: "nvidia.com/gpu",
+			},
+			Cpu: types.CPU{
+				Num: "4",
+			},
+			Memory: "32Gi",
+		},
+		Image:    "evalscope:1.11.1-cu130",
+		RepoType: "model",
+		TaskType: "evaluation",
+		Token:    "foo",
+		Nodes:    []types.Node{{Name: "node1", EnableVXPU: false}},
+	}
+	t.Run("create evaluation without resource id", func(t *testing.T) {
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		c.config.Argo.QuotaGPUNumber = "1"
+		c.mocks.stores.UserMock().EXPECT().FindByUsername(ctx, req.Username).Return(database.User{
+			RoleMask: "admin",
+			Username: req.Username,
+			UUID:     req.Username,
+			ID:       1,
+		}, nil).Once()
+		c.mocks.stores.ModelMock().EXPECT().FindByPath(ctx, "opencsg", "wukong").Return(
+			&database.Model{
+				ID: 1,
+				Repository: &database.Repository{
+					DefaultBranch: "main",
+				},
+			}, nil,
+		).Maybe()
+		c.mocks.stores.RepoMock().EXPECT().FindByPath(ctx, types.DatasetRepo, "opencsg", "hellaswag").Return(&database.Repository{
+			ID:            1,
+			DefaultBranch: "main",
+			HFPath:        "Rowan/hellaswag",
+		}, nil)
+		c.mocks.stores.AccessTokenMock().EXPECT().FindByUID(ctx, int64(1)).Return(&database.AccessToken{Token: "foo"}, nil)
+		c.mocks.stores.RuntimeFrameworkMock().EXPECT().FindEnabledByID(ctx, int64(1)).Return(&database.RuntimeFramework{
+			ID:          1,
+			FrameImage:  "evalscope:1.11.1-cu130",
+			ComputeType: string(types.ResourceTypeGPU),
+		}, nil)
+
+		e, err := c.CreateEvaluation(ctx, req)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "share mode is deprecated")
+		require.Nil(t, e)
+	})
+	t.Run("create evaluation with resource id", func(t *testing.T) {
+		req.ResourceId = 1
+		req2.ResourceId = 1
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		c.config.Argo.QuotaGPUNumber = "1"
+		c.mocks.stores.UserMock().EXPECT().FindByUsername(ctx, req.Username).Return(database.User{
+			RoleMask: "admin",
+			Username: req.Username,
+			UUID:     req.Username,
+			ID:       1,
+		}, nil).Once()
+		c.mocks.stores.ModelMock().EXPECT().FindByPath(ctx, "opencsg", "wukong").Return(
+			&database.Model{
+				ID: 1,
+				Repository: &database.Repository{
+					DefaultBranch: "main",
+				},
+			}, nil,
+		).Maybe()
+		c.mocks.stores.RepoMock().EXPECT().FindByPath(ctx, types.DatasetRepo, "opencsg", "hellaswag").Return(&database.Repository{
+			ID:            1,
+			DefaultBranch: "main",
+			HFPath:        "Rowan/hellaswag",
+		}, nil)
+		c.mocks.stores.AccessTokenMock().EXPECT().FindByUID(ctx, int64(1)).Return(&database.AccessToken{Token: "foo"}, nil)
+		c.mocks.stores.RuntimeFrameworkMock().EXPECT().FindEnabledByID(ctx, int64(1)).Return(&database.RuntimeFramework{
+			ID:          1,
+			FrameName:   "evalscope",
+			FrameImage:  "evalscope:1.11.1-cu130",
+			ComputeType: string(types.ResourceTypeGPU),
+		}, nil)
+		resource, err := json.Marshal(req2.Hardware)
+		require.Nil(t, err)
+		c.mocks.stores.SpaceResourceMock().EXPECT().FindByID(ctx, int64(1)).Return(&database.SpaceResource{
+			ID:        1,
+			Name:      "1 GPU · 4 vCPU · 32Gi",
+			Resources: string(resource),
+			ClusterID: "c1",
+		}, nil)
+		c.mocks.components.repo.EXPECT().CheckAccountAndResource(ctx, types.CheckResourceAndAccountReq{UserName: "test", ClusterID: "c1", OrderDetailID: 0, CurrentUser: "test"}, mock.Anything).Return(&types.CheckExclusiveResp{}, nil)
+		c.mocks.stores.ClusterInfoMock().EXPECT().FindNodeByClusterID(ctx, "c1").Return([]database.ClusterNode{
+			{
+				Name: "node1",
+			},
+		}, nil)
+		c.mocks.deployer.EXPECT().SubmitEvaluation(ctx, mock.MatchedBy(func(r types.EvaluationReq) bool {
+			// the caller sent no configuration, so what reaches the deployer - and is
+			// recorded - must be the effective one rather than an empty string
+			return r.ResourceName == "1 GPU · 4 vCPU · 32Gi" && r.ClusterID == "c1" &&
+				r.FrameworkConfig == `{"generation_config":{"do_sample":false,"max_tokens":8192},"limit":10}`
+		})).Return(&types.ArgoWorkFlowRes{
+			ID:       1,
+			TaskName: "test",
+		}, nil)
+
+		e, err := c.CreateEvaluation(ctx, req)
+		require.NotNil(t, e)
+		require.Equal(t, "test", e.TaskName)
+		require.Nil(t, err)
+	})
+
+	t.Run("create evaluation with invalid model id", func(t *testing.T) {
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		invalidReq := types.EvaluationReq{
+			TaskName:           "test",
+			ModelIds:           []string{"badmodelid"},
+			Username:           "test",
+			ResourceId:         0,
+			Datasets:           []string{"opencsg/hellaswag"},
+			RuntimeFrameworkId: 1,
+		}
+		c.mocks.stores.UserMock().EXPECT().FindByUsername(ctx, invalidReq.Username).Return(database.User{
+			RoleMask: "admin",
+			Username: invalidReq.Username,
+			UUID:     invalidReq.Username,
+			ID:       1,
+		}, nil).Once()
+		c.mocks.stores.RuntimeFrameworkMock().EXPECT().FindEnabledByID(ctx, int64(1)).Return(&database.RuntimeFramework{
+			FrameName: "evalscope",
+		}, nil).Once()
+		_, err := c.CreateEvaluation(ctx, invalidReq)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "invalid model id format: badmodelid")
+	})
+
+	t.Run("create evaluation with invalid dataset", func(t *testing.T) {
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		invalidReq := types.EvaluationReq{
+			TaskName:           "test",
+			ModelIds:           []string{"opencsg/wukong"},
+			Username:           "test",
+			ResourceId:         0,
+			Datasets:           []string{"baddataset"},
+			RuntimeFrameworkId: 1,
+		}
+		c.mocks.stores.UserMock().EXPECT().FindByUsername(ctx, invalidReq.Username).Return(database.User{
+			RoleMask: "admin",
+			Username: invalidReq.Username,
+			UUID:     invalidReq.Username,
+			ID:       1,
+		}, nil).Once()
+		c.mocks.stores.RuntimeFrameworkMock().EXPECT().FindEnabledByID(ctx, int64(1)).Return(&database.RuntimeFramework{
+			FrameName: "evalscope",
+		}, nil).Once()
+		c.mocks.stores.ModelMock().EXPECT().FindByPath(ctx, "opencsg", "wukong").Return(
+			&database.Model{
+				ID: 1,
+				Repository: &database.Repository{
+					DefaultBranch: "main",
+				},
+			}, nil,
+		).Once()
+		c.mocks.stores.AccessTokenMock().EXPECT().FindByUID(ctx, int64(1)).Return(&database.AccessToken{Token: "foo"}, nil).Once()
+		_, err := c.CreateEvaluation(ctx, invalidReq)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to generate mirror repo ids")
+	})
+
+	t.Run("create evaluation with invalid custom dataset", func(t *testing.T) {
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		invalidReq := types.EvaluationReq{
+			TaskName:           "test",
+			ModelIds:           []string{"opencsg/wukong"},
+			Username:           "test",
+			ResourceId:         0,
+			CustomDataSets:     []string{"badcustomdataset"},
+			RuntimeFrameworkId: 1,
+		}
+		c.mocks.stores.UserMock().EXPECT().FindByUsername(ctx, invalidReq.Username).Return(database.User{
+			RoleMask: "admin",
+			Username: invalidReq.Username,
+			UUID:     invalidReq.Username,
+			ID:       1,
+		}, nil).Once()
+		c.mocks.stores.RuntimeFrameworkMock().EXPECT().FindEnabledByID(ctx, int64(1)).Return(&database.RuntimeFramework{
+			FrameName: "evalscope",
+		}, nil).Once()
+		c.mocks.stores.ModelMock().EXPECT().FindByPath(ctx, "opencsg", "wukong").Return(
+			&database.Model{
+				ID: 1,
+				Repository: &database.Repository{
+					DefaultBranch: "main",
+				},
+			}, nil,
+		).Once()
+		c.mocks.stores.AccessTokenMock().EXPECT().FindByUID(ctx, int64(1)).Return(&database.AccessToken{Token: "foo"}, nil).Once()
+		_, err := c.CreateEvaluation(ctx, invalidReq)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to generate mirror repo ids")
+	})
+
+	t.Run("non_admin_namespace_permission_error", func(t *testing.T) {
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		req := types.EvaluationReq{
+			TaskName:           "test",
+			ModelIds:           []string{"opencsg/wukong"},
+			Username:           "test",
+			OwnerNamespace:     "org1",
+			ResourceId:         0,
+			Datasets:           []string{"opencsg/hellaswag"},
+			RuntimeFrameworkId: 1,
+		}
+		c.mocks.stores.UserMock().EXPECT().FindByUsername(ctx, req.Username).Return(database.User{
+			RoleMask: "",
+			Username: req.Username,
+			UUID:     req.Username,
+			ID:       1,
+		}, nil).Once()
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "test", "org1", rebac.NamespaceCanWrite).Return(false, errors.New("rpc error"))
+		_, err := c.CreateEvaluation(ctx, req)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to check namespace permission")
+	})
+	t.Run("non_admin_namespace_forbidden", func(t *testing.T) {
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		req := types.EvaluationReq{
+			TaskName:           "test",
+			ModelIds:           []string{"opencsg/wukong"},
+			Username:           "test",
+			OwnerNamespace:     "org1",
+			ResourceId:         0,
+			Datasets:           []string{"opencsg/hellaswag"},
+			RuntimeFrameworkId: 1,
+		}
+		c.mocks.stores.UserMock().EXPECT().FindByUsername(ctx, req.Username).Return(database.User{
+			RoleMask: "",
+			Username: req.Username,
+			UUID:     req.Username,
+			ID:       1,
+		}, nil).Once()
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "test", "org1", rebac.NamespaceCanWrite).Return(false, nil)
+		_, err := c.CreateEvaluation(ctx, req)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "do not have permission to create evaluation in this namespace")
+	})
+	t.Run("create evaluation under org uses org billing UUID", func(t *testing.T) {
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		c.config.Argo.QuotaGPUNumber = "1"
+		orgReq := types.EvaluationReq{
+			TaskName:           "org-eval",
+			ModelIds:           []string{"opencsg/wukong"},
+			Username:           "testuser",
+			OwnerNamespace:     "org1",
+			ResourceId:         0,
+			Datasets:           []string{"opencsg/hellaswag"},
+			RuntimeFrameworkId: 1,
+		}
+		c.mocks.stores.UserMock().EXPECT().FindByUsername(ctx, "testuser").Return(database.User{
+			RoleMask: "",
+			Username: "testuser",
+			UUID:     "user-uuid",
+			ID:       1,
+		}, nil).Once()
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "testuser", "org1", rebac.NamespaceCanWrite).Return(true, nil)
+		c.mocks.stores.ModelMock().EXPECT().FindByPath(ctx, "opencsg", "wukong").Return(
+			&database.Model{
+				ID: 1,
+				Repository: &database.Repository{
+					DefaultBranch: "main",
+				},
+			}, nil,
+		).Maybe()
+		c.mocks.stores.AccessTokenMock().EXPECT().FindByUID(ctx, int64(1)).Return(&database.AccessToken{Token: "foo"}, nil)
+		c.mocks.stores.RepoMock().EXPECT().FindByPath(ctx, types.DatasetRepo, "opencsg", "hellaswag").Return(&database.Repository{
+			ID:            1,
+			DefaultBranch: "main",
+			HFPath:        "Rowan/hellaswag",
+		}, nil)
+		c.mocks.stores.RuntimeFrameworkMock().EXPECT().FindEnabledByID(ctx, int64(1)).Return(&database.RuntimeFramework{
+			ID:          1,
+			FrameImage:  "evalscope:1.11.1-cu130",
+			ComputeType: string(types.ResourceTypeGPU),
+		}, nil)
+
+		e, err := c.CreateEvaluation(ctx, orgReq)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "share mode is deprecated")
+		require.Nil(t, e)
+	})
+}
+
+func TestEvaluationComponent_GetEvaluation(t *testing.T) {
+	ctx := context.TODO()
+	c := initializeTestEvaluationComponent(ctx, t)
+	c.config.Argo.QuotaGPUNumber = "1"
+	req := types.EvaluationGetReq{
+		Username: "test",
+		ID:       1,
+	}
+	c.mocks.stores.WorkflowMock().EXPECT().FindByID(ctx, int64(1)).Return(database.ArgoWorkflow{
+		ID:       1,
+		RepoIds:  []string{"Rowan/hellaswag"},
+		Datasets: []string{"Rowan/hellaswag"},
+		RepoType: "model",
+		Username: "test",
+		TaskName: "test",
+		TaskId:   "test",
+		TaskType: "evaluation",
+		Status:   "Succeed",
+	}, nil)
+	c.mocks.stores.DatasetMock().EXPECT().FindByOriginPath(ctx, "Rowan/hellaswag").Return(&database.Dataset{
+		Repository: &database.Repository{
+			Path: "Rowan/hellaswag",
+			Tags: []database.Tag{
+				{
+					Name:     "test",
+					Category: "test",
+					Group:    "test",
+					Scope:    "test",
+					BuiltIn:  true,
+				},
+			},
+		},
+	}, nil)
+	e, err := c.GetEvaluation(ctx, req)
+	require.NotNil(t, e)
+	require.Equal(t, "test", e.TaskName)
+	require.Nil(t, err)
+}
+
+func TestEvaluationComponent_GetEvaluation_AccessControl(t *testing.T) {
+	t.Run("owner is req user", func(t *testing.T) {
+		ctx := context.TODO()
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		c.config.Argo.QuotaGPUNumber = "1"
+		req := types.EvaluationGetReq{
+			Username: "test",
+			ID:       1,
+		}
+		c.mocks.stores.WorkflowMock().EXPECT().FindByID(ctx, int64(1)).Return(database.ArgoWorkflow{
+			ID:       1,
+			RepoIds:  []string{"Rowan/hellaswag"},
+			Datasets: []string{"deleted/dataset"},
+			RepoType: "model",
+			Username: "test",
+			TaskName: "test",
+			TaskId:   "test",
+			TaskType: "evaluation",
+			Status:   "Succeed",
+		}, nil)
+		c.mocks.stores.DatasetMock().EXPECT().FindByOriginPath(ctx, "deleted/dataset").Return(nil, sql.ErrNoRows)
+		e, err := c.GetEvaluation(ctx, req)
+		require.NotNil(t, e)
+		require.Equal(t, "test", e.TaskName)
+		require.Nil(t, err)
+		require.Len(t, e.Datasets, 1)
+		require.True(t, e.Datasets[0].Deleted)
+		require.Equal(t, "deleted/dataset", e.Datasets[0].RepoId)
+	})
+	t.Run("owner is different from req user and req user has no read permission", func(t *testing.T) {
+		ctx := context.TODO()
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		req := types.EvaluationGetReq{
+			Username: "otheruser",
+			ID:       1,
+		}
+		c.mocks.stores.WorkflowMock().EXPECT().FindByID(ctx, int64(1)).Return(database.ArgoWorkflow{
+			ID:       1,
+			RepoIds:  []string{"Rowan/hellaswag"},
+			Datasets: []string{"Rowan/hellaswag"},
+			RepoType: "model",
+			Username: "test",
+			TaskName: "test",
+			TaskId:   "test",
+			TaskType: "evaluation",
+			Status:   "Succeed",
+		}, nil)
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "otheruser", "test", rebac.NamespaceCanRead).Return(false, nil)
+		e, err := c.GetEvaluation(ctx, req)
+		require.Equal(t, err, errorx.ErrForbidden)
+		require.Nil(t, e)
+	})
+	t.Run("owner is different from req user and req user has read permission", func(t *testing.T) {
+		ctx := context.TODO()
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		req := types.EvaluationGetReq{
+			Username: "otheruser",
+			ID:       1,
+		}
+		c.mocks.stores.WorkflowMock().EXPECT().FindByID(ctx, int64(1)).Return(database.ArgoWorkflow{
+			ID:       1,
+			RepoIds:  []string{"Rowan/hellaswag"},
+			Datasets: []string{"Rowan/hellaswag"},
+			RepoType: "model",
+			Username: "test",
+			TaskName: "test",
+			TaskId:   "test",
+			TaskType: "evaluation",
+			Status:   "Succeed",
+		}, nil)
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "otheruser", "test", rebac.NamespaceCanRead).Return(true, nil)
+		c.mocks.stores.DatasetMock().EXPECT().FindByOriginPath(ctx, "Rowan/hellaswag").Return(&database.Dataset{
+			Repository: &database.Repository{
+				Path: "Rowan/hellaswag",
+				Tags: []database.Tag{
+					{
+						Name:     "test",
+						Category: "test",
+						Group:    "test",
+						Scope:    "test",
+						BuiltIn:  true,
+					},
+				},
+			},
+		}, nil)
+		e, err := c.GetEvaluation(ctx, req)
+		require.NotNil(t, e)
+		require.Equal(t, "test", e.TaskName)
+		require.Nil(t, err)
+		require.Len(t, e.Datasets, 1)
+		require.False(t, e.Datasets[0].Deleted)
+		require.Equal(t, "Rowan/hellaswag", e.Datasets[0].RepoId)
+	})
+	t.Run("owner is different from req user and permission check fails", func(t *testing.T) {
+		ctx := context.TODO()
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		req := types.EvaluationGetReq{
+			Username: "otheruser",
+			ID:       1,
+		}
+		c.mocks.stores.WorkflowMock().EXPECT().FindByID(ctx, int64(1)).Return(database.ArgoWorkflow{
+			ID:       1,
+			RepoIds:  []string{"Rowan/hellaswag"},
+			Datasets: []string{"Rowan/hellaswag"},
+			RepoType: "model",
+			Username: "test",
+			TaskName: "test",
+			TaskId:   "test",
+			TaskType: "evaluation",
+			Status:   "Succeed",
+		}, nil)
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "otheruser", "test", rebac.NamespaceCanRead).Return(false, errors.New("rpc error"))
+		e, err := c.GetEvaluation(ctx, req)
+		require.Nil(t, e)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to check namespace permission")
+	})
+	t.Run("org member can view org evaluation", func(t *testing.T) {
+		ctx := context.TODO()
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		req := types.EvaluationGetReq{
+			Username: "orgmember",
+			ID:       1,
+		}
+		c.mocks.stores.WorkflowMock().EXPECT().FindByID(ctx, int64(1)).Return(database.ArgoWorkflow{
+			ID:       1,
+			RepoIds:  []string{"Rowan/hellaswag"},
+			Datasets: []string{"Rowan/hellaswag"},
+			RepoType: "model",
+			Username: "org1",
+			TaskName: "org-eval",
+			TaskId:   "org-eval-1",
+			TaskType: "evaluation",
+			Status:   "Succeed",
+		}, nil)
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "orgmember", "org1", rebac.NamespaceCanRead).Return(true, nil)
+		c.mocks.stores.DatasetMock().EXPECT().FindByOriginPath(ctx, "Rowan/hellaswag").Return(&database.Dataset{
+			Repository: &database.Repository{
+				Path: "Rowan/hellaswag",
+				Tags: []database.Tag{},
+			},
+		}, nil)
+		e, err := c.GetEvaluation(ctx, req)
+		require.NotNil(t, e)
+		require.Equal(t, "org-eval", e.TaskName)
+		require.Nil(t, err)
+	})
+	t.Run("non org member cannot view org evaluation", func(t *testing.T) {
+		ctx := context.TODO()
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		req := types.EvaluationGetReq{
+			Username: "outsider",
+			ID:       1,
+		}
+		c.mocks.stores.WorkflowMock().EXPECT().FindByID(ctx, int64(1)).Return(database.ArgoWorkflow{
+			ID:       1,
+			RepoIds:  []string{"Rowan/hellaswag"},
+			Datasets: []string{"Rowan/hellaswag"},
+			RepoType: "model",
+			Username: "org1",
+			TaskName: "org-eval",
+			TaskId:   "org-eval-1",
+			TaskType: "evaluation",
+			Status:   "Succeed",
+		}, nil)
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "outsider", "org1", rebac.NamespaceCanRead).Return(false, nil)
+		e, err := c.GetEvaluation(ctx, req)
+		require.Equal(t, err, errorx.ErrForbidden)
+		require.Nil(t, e)
+	})
+}
+
+func TestEvaluationComponent_DeleteEvaluation(t *testing.T) {
+	t.Run("owner can delete own evaluation", func(t *testing.T) {
+		ctx := context.TODO()
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+
+		c.mocks.stores.WorkflowMock().EXPECT().FindByID(ctx, int64(1)).Return(database.ArgoWorkflow{
+			ID:        1,
+			RepoIds:   []string{"Rowan/hellaswag"},
+			Datasets:  []string{"Rowan/hellaswag"},
+			RepoType:  "model",
+			Username:  "test",
+			TaskName:  "test",
+			TaskId:    "test",
+			TaskType:  "evaluation",
+			Status:    "Succeed",
+			ClusterID: "test",
+			Namespace: "test",
+		}, nil)
+		req := types.EvaluationDelReq{
+			Username:  "test",
+			ID:        1,
+			TaskID:    "test",
+			ClusterID: "test",
+			Namespace: "test",
+		}
+		c.mocks.stores.WorkflowMock().EXPECT().DeleteWorkFlow(ctx, int64(1)).Return(nil)
+		c.mocks.deployer.EXPECT().DeleteEvaluation(ctx, req).Return(nil)
+		err := c.DeleteEvaluation(ctx, req)
+		require.Nil(t, err)
+	})
+
+	t.Run("org member with write permission can delete org evaluation", func(t *testing.T) {
+		ctx := context.TODO()
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+
+		c.mocks.stores.WorkflowMock().EXPECT().FindByID(ctx, int64(1)).Return(database.ArgoWorkflow{
+			ID:        1,
+			Username:  "org1",
+			TaskId:    "org-task-1",
+			TaskType:  "evaluation",
+			Status:    "Succeed",
+			ClusterID: "cluster1",
+			Namespace: "ns1",
+		}, nil)
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "orgmember", "org1", rebac.NamespaceCanWrite).Return(true, nil)
+		req := types.EvaluationDelReq{
+			Username: "orgmember",
+			ID:       1,
+		}
+		c.mocks.stores.WorkflowMock().EXPECT().DeleteWorkFlow(ctx, int64(1)).Return(nil)
+		c.mocks.deployer.EXPECT().DeleteEvaluation(ctx, mock.Anything).Return(nil)
+		err := c.DeleteEvaluation(ctx, req)
+		require.Nil(t, err)
+	})
+
+	t.Run("user without write permission cannot delete org evaluation", func(t *testing.T) {
+		ctx := context.TODO()
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+
+		c.mocks.stores.WorkflowMock().EXPECT().FindByID(ctx, int64(1)).Return(database.ArgoWorkflow{
+			ID:        1,
+			Username:  "org1",
+			TaskId:    "org-task-1",
+			TaskType:  "evaluation",
+			Status:    "Succeed",
+			ClusterID: "cluster1",
+			Namespace: "ns1",
+		}, nil)
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "outsider", "org1", rebac.NamespaceCanWrite).Return(false, nil)
+		req := types.EvaluationDelReq{
+			Username: "outsider",
+			ID:       1,
+		}
+		err := c.DeleteEvaluation(ctx, req)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "do not have permission to delete evaluation")
+	})
+
+	t.Run("delete permission check error", func(t *testing.T) {
+		ctx := context.TODO()
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+
+		c.mocks.stores.WorkflowMock().EXPECT().FindByID(ctx, int64(1)).Return(database.ArgoWorkflow{
+			ID:       1,
+			Username: "org1",
+			TaskId:   "org-task-1",
+		}, nil)
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "orgmember", "org1", rebac.NamespaceCanWrite).Return(false, errors.New("rpc error"))
+		req := types.EvaluationDelReq{
+			Username: "orgmember",
+			ID:       1,
+		}
+		err := c.DeleteEvaluation(ctx, req)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to check namespace permission")
+	})
+}
+
+func TestEvaluationComponent_OrgEvaluations(t *testing.T) {
+	ctx := context.TODO()
+
+	t.Run("with current user and read permission", func(t *testing.T) {
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		req := &types.OrgEvaluationsReq{
+			Namespace:   "org1",
+			CurrentUser: "user1",
+			PageOpts:    types.PageOpts{Page: 1, PageSize: 10},
+		}
+		c.mocks.components.repo.EXPECT().CheckCurrentUserPermission(ctx, "user1", "org1", rebac.NamespaceCanRead).Return(true, nil)
+		c.mocks.stores.WorkflowMock().EXPECT().FindByUsernameWithTaskTypes(ctx, "org1", evaluationTaskTypes, 10, 1).Return([]database.ArgoWorkflow{
+			{ID: 1, TaskName: "ev1", Username: "org1", TaskType: "evaluation", Status: "Succeed"},
+		}, 1, nil)
+		res, total, err := c.OrgEvaluations(ctx, req)
+		require.Nil(t, err)
+		require.Equal(t, 1, total)
+		require.Len(t, res, 1)
+		require.Equal(t, "ev1", res[0].TaskName)
+		require.Equal(t, "org1", res[0].Username)
+	})
+
+	t.Run("without current user skips permission check", func(t *testing.T) {
+		c := initializeTestEvaluationComponent(ctx, t)
+		expectEvaluationCommitLookups(c, ctx)
+		req := &types.OrgEvaluationsReq{
+			Namespace:   "org1",
+			CurrentUser: "",
+			PageOpts:    types.PageOpts{Page: 1, PageSize: 10},
+		}
+		c.mocks.stores.WorkflowMock().EXPECT().FindByUsernameWithTaskTypes(ctx, "org1", evaluationTaskTypes, 10, 1).Return([]database.ArgoWorkflow{}, 0, nil)
+		res, total, err := c.OrgEvaluations(ctx, req)
+		require.Nil(t, err)
+		require.Equal(t, 0, total)
+		require.Len(t, res, 0)
+	})
+}

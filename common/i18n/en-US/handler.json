@@ -1,0 +1,173 @@
+{
+    "handler.list": {
+        "other": "list"
+    },
+    "handler.sshkey": {
+        "other": "ssh key"
+    },
+    "handler.mcpserver": {
+        "other": "mcp server"
+    },
+    "handler.spacesdk": {
+        "other": "space sdk"
+    },
+    "handler.accounting": {
+        "other": "accounting"
+    },
+    "handler.discussion": {
+        "other": "discussion"
+    },
+    "handler.internalserviceproxy": {
+        "other": "internal service proxy"
+    },
+    "handler.sync": {
+        "other": "sync"
+    },
+    "handler.space": {
+        "other": "space"
+    },
+    "handler.rproxy": {
+        "other": "rproxy"
+    },
+    "handler.recom": {
+        "other": "recom"
+    },
+    "handler.event": {
+        "other": "event"
+    },
+    "handler.dataset": {
+        "other": "dataset"
+    },
+    "handler.cluster": {
+        "other": "cluster"
+    },
+    "handler.hfdataset": {
+        "other": "Hugging Face dataset"
+    },
+    "handler.broadcast": {
+        "other": "broadcast"
+    },
+    "handler.monitor": {
+        "other": "monitor"
+    },
+    "handler.spacetemplate": {
+        "other": "space template"
+    },
+    "handler.mirrorsource": {
+        "other": "mirror source"
+    },
+    "handler.prompt": {
+        "other": "prompt"
+    },
+    "handler.mirror": {
+        "other": "mirror"
+    },
+    "handler.gitcallback": {
+        "other": "git call back"
+    },
+    "handler.repo": {
+        "other": "repo"
+    },
+    "handler.user": {
+        "other": "user"
+    },
+    "handler.tags": {
+        "other": "tag"
+    },
+    "handler.organization": {
+        "other": "organization"
+    },
+    "handler.sensitive": {
+        "other": "sensitive"
+    },
+    "handler.internal": {
+        "other": "internal"
+    },
+    "handler.githttp": {
+        "other": "githttp"
+    },
+    "handler.evaluation": {
+        "other": "evaluation"
+    },
+    "handler.spaceresource": {
+        "other": "space resource"
+    },
+    "handler.telemetry": {
+        "other": "telemetry"
+    },
+    "handler.model": {
+        "other": "model"
+    },
+    "handler.collection": {
+        "other": "collection"
+    },
+    "handler.modeltree": {
+        "other": "model tree"
+    },
+    "handler.stat": {
+        "other": "stat"
+    },
+    "handler.dataflowproxy": {
+        "other": "dataflow proxy"
+    },
+    "handler.license": {
+        "other": "license"
+    },
+    "handler.runtimearchitecture": {
+        "other": "runtime architecture"
+    },
+    "handler.code": {
+        "other": "code"
+    },
+    "handler.syncclientsetting": {
+        "other": "sync client setting"
+    },
+    "handler.rule": {
+        "other": "rule"
+    },
+    "handler.config": {
+        "other": "config"
+    },
+    "handler.token_report.date": {
+        "other": "Date"
+    },
+    "handler.token_report.user_org": {
+        "other": "User/Org"
+    },
+    "handler.token_report.api_key": {
+        "other": "API Key"
+    },
+    "handler.token_report.model": {
+        "other": "Model"
+    },
+    "handler.token_report.provider": {
+        "other": "Provider"
+    },
+    "handler.token_report.call_count": {
+        "other": "Total Calls"
+    },
+    "handler.token_report.prompt_token": {
+        "other": "Input Tokens"
+    },
+    "handler.token_report.completion_token": {
+        "other": "Output/Reasoning Tokens"
+    },
+    "handler.token_report.cache_hit_rate": {
+        "other": "Cache Hit Rate"
+    },
+    "handler.token_report.revenue": {
+        "other": "Revenue"
+    },
+    "handler.token_report.cost": {
+        "other": "Cost"
+    },
+    "handler.token_report.margin": {
+        "other": "Margin"
+    },
+    "handler.token_report.margin_rate": {
+        "other": "Margin Rate"
+    },
+    "handler.token_report.total": {
+        "other": "Total"
+    }
+}

@@ -1,0 +1,29 @@
+{
+    "error.REPO-ERR-0": {
+        "other": "仓库名称已存在"
+    },
+    "error.REPO-ERR-1": {
+        "other": "仓库名称无效"
+    },
+    "error.REPO-ERR-2": {
+        "other": "命名空间不存在"
+    },
+    "error.REPO-ERR-3": {
+        "other": "仓库未找到"
+    },
+    "error.REPO-ERR-4": {
+        "other": "用户未指定分支，请指定分支后再试"
+    },
+    "error.REPO-ERR-5": {
+        "other": "下载代码 zip 归档失败"
+    },
+    "error.REPO-ERR-6": {
+        "other": "批量获取仓库额外信息失败"
+    },
+    "error.REPO-ERR-7": {
+        "other": "无法更改仓库路径，以下依赖实体存在：{{.entity}}。请先移除它们。"
+    },
+    "error.REPO-ERR-8": {
+        "other": "合规扫描未通过，无法将仓库设置为公开。"
+    }
+}

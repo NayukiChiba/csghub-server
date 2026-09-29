@@ -1,0 +1,125 @@
+//go:build !ee && !saas
+
+package workflow
+
+import (
+	"context"
+	"fmt"
+
+	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
+	"opencsg.com/csghub-server/api/workflow/activity"
+	"opencsg.com/csghub-server/builder/temporal"
+	"opencsg.com/csghub-server/common/config"
+	"opencsg.com/csghub-server/common/types"
+)
+
+func RegisterCronJobs(config *config.Config, temporalClient temporal.Client) error {
+	var err error
+	scheduler := temporalClient.GetScheduleClient()
+
+	_, err = scheduler.Create(context.Background(), client.ScheduleOptions{
+		ID: "sync-as-client-schedule",
+		Spec: client.ScheduleSpec{
+			CronExpressions: []string{config.CronJob.SyncAsClientCronExpression},
+		},
+		Overlap: enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
+		Action: &client.ScheduleWorkflowAction{
+			ID:        "sync-as-client-workflow",
+			TaskQueue: CronJobQueueName,
+			Workflow:  SyncAsClientWorkflow,
+			Args:      []interface{}{},
+		},
+	})
+	if err != nil && err.Error() != types.AlreadyScheduledMessage {
+		return fmt.Errorf("unable to create schedule, error:%w", err)
+	}
+
+	_, err = scheduler.Create(context.Background(), client.ScheduleOptions{
+		ID: "calc-recom-score-schedule",
+		Spec: client.ScheduleSpec{
+			CronExpressions: []string{config.CronJob.CalcRecomScoreCronExpression},
+		},
+		Overlap: enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
+		Action: &client.ScheduleWorkflowAction{
+			ID:        "calc-recom-score-workflow",
+			TaskQueue: CronJobQueueName,
+			Workflow:  CalcRecomScoreWorkflow,
+			Args:      []interface{}{},
+		},
+	})
+	if err != nil && err.Error() != types.AlreadyScheduledMessage {
+		return fmt.Errorf("unable to create schedule, error:%w", err)
+	}
+
+	_, err = scheduler.Create(context.Background(), client.ScheduleOptions{
+		ID: "delete-pending-deletion-schedule",
+		Spec: client.ScheduleSpec{
+			CronExpressions: []string{config.CronJob.DeletePendingDeletionCronExpression},
+		},
+		Overlap: enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
+		Action: &client.ScheduleWorkflowAction{
+			ID:        "delete-pending-deletion-workflow",
+			TaskQueue: CronJobQueueName,
+			Workflow:  DeletePendingDeletionWorkflow,
+			Args:      []interface{}{},
+		},
+	})
+	if err != nil && err.Error() != types.AlreadyScheduledMessage {
+		return fmt.Errorf("unable to create delete pending deletion schedule, error:%w", err)
+	}
+
+	_, err = scheduler.Create(context.Background(), client.ScheduleOptions{
+		ID: "aigateway-async-generation-schedule",
+		Spec: client.ScheduleSpec{
+			CronExpressions: []string{config.CronJob.AIGatewayAsyncGenerationCronExpression},
+		},
+		Overlap: enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
+		Action: &client.ScheduleWorkflowAction{
+			ID:        "aigateway-async-generation-workflow",
+			TaskQueue: CronJobQueueName,
+			Workflow:  ProcessAIGatewayAsyncGenerationsWorkflow,
+			Args:      []interface{}{},
+		},
+	})
+	if err != nil && err.Error() != types.AlreadyScheduledMessage {
+		return fmt.Errorf("unable to create aigateway async generation schedule, error:%w", err)
+	}
+
+	_, err = scheduler.Create(context.Background(), client.ScheduleOptions{
+		ID: "deploy-reconcile-schedule",
+		Spec: client.ScheduleSpec{
+			CronExpressions: []string{config.DeployReconcile.CronExpression},
+		},
+		Overlap: enumspb.SCHEDULE_OVERLAP_POLICY_SKIP,
+		Action: &client.ScheduleWorkflowAction{
+			ID:        "deploy-reconcile-workflow",
+			TaskQueue: CronJobQueueName,
+			Workflow:  DeployReconcileWorkflow,
+			Args:      []interface{}{},
+		},
+	})
+	if err != nil && err.Error() != types.AlreadyScheduledMessage {
+		return fmt.Errorf("unable to create deploy reconcile schedule, error:%w", err)
+	}
+
+	if err := createSchedule(scheduler, "upstream-sync-reconcile-schedule", config.CronJob.UpstreamSyncReconcileCronExpression, "upstream-sync-reconcile-workflow", UpstreamSyncReconcileWorkflow); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func RegisterCronWorker(config *config.Config, temporalClient temporal.Client, activities *activity.Activities) {
+
+	wfWorker := temporalClient.NewWorker(CronJobQueueName, worker.Options{})
+	wfWorker.RegisterActivity(activities)
+
+	wfWorker.RegisterWorkflow(SyncAsClientWorkflow)
+	wfWorker.RegisterWorkflow(CalcRecomScoreWorkflow)
+	wfWorker.RegisterWorkflow(DeletePendingDeletionWorkflow)
+	wfWorker.RegisterWorkflow(ProcessAIGatewayAsyncGenerationsWorkflow)
+	wfWorker.RegisterWorkflow(DeployReconcileWorkflow)
+	wfWorker.RegisterWorkflow(UpstreamSyncReconcileWorkflow)
+}

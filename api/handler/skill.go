@@ -1,0 +1,493 @@
+package handler
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"opencsg.com/csghub-server/api/httpbase"
+	"opencsg.com/csghub-server/builder/store/s3"
+	"opencsg.com/csghub-server/common/config"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/types"
+	"opencsg.com/csghub-server/common/utils/common"
+	"opencsg.com/csghub-server/component"
+)
+
+func NewSkillHandler(config *config.Config) (*SkillHandler, error) {
+	tc, err := component.NewSkillComponent(config)
+	if err != nil {
+		return nil, err
+	}
+	sc, err := component.NewSensitiveComponent(config)
+	if err != nil {
+		return nil, fmt.Errorf("error creating sensitive component:%w", err)
+	}
+	repo, err := component.NewRepoComponent(config)
+	if err != nil {
+		return nil, fmt.Errorf("error creating repo component:%w", err)
+	}
+	publisher, err := component.NewSkillPublishComponent(config)
+	if err != nil {
+		return nil, fmt.Errorf("error creating skill publish component:%w", err)
+	}
+	s3Client, err := s3.NewMinio(config)
+	if err != nil {
+		return nil, fmt.Errorf("error creating s3 client:%w", err)
+	}
+	return &SkillHandler{
+		skill:     tc,
+		sensitive: sc,
+		repo:      repo,
+		publisher: publisher,
+		s3Client:  s3Client,
+		config:    config,
+	}, nil
+}
+
+type SkillHandler struct {
+	skill     component.SkillComponent
+	sensitive component.SensitiveComponent
+	repo      component.RepoComponent
+	publisher component.SkillPublishComponent
+	s3Client  s3.Client
+	config    *config.Config
+}
+
+// CreateSkill   godoc
+// @Security     ApiKey
+// @Summary      Create a new skill
+// @Description  create a new skill
+// @Tags         Skill
+// @Accept       json
+// @Produce      json
+// @Param        current_user query string false "current user, the owner"
+// @Param        body body types.CreateSkillReq true "body"
+// @Success      200  {object}  types.Response{data=types.Skill} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /skills [post]
+func (h *SkillHandler) Create(ctx *gin.Context) {
+	currentUser := httpbase.GetCurrentUser(ctx)
+	var req *types.CreateSkillReq
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	req.Username = currentUser
+	if req.Namespace == "" {
+		req.Namespace = currentUser
+	}
+
+	_, err := h.sensitive.CheckRequestV2(ctx.Request.Context(), req)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "failed to check sensitive request", slog.Any("error", err))
+		httpbase.BadRequestWithExt(ctx, errorx.ErrSensitiveInfoNotAllowed)
+		return
+	}
+
+	skill, err := h.skill.Create(ctx.Request.Context(), req)
+	if err != nil {
+		if errors.Is(err, errorx.ErrForbidden) {
+			httpbase.ForbiddenError(ctx, err)
+			return
+		} else if errors.Is(err, errorx.ErrDatabaseDuplicateKey) ||
+			errors.Is(err, errorx.ErrMirrorSourceRepoAuthInvalid) ||
+			errors.Is(err, errorx.ErrBadRequest) {
+			httpbase.BadRequestWithExt(ctx, err)
+		} else {
+			slog.ErrorContext(ctx.Request.Context(), "Failed to create skill", slog.Any("error", err))
+			httpbase.ServerError(ctx, err)
+		}
+		return
+	}
+	slog.Info("Create skill succeed", slog.String("skill", skill.Name))
+	httpbase.OK(ctx, skill)
+}
+
+// GetVisiableSkills godoc
+// @Security     ApiKey
+// @Summary      Get Visiable skills for current user
+// @Description  get visiable skills for current user
+// @Tags         Skill
+// @Accept       json
+// @Produce      json
+// @Param        current_user query string false "current user"
+// @Param        search query string false "search text"
+// @Param        sort query string false "sort by"
+// @Param        source query string false "source" Enums(opencsg, huggingface, local)
+// @Param        per query int false "per" default(20)
+// @Param        page query int false "per page" default(1)
+// @Success      200  {object}  types.ResponseWithTotal{data=[]types.Skill,total=int} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /skills [get]
+func (h *SkillHandler) Index(ctx *gin.Context) {
+	filter := new(types.RepoFilter)
+	filter.Tags = parseTagReqs(ctx)
+	filter.Username = httpbase.GetCurrentUser(ctx)
+	per, page, err := common.GetPerAndPageFromContext(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	filter = getFilterFromContext(ctx, filter)
+	if !slices.Contains(types.Sorts, filter.Sort) {
+		msg := fmt.Sprintf("sort parameter must be one of %v", types.Sorts)
+		err := errorx.ReqParamInvalid(errors.New(msg),
+			errorx.Ctx().
+				Set("param", "sort").
+				Set("provided", filter.Sort).
+				Set("allowed", types.Sorts))
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format,", slog.String("error", msg))
+		httpbase.BadRequestWithExt(ctx, err)
+		return
+	}
+
+	if filter.Source != "" && !slices.Contains(types.Sources, filter.Source) {
+		msg := fmt.Sprintf("source parameter must be one of %v", types.Sources)
+		err := errorx.ReqParamInvalid(errors.New(msg),
+			errorx.Ctx().
+				Set("param", "source").
+				Set("provided", filter.Source).
+				Set("allowed", types.Sources))
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format,", slog.String("error", msg))
+		httpbase.BadRequestWithExt(ctx, err)
+		return
+	}
+
+	qNeedOpWeight := ctx.Query("need_op_weight")
+	needOpWeight, err := strconv.ParseBool(qNeedOpWeight)
+	if err != nil {
+		needOpWeight = false
+	}
+
+	skills, total, err := h.skill.Index(ctx.Request.Context(), filter, per, page, needOpWeight, false)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Failed to get skills", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+	slog.Info("Get public skills succeed", slog.Int("count", total))
+	httpbase.OKWithTotal(ctx, skills, total)
+}
+
+// DownloadSkillZip godoc
+// @Security     ApiKey
+// @Summary      Download skill repository as zip archive
+// @Description  Download skill repository as zip archive
+// @Tags         Skill
+// @Produce      application/zip
+// @Param        namespace path string true "repo owner name"
+// @Param        name path string true "repo name"
+// @Param        ref path string true "branch or tag name"
+// @Success      200  {file}  file "OK"
+// @Router       /skills/{namespace}/{name}/download_archive/refs/{ref}/ [get]
+func (h *SkillHandler) DownloadZip(ctx *gin.Context) {
+	namespace, name, err := common.GetNamespaceAndNameFromContext(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	currentUser := httpbase.GetCurrentUser(ctx)
+	ref := strings.TrimPrefix(ctx.Param("ref"), "/")
+
+	zipData, err := h.repo.DownloadRepoZip(ctx.Request.Context(), types.DownloadRepoZipReq{
+		RepoType:  types.SkillRepo,
+		Namespace: namespace,
+		Name:      name,
+		Revision:  ref,
+	}, currentUser)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Failed to download skill zip", slog.String("namespace", namespace), slog.String("name", name), slog.Any("error", err))
+		if errors.Is(err, errorx.ErrForbidden) {
+			httpbase.ForbiddenError(ctx, err)
+			return
+		}
+		if errors.Is(err, errorx.ErrSkillNotFound) {
+			httpbase.NotFoundError(ctx, err)
+			return
+		}
+		httpbase.ServerError(ctx, err)
+		return
+	}
+
+	filename := name + ".zip"
+	if ref != "" {
+		filename = fmt.Sprintf("%s-%s.zip", name, strings.ReplaceAll(ref, "/", "-"))
+	}
+	ctx.Header("Content-Type", "application/zip")
+	ctx.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+	ctx.Data(200, "application/zip", zipData)
+}
+
+// UpdateSkill   godoc
+// @Security     ApiKey
+// @Summary      Update a exists skill
+// @Description  update a exists skill
+// @Tags         Skill
+// @Accept       json
+// @Produce      json
+// @Param        namespace path string true "namespace"
+// @Param        name path string true "name"
+// @Param        current_user query string false "current user, the owner"
+// @Param        body body types.UpdateSkillReq true "body"
+// @Success      200  {object}  types.Response{data=database.Skill} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /skills/{namespace}/{name} [put]
+func (h *SkillHandler) Update(ctx *gin.Context) {
+	currentUser := httpbase.GetCurrentUser(ctx)
+	var req *types.UpdateSkillReq
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+
+	_, err := h.sensitive.CheckRequestV2(ctx.Request.Context(), req)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "failed to check sensitive request", slog.Any("error", err))
+		httpbase.BadRequestWithExt(ctx, errorx.ErrSensitiveInfoNotAllowed)
+		return
+	}
+	req.Username = currentUser
+
+	namespace, name, err := common.GetNamespaceAndNameFromContext(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	req.Namespace = namespace
+	req.Name = name
+
+	skill, err := h.skill.Update(ctx.Request.Context(), req)
+	if err != nil {
+		if errors.Is(err, errorx.ErrForbidden) {
+			httpbase.ForbiddenError(ctx, err)
+			return
+		}
+		slog.ErrorContext(ctx.Request.Context(), "Failed to update skill", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+
+	slog.Info("Update skill succeed", slog.String("skill", skill.Name))
+	httpbase.OK(ctx, skill)
+}
+
+// DeleteSkill   godoc
+// @Security     ApiKey
+// @Summary      Delete a exists skill
+// @Description  delete a exists skill
+// @Tags         Skill
+// @Accept       json
+// @Produce      json
+// @Param        namespace path string true "namespace"
+// @Param        name path string true "name"
+// @Param        current_user query string false "current user, the owner"
+// @Success      200  {object}  types.Response{} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /skills/{namespace}/{name} [delete]
+func (h *SkillHandler) Delete(ctx *gin.Context) {
+	currentUser := httpbase.GetCurrentUser(ctx)
+	namespace, name, err := common.GetNamespaceAndNameFromContext(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	err = h.skill.Delete(ctx.Request.Context(), namespace, name, currentUser)
+	if err != nil {
+		if errors.Is(err, errorx.ErrForbidden) {
+			httpbase.ForbiddenError(ctx, err)
+			return
+		}
+		slog.ErrorContext(ctx.Request.Context(), "Failed to delete skill", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+	slog.Info("Delete skill succeed", slog.String("skill", name))
+	httpbase.OK(ctx, nil)
+}
+
+// GetSkill      godoc
+// @Security     ApiKey
+// @Summary      Get skill detail
+// @Description  get skill detail
+// @Tags         Skill
+// @Accept       json
+// @Produce      json
+// @Param        namespace path string true "namespace"
+// @Param        name path string true "name"
+// @Param        current_user query string true "current_user"
+// @Param        need_op_weight query bool false "need op weight" default(false)
+// @Param        need_multi_sync query bool false "need multi sync" default(false)
+// @Success      200  {object}  types.Response{data=types.Skill} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /skills/{namespace}/{name} [get]
+func (h *SkillHandler) Show(ctx *gin.Context) {
+	namespace, name, err := common.GetNamespaceAndNameFromContext(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	currentUser := httpbase.GetCurrentUser(ctx)
+
+	qNeedOpWeight := ctx.Query("need_op_weight")
+	needOpWeight, err := strconv.ParseBool(qNeedOpWeight)
+	if err != nil {
+		needOpWeight = false
+	}
+
+	qNeedMultiSync := ctx.Query("need_multi_sync")
+	needMultiSync, err := strconv.ParseBool(qNeedMultiSync)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "bad need_multi_sync params", slog.Any("need_multi_sync", qNeedMultiSync), slog.Any("error", err))
+		needMultiSync = false
+	}
+
+	detail, err := h.skill.Show(ctx.Request.Context(), namespace, name, currentUser, needOpWeight, needMultiSync)
+	if err != nil {
+		if errors.Is(err, errorx.ErrForbidden) {
+			httpbase.ForbiddenError(ctx, err)
+			return
+		}
+		slog.ErrorContext(ctx.Request.Context(), "Failed to get skill", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+
+	slog.Info("Get skill succeed", slog.String("skill", name))
+	httpbase.OK(ctx, detail)
+}
+
+// PublishSkillVersion godoc
+// @Security     ApiKey
+// @Summary      Publish a skill version
+// @Description  publish current skill repository commit as an installable version
+// @Tags         Skill
+// @Accept       json
+// @Produce      json
+// @Param        namespace path string true "namespace"
+// @Param        name path string true "name"
+// @Param        body body types.PublishSkillVersionReq true "body"
+// @Success      200  {object}  types.Response{data=types.PublishSkillVersionResp} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      403  {object}  types.APIForbidden "Forbidden"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /skills/{namespace}/{name}/publish [post]
+func (h *SkillHandler) Publish(ctx *gin.Context) {
+	currentUser := httpbase.GetCurrentUser(ctx)
+	namespace, name, err := common.GetNamespaceAndNameFromContext(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+
+	req := new(types.PublishSkillVersionReq)
+	if err := ctx.ShouldBindJSON(req); err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	req.Namespace = namespace
+	req.Name = name
+	req.Username = currentUser
+	if strings.TrimSpace(req.Version) == "" {
+		httpbase.BadRequest(ctx, "missing version parameter")
+		return
+	}
+
+	response, err := h.publisher.Publish(ctx.Request.Context(), req)
+	if err != nil {
+		if errors.Is(err, errorx.ErrForbidden) {
+			httpbase.ForbiddenError(ctx, err)
+			return
+		}
+		if errors.Is(err, errorx.ErrDatabaseDuplicateKey) {
+			httpbase.BadRequestWithExt(ctx, err)
+			return
+		}
+		slog.ErrorContext(ctx.Request.Context(), "Failed to publish skill version", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+
+	slog.Info("Publish skill version succeed", slog.String("skill", name), slog.String("version", response.Version))
+	httpbase.OK(ctx, response)
+}
+
+// SkillRelations      godoc
+// @Security     ApiKey
+// @Summary      Get skill related assets
+// @Tags         Skill
+// @Accept       json
+// @Produce      json
+// @Param        namespace path string true "namespace"
+// @Param        name path string true "name"
+// @Param        current_user query string false "current_user"
+// @Success      200  {object}  types.Response{data=types.Relations} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /skills/{namespace}/{name}/relations [get]
+func (h *SkillHandler) Relations(ctx *gin.Context) {
+	namespace, name, err := common.GetNamespaceAndNameFromContext(ctx)
+	if err != nil {
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	currentUser := httpbase.GetCurrentUser(ctx)
+	detail, err := h.skill.Relations(ctx.Request.Context(), namespace, name, currentUser)
+	if err != nil {
+		if errors.Is(err, errorx.ErrForbidden) {
+			httpbase.ForbiddenError(ctx, err)
+			return
+		}
+		slog.ErrorContext(ctx.Request.Context(), "Failed to get skill relations", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+
+	httpbase.OK(ctx, detail)
+}
+
+// UploadSkillPackage godoc
+// @Security     ApiKey
+// @Summary      Get skill package upload URL
+// @Description  Get a presigned URL and form data for uploading skill package
+// @Tags         Skill
+// @Produce      json
+// @Param        current_user query string false "current user"
+// @Success      200  {object}  types.Response{data=map[string]interface{}} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /skills/upload_url [post]
+func (h *SkillHandler) GetUploadUrl(ctx *gin.Context) {
+	// Call component to get upload URL, UUID, and form data
+	url, uuid, formData, err := h.skill.GetUploadUrl(ctx.Request.Context())
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Failed to get upload URL", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+
+	// Return the upload URL, UUID, and form data
+	httpbase.OK(ctx, map[string]interface{}{
+		"url":      url,
+		"uuid":     uuid,
+		"formData": formData,
+	})
+}

@@ -1,0 +1,70 @@
+#!/bin/bash
+
+# Export fine-tuned model to CSGHUB using API
+# This script should be run after fine-tuning completes
+
+set -e
+
+echo "Starting export to CSGHUB using API..."
+
+if [ -z "$HF_TOKEN" ]; then
+    echo "Error: HF_TOKEN environment variable is required"
+    exit 1
+fi
+
+if [ -z "$HF_ENDPOINT" ]; then
+    echo "Error: HF_ENDPOINT environment variable is required"
+    exit 1
+fi
+
+# Set default values for optional variables
+HF_COMMIT_MESSAGE="${HF_COMMIT_MESSAGE:-"Fine-tuned model exported from ms-swift"}"
+LATEST_CKP=`find output/*/v*/checkpoint-* -type d | grep -v 'merged' | sort -V | tail -n 1`
+EXPORT_DIR="${EXPORT_DIR:-${FINETUNE_WORK_DIR:-/workspace}/$LATEST_CKP}"
+
+# Create the full repository name
+CURRENT_TIME=$(date +%Y%m%d_%H%M%S)
+SOURCE_MODEL_ID="${SOURCE_MODEL_ID:-$MODEL_ID}"
+MODEL_NAME=$(echo "$SOURCE_MODEL_ID" | cut -d'/' -f2)
+#use FINETUNED_MODEL_NAME if provided, otherwise use MODEL_ID
+REPO_NAME_DEFAULT="$MODEL_NAME-finetuned-$CURRENT_TIME"
+REPO_NAME="${FINETUNED_MODEL_NAME:-$REPO_NAME_DEFAULT}"
+FULL_REPO_NAME="$HF_USERNAME/$REPO_NAME"
+
+echo "Export configuration:"
+echo "  Model Name: $MODEL_ID"
+echo "  Repository Name: $FULL_REPO_NAME"
+echo "  HF Endpoint: $HF_ENDPOINT"
+echo "  Export Directory: $EXPORT_DIR"
+
+# Check if the fine-tuned model exists
+if [ ! -d "$EXPORT_DIR" ]; then
+    echo "Error: Export directory $EXPORT_DIR does not exist"
+    echo "Make sure fine-tuning has completed successfully"
+    exit 1
+fi
+
+MODEL_TYPE_ARG=()
+if [ -n "${MODEL_TYPE:-}" ]; then
+    MODEL_TYPE_ARG=(--model_type "$MODEL_TYPE")
+    echo "Using model type: $MODEL_TYPE"
+else
+    echo "MODEL_TYPE not provided; ms-swift will auto-detect it from model config"
+fi
+
+# Export the model using swift export command with API endpoint
+echo "Exporting model to CSGHUB ..."
+swift export \
+    --model "${MODEL_PATH:-$MODEL_ID}" \
+    --adapters "$EXPORT_DIR" \
+    "${MODEL_TYPE_ARG[@]}" \
+    --merge_lora true \
+    --push_to_hub true \
+    --output_dir "$REPO_NAME" \
+    --hub_model_id "$FULL_REPO_NAME" \
+    --commit_message "$HF_COMMIT_MESSAGE" \
+    --use_hf true \
+    --exist_ok true
+
+echo "Export completed successfully!"
+echo "Model is now available at: $HF_ENDPOINT/$FULL_REPO_NAME"

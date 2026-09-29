@@ -1,0 +1,328 @@
+package handler
+
+import (
+	"errors"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
+	"github.com/go-playground/validator/v10"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	mockcomponent "opencsg.com/csghub-server/_mocks/opencsg.com/csghub-server/component"
+	"opencsg.com/csghub-server/builder/testutil"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/types"
+)
+
+type SpaceResourceTester struct {
+	*testutil.GinTester
+	handler *SpaceResourceHandler
+	mocks   struct {
+		spaceResource *mockcomponent.MockSpaceResourceComponent
+		cluster       *mockcomponent.MockClusterComponent
+	}
+}
+
+func NewSpaceResourceTester(t *testing.T) *SpaceResourceTester {
+	tester := &SpaceResourceTester{GinTester: testutil.NewGinTester()}
+	tester.mocks.spaceResource = mockcomponent.NewMockSpaceResourceComponent(t)
+	tester.mocks.cluster = mockcomponent.NewMockClusterComponent(t)
+
+	tester.handler = &SpaceResourceHandler{
+		spaceResource: tester.mocks.spaceResource,
+		cluster:       tester.mocks.cluster,
+	}
+	tester.WithParam("namespace", "u")
+	tester.WithParam("name", "r")
+	v, ok := binding.Validator.Engine().(*validator.Validate)
+	assert.True(t, ok)
+	err := v.RegisterValidation("resource_type", types.ResourceTypeValidator)
+	assert.NoError(t, err)
+	return tester
+}
+
+func (t *SpaceResourceTester) WithHandleFunc(fn func(h *SpaceResourceHandler) gin.HandlerFunc) *SpaceResourceTester {
+	t.Handler(fn(t.handler))
+	return t
+}
+
+func TestSpaceResourceHandler_Index(t *testing.T) {
+	t.Run("200", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.Index
+		})
+		deployType := types.InferenceType
+		req := &types.SpaceResourceIndexReq{
+			ClusterIDs:   []string{"c1"},
+			DeployType:   deployType,
+			CurrentUser:  "u",
+			ResourceType: types.ResourceTypeGPU,
+			HardwareType: "A10",
+			Per:          100,
+			Page:         1,
+		}
+
+		tester.mocks.spaceResource.EXPECT().Index(tester.Ctx(), req).Return(
+			[]types.SpaceResource{{Name: "sp"}}, 0, nil,
+		)
+		tester.WithQuery("cluster_id", "c1").WithQuery("deploy_type", "1").
+			WithQuery("resource_type", "gpu").WithQuery("hardware_type", "A10").WithUser().Execute()
+
+		tester.ResponseEq(t, 200, tester.OKText, []types.SpaceResource{{Name: "sp"}})
+	})
+	t.Run("200 with no cluster", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.Index
+		})
+		deployType := types.InferenceType
+		req := &types.SpaceResourceIndexReq{
+			ClusterIDs:   []string{"c1"},
+			DeployType:   deployType,
+			CurrentUser:  "u",
+			ResourceType: types.ResourceTypeGPU,
+			HardwareType: "A10",
+			Per:          100,
+			Page:         1,
+		}
+		tester.mocks.cluster.EXPECT().Index(mock.Anything, types.ClusterIndexReq{}).
+			Return([]types.ClusterRes{
+				{ClusterID: "c1"},
+			}, nil)
+
+		tester.mocks.spaceResource.EXPECT().Index(tester.Ctx(), req).Return(
+			[]types.SpaceResource{{Name: "sp"}}, 0, nil,
+		)
+		tester.WithQuery("deploy_type", "1").
+			WithQuery("resource_type", "gpu").WithQuery("hardware_type", "A10").WithUser().Execute()
+
+		tester.ResponseEq(t, 200, tester.OKText, []types.SpaceResource{{Name: "sp"}})
+	})
+	t.Run("invalid resource type", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.Index
+		})
+
+		tester.WithQuery("cluster_id", "c1").WithQuery("deploy_type", "").
+			WithQuery("resource_type", "invalid").WithQuery("hardware_type", "intel").WithUser().Execute()
+
+		tester.ResponseEqCode(t, 400)
+	})
+}
+
+func TestSpaceResourceHandler_Create(t *testing.T) {
+	tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+		return h.Create
+	})
+
+	tester.mocks.spaceResource.EXPECT().Create(tester.Ctx(), &types.CreateSpaceResourceReq{
+		ClusterID: "c",
+		Name:      "n",
+		Resources: `{"cpu":{"num":"2"}}`,
+	}).Return(
+		&types.SpaceResource{Name: "sp"}, nil,
+	)
+	tester.WithBody(t, &types.CreateSpaceResourceReq{
+		ClusterID: "c", Name: "n", Resources: `{"cpu":{"num":"2"}}`,
+	}).WithUser().Execute()
+
+	tester.ResponseEq(t, 200, tester.OKText, &types.SpaceResource{Name: "sp"})
+}
+
+func TestSpaceResourceHandler_Create_InvalidResources(t *testing.T) {
+	tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+		return h.Create
+	})
+
+	tester.mocks.spaceResource.EXPECT().Create(tester.Ctx(), &types.CreateSpaceResourceReq{
+		ClusterID: "c",
+		Name:      "n",
+		Resources: "invalid-json",
+	}).Return(
+		nil, errorx.BadRequest(errors.New("invalid json"), nil),
+	)
+	tester.WithBody(t, &types.CreateSpaceResourceReq{
+		ClusterID: "c", Name: "n", Resources: "invalid-json",
+	}).WithUser().Execute()
+
+	tester.ResponseEqCode(t, 400)
+}
+
+func TestSpaceResourceHandler_Update(t *testing.T) {
+	tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+		return h.Update
+	})
+
+	tester.mocks.spaceResource.EXPECT().Update(tester.Ctx(), &types.UpdateSpaceResourceReq{
+		Name:      "n",
+		Resources: `{"cpu":{"num":"2"}}`,
+		ID:        1,
+	}).Return(
+		&types.SpaceResource{Name: "sp"}, nil,
+	)
+	tester.WithBody(t, &types.UpdateSpaceResourceReq{
+		Name: "n", Resources: `{"cpu":{"num":"2"}}`,
+	}).WithUser().WithParam("id", "1").Execute()
+
+	tester.ResponseEq(t, 200, tester.OKText, &types.SpaceResource{Name: "sp"})
+}
+
+func TestSpaceResourceHandler_Update_InvalidResources(t *testing.T) {
+	tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+		return h.Update
+	})
+
+	tester.mocks.spaceResource.EXPECT().Update(tester.Ctx(), &types.UpdateSpaceResourceReq{
+		Name:      "n",
+		Resources: "invalid-json",
+		ID:        1,
+	}).Return(
+		nil, errorx.BadRequest(errors.New("invalid json"), nil),
+	)
+	tester.WithBody(t, &types.UpdateSpaceResourceReq{
+		Name: "n", Resources: "invalid-json",
+	}).WithUser().WithParam("id", "1").Execute()
+
+	tester.ResponseEqCode(t, 400)
+}
+
+func TestSpaceResourceHandler_Delete(t *testing.T) {
+	tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+		return h.Delete
+	})
+
+	tester.mocks.spaceResource.EXPECT().Delete(tester.Ctx(), int64(1)).Return(
+		nil,
+	)
+	tester.WithUser().WithParam("id", "1").Execute()
+
+	tester.ResponseEq(t, 200, tester.OKText, nil)
+}
+
+func TestSpaceResourceHandler_ListHardwareTypes(t *testing.T) {
+	t.Run("200", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.ListHardwareTypes
+		})
+		tester.mocks.spaceResource.EXPECT().ListHardwareTypes(tester.Ctx(), "c1").Return(
+			[]string{"NVIDIA A100", "Intel Xeon"}, nil,
+		)
+		tester.WithQuery("cluster_id", "c1").WithUser().Execute()
+
+		tester.ResponseEq(t, 200, tester.OKText, []string{"NVIDIA A100", "Intel Xeon"})
+	})
+	t.Run("error", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.ListHardwareTypes
+		})
+		tester.mocks.spaceResource.EXPECT().ListHardwareTypes(tester.Ctx(), "c1").Return(
+			nil, errors.New("database error"),
+		)
+		tester.WithQuery("cluster_id", "c1").WithUser().Execute()
+
+		tester.ResponseEq(t, 500, "database error", nil)
+	})
+}
+
+func TestSpaceResourceHandler_ListAll(t *testing.T) {
+	t.Run("200", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.ListAll
+		})
+		tester.mocks.spaceResource.EXPECT().ListAll(tester.Ctx()).Return(
+			[]types.SpaceResource{{ID: 1, Name: "resource1", ClusterID: "c1"}}, nil,
+		)
+		tester.WithUser().Execute()
+
+		tester.ResponseEq(t, 200, tester.OKText, []types.SpaceResource{{ID: 1, Name: "resource1", ClusterID: "c1"}})
+	})
+	t.Run("error", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.ListAll
+		})
+		tester.mocks.spaceResource.EXPECT().ListAll(tester.Ctx()).Return(
+			nil, errors.New("database error"),
+		)
+		tester.WithUser().Execute()
+
+		tester.ResponseEq(t, 500, "database error", nil)
+	})
+}
+
+func TestSpaceResourceHandler_UpdateScenarioConstraint(t *testing.T) {
+	rh := func(v int64) *int64 { return &v }
+	rm := func(v int) *int { return &v }
+	t.Run("200", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.UpdateScenarioConstraint
+		})
+		tester.mocks.spaceResource.EXPECT().UpdateScenarioConstraint(tester.Ctx(), &types.UpdateScenarioConstraintReq{
+			ID:               1,
+			RequiredHardware: rh(2),
+			ExcludeHardware:  rh(4),
+			MaxReplica:       rm(3),
+		}).Return(
+			&types.ScenarioInfo{ID: 1, Code: 0, Name: "space", RequiredHardware: 2, ExcludeHardware: 4, MaxReplica: 3}, nil,
+		)
+		tester.WithBody(t, &types.UpdateScenarioConstraintReq{
+			RequiredHardware: rh(2),
+			ExcludeHardware:  rh(4),
+			MaxReplica:       rm(3),
+		}).WithUser().WithParam("id", "1").Execute()
+
+		tester.ResponseEq(t, 200, tester.OKText, &types.ScenarioInfo{ID: 1, Code: 0, Name: "space", RequiredHardware: 2, ExcludeHardware: 4, MaxReplica: 3})
+	})
+	t.Run("error", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.UpdateScenarioConstraint
+		})
+		tester.mocks.spaceResource.EXPECT().UpdateScenarioConstraint(tester.Ctx(), &types.UpdateScenarioConstraintReq{
+			ID:               1,
+			RequiredHardware: rh(2),
+			ExcludeHardware:  rh(4),
+			MaxReplica:       rm(3),
+		}).Return(
+			nil, errors.New("database error"),
+		)
+		tester.WithBody(t, &types.UpdateScenarioConstraintReq{
+			RequiredHardware: rh(2),
+			ExcludeHardware:  rh(4),
+			MaxReplica:       rm(3),
+		}).WithUser().WithParam("id", "1").Execute()
+
+		tester.ResponseEq(t, 500, "database error", nil)
+	})
+	t.Run("negative required_hardware rejected", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.UpdateScenarioConstraint
+		})
+		neg64 := int64(-1)
+		tester.WithBody(t, &types.UpdateScenarioConstraintReq{
+			RequiredHardware: &neg64,
+		}).WithUser().WithParam("id", "1").Execute()
+
+		tester.ResponseEq(t, 400, "required_hardware must be >= 0", nil)
+	})
+	t.Run("negative exclude_hardware rejected", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.UpdateScenarioConstraint
+		})
+		neg64 := int64(-1)
+		tester.WithBody(t, &types.UpdateScenarioConstraintReq{
+			ExcludeHardware: &neg64,
+		}).WithUser().WithParam("id", "1").Execute()
+
+		tester.ResponseEq(t, 400, "exclude_hardware must be >= 0", nil)
+	})
+	t.Run("negative max_replica rejected", func(t *testing.T) {
+		tester := NewSpaceResourceTester(t).WithHandleFunc(func(h *SpaceResourceHandler) gin.HandlerFunc {
+			return h.UpdateScenarioConstraint
+		})
+		neg := -1
+		tester.WithBody(t, &types.UpdateScenarioConstraintReq{
+			MaxReplica: &neg,
+		}).WithUser().WithParam("id", "1").Execute()
+
+		tester.ResponseEq(t, 400, "max_replica must be >= 0", nil)
+	})
+}

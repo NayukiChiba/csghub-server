@@ -1,0 +1,138 @@
+//go:build !ee && !saas
+
+package component
+
+import (
+	"context"
+
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/types"
+)
+
+func (ac *accountingComponentImpl) QueryAllUsersBalance(ctx context.Context, per, page int) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) QueryBalanceByUserID(ctx context.Context, currentUser, userUUID string) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) QueryBalanceByUserIDInternal(ctx context.Context, currentUser string) (*types.UserBalanceResp, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) ListStatementByUserIDAndTime(ctx context.Context, req types.ActStatementsReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) ListBillsByUserIDAndDate(ctx context.Context, req types.ActStatementsReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) ListBillsDetailByUserID(ctx context.Context, req types.AcctBillsDetailReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) RechargeAccountingUser(ctx context.Context, userUUID string, req types.RechargeReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) CreateOrUpdateQuota(currentUser string, req types.AcctQuotaReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) GetQuotaByID(currentUser string) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) CreateQuotaStatement(currentUser string, req types.AcctQuotaStatementReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) GetQuotaStatement(currentUser string, req types.AcctQuotaStatementReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) QueryPricesBySKUType(currentUser string, req types.AcctPriceListReq) (*database.PriceResp, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) QueryPricesBySkuTypeAndKinds(currentUser string, req types.AcctPriceListByKindsReq) (any, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) QueryDistinctPrices(currentUser string, req types.AcctPriceDistinctListReq) (any, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) GetPriceByID(currentUser string, id int64) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) CreatePrice(currentUser string, req types.AcctPriceCreateReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) BatchCreatePrice(currentUser string, req types.AcctPriceBatchCreateReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) UpdatePrice(currentUser string, req types.AcctPriceUpdateReq, id int64) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) DeletePrice(currentUser string, id int64) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) CreateOrder(currentUser string, req types.AcctOrderCreateReq) (*database.AccountOrder, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) GetOrderDetailByID(ctx context.Context, currentUser string, id int64) (*database.AccountOrderDetail, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) ListRecharge(ctx context.Context, req types.AcctRechargeListReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) RechargesIndex(ctx context.Context, req types.RechargesIndexReq) ([]*types.RechargeIndexResp, int, error) {
+	return nil, 0, nil
+}
+
+func (ac *accountingComponentImpl) StatementsIndex(ctx context.Context, req types.ActStatementsReq) ([]types.AcctStatementsRes, int, error) {
+	return nil, 0, nil
+}
+
+func (ac *accountingComponentImpl) TokenReportIndex(ctx context.Context, req types.TokenReportReq) (*types.TokenReportResp, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) ListPresents(ctx context.Context, req types.PresentsIndexReq) ([]*types.PresentIndexResp, int, error) {
+	return nil, 0, nil
+}
+
+func (ac *accountingComponentImpl) WeeklyRecharges(ctx context.Context, emails []string) error {
+	return nil
+}
+
+func (ac *accountingComponentImpl) GetVoucherDashboard(ctx context.Context, req types.VoucherDashboardReq) (*types.VoucherDashboardStatusItem, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) OffLinePrice(ctx context.Context, req types.AcctPriceOffLineReq) (any, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) QueryStatisticsByUserID(ctx context.Context, req types.AcctBillsReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) QueryStatisticsDetailByUserID(ctx context.Context, req types.AcctBillsDetailReq) (interface{}, error) {
+	return nil, nil
+}
+
+func (ac *accountingComponentImpl) GetStatisticsSummary(ctx context.Context, req types.AcctBillsReq) (interface{}, error) {
+	return nil, nil
+}

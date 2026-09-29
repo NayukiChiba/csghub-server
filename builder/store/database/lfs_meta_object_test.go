@@ -1,0 +1,348 @@
+package database_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/tests"
+	"opencsg.com/csghub-server/common/types"
+)
+
+func TestLfsMetaStore_CRUD(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewLfsMetaObjectStoreWithDB(db)
+	_, err := store.Create(ctx, database.LfsMetaObject{
+		RepositoryID: 123,
+		Oid:          "foobar",
+	})
+	require.Nil(t, err)
+
+	obj := &database.LfsMetaObject{}
+	err = db.Core.NewSelect().Model(obj).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, "foobar", obj.Oid)
+
+	obj, err = store.FindByOID(ctx, 123, "foobar")
+	require.Nil(t, err)
+	require.Equal(t, "foobar", obj.Oid)
+
+	objs, err := store.FindByRepoID(ctx, 123)
+	require.Nil(t, err)
+	require.Equal(t, 1, len(objs))
+	require.Equal(t, "foobar", objs[0].Oid)
+
+	objs, err = store.FindByRepoID(ctx, 987)
+	require.Nil(t, err)
+	require.Equal(t, 0, len(objs))
+
+	// update
+	_, err = store.UpdateOrCreate(ctx, database.LfsMetaObject{
+		RepositoryID: 123,
+		Oid:          "foobar",
+		Size:         999,
+	})
+	require.Nil(t, err)
+	obj, err = store.FindByOID(ctx, 123, "foobar")
+	require.Nil(t, err)
+	require.Equal(t, 999, int(obj.Size))
+
+	// create
+	_, err = store.UpdateOrCreate(ctx, database.LfsMetaObject{
+		RepositoryID: 456,
+		Oid:          "bar",
+		Size:         998,
+	})
+	require.Nil(t, err)
+	obj, err = store.FindByOID(ctx, 456, "bar")
+	require.Nil(t, err)
+	require.Equal(t, 998, int(obj.Size))
+
+	err = store.BulkUpdateOrCreate(ctx, int64(456), []database.LfsMetaObject{
+		{RepositoryID: 456, Oid: "foobar", Size: 1},
+		{RepositoryID: 456, Oid: "bar", Size: 2},
+		{RepositoryID: 456, Oid: "barfoo", Size: 3},
+	})
+	require.Nil(t, err)
+
+	obj, err = store.FindByOID(ctx, 456, "foobar")
+	require.Nil(t, err)
+	require.Equal(t, 1, int(obj.Size))
+	obj, err = store.FindByOID(ctx, 456, "bar")
+	require.Nil(t, err)
+	require.Equal(t, 2, int(obj.Size))
+	obj, err = store.FindByOID(ctx, 456, "barfoo")
+	require.Nil(t, err)
+	require.Equal(t, 3, int(obj.Size))
+
+	err = store.RemoveByOid(ctx, "foobar", 456)
+	require.Nil(t, err)
+	_, err = store.FindByOID(ctx, 456, "foobar")
+	require.NotNil(t, err)
+
+}
+
+// TestLfsMetaStoreBulkUpdateOrCreateUpdatesRepositorySize verifies LFS metadata and its repository total stay consistent.
+func TestLfsMetaStoreBulkUpdateOrCreateUpdatesRepositorySize(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	repoStore := database.NewRepoStoreWithDB(db)
+	lfsStore := database.NewLfsMetaObjectStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{GitPath: "models_ns/repo"})
+	require.NoError(t, err)
+
+	err = lfsStore.BulkUpdateOrCreate(ctx, repo.ID, []database.LfsMetaObject{
+		{RepositoryID: repo.ID, Oid: "one", Size: 10},
+		{RepositoryID: repo.ID, Oid: "two", Size: 20},
+	})
+	require.NoError(t, err)
+	repo, err = repoStore.FindById(ctx, repo.ID)
+	require.NoError(t, err)
+	require.Equal(t, int64(30), repo.LFSObjectsSize)
+
+	err = lfsStore.BulkUpdateOrCreate(ctx, repo.ID, nil)
+	require.NoError(t, err)
+	repo, err = repoStore.FindById(ctx, repo.ID)
+	require.NoError(t, err)
+	require.Zero(t, repo.LFSObjectsSize)
+}
+
+func TestLfsMetaStore_UpdateXnetUsed(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewLfsMetaObjectStoreWithDB(db)
+
+	// Create a test LFS object
+	_, err := store.Create(ctx, database.LfsMetaObject{
+		RepositoryID: 123,
+		Oid:          "test-oid-123",
+		Size:         1024,
+		XnetUsed:     false,
+	})
+	require.Nil(t, err)
+
+	// Verify initial state
+	obj, err := store.FindByOID(ctx, 123, "test-oid-123")
+	require.Nil(t, err)
+	require.Equal(t, "test-oid-123", obj.Oid)
+	require.Equal(t, false, obj.XnetUsed)
+
+	// Update XnetUsed to true
+	err = store.UpdateXnetUsed(ctx, 123, "test-oid-123", true)
+	require.Nil(t, err)
+
+	// Verify update
+	obj, err = store.FindByOID(ctx, 123, "test-oid-123")
+	require.Nil(t, err)
+	require.Equal(t, true, obj.XnetUsed)
+
+	// Update XnetUsed back to false
+	err = store.UpdateXnetUsed(ctx, 123, "test-oid-123", false)
+	require.Nil(t, err)
+
+	// Verify update
+	obj, err = store.FindByOID(ctx, 123, "test-oid-123")
+	require.Nil(t, err)
+	require.Equal(t, false, obj.XnetUsed)
+
+	// Test updating non-existent object (should not error but affect 0 rows)
+	err = store.UpdateXnetUsed(ctx, 999, "non-existent-oid", true)
+	require.Nil(t, err)
+}
+
+func TestLfsMetaStore_BulkUpdateExistingByOIDs(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewLfsMetaObjectStoreWithDB(db)
+
+	// Seed rows with intentionally stale Existing values to verify that the
+	// bulk update writes the checked object-storage state instead of trusting DB.
+	_, err := store.Create(ctx, database.LfsMetaObject{
+		RepositoryID: 123,
+		Oid:          "existing-oid",
+		Size:         1024,
+		Existing:     false,
+	})
+	require.Nil(t, err)
+	_, err = store.Create(ctx, database.LfsMetaObject{
+		RepositoryID: 123,
+		Oid:          "missing-oid",
+		Size:         2048,
+		Existing:     true,
+	})
+	require.Nil(t, err)
+	_, err = store.Create(ctx, database.LfsMetaObject{
+		RepositoryID: 456,
+		Oid:          "missing-oid",
+		Size:         4096,
+		Existing:     true,
+	})
+	require.Nil(t, err)
+
+	err = store.BulkUpdateExistingByOIDs(ctx, 123, []string{"existing-oid"}, []string{"missing-oid"})
+	require.Nil(t, err)
+
+	existingObj, err := store.FindByOID(ctx, 123, "existing-oid")
+	require.Nil(t, err)
+	require.True(t, existingObj.Existing)
+
+	missingObj, err := store.FindByOID(ctx, 123, "missing-oid")
+	require.Nil(t, err)
+	require.False(t, missingObj.Existing)
+
+	otherRepoObj, err := store.FindByOID(ctx, 456, "missing-oid")
+	require.Nil(t, err)
+	require.True(t, otherRepoObj.Existing)
+
+	objs, err := store.FindByRepoID(ctx, 123)
+	require.Nil(t, err)
+	require.Len(t, objs, 2)
+}
+
+func TestLfsMetaStore_CheckIfAllMigratedToXnet(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewLfsMetaObjectStoreWithDB(db)
+
+	// Test with no objects
+	allMigrated, err := store.CheckIfAllMigratedToXnet(ctx, 123)
+	require.Nil(t, err)
+	require.True(t, allMigrated, "No objects should return true")
+
+	// Create test objects
+	testCases := []database.LfsMetaObject{
+		{RepositoryID: 123, Oid: "oid-1", Size: 1024, XnetUsed: false},
+		{RepositoryID: 123, Oid: "oid-2", Size: 2048, XnetUsed: false},
+		{RepositoryID: 456, Oid: "oid-3", Size: 3072, XnetUsed: true}, // Different repo
+	}
+
+	for _, tc := range testCases {
+		_, err := store.Create(ctx, tc)
+		require.Nil(t, err)
+	}
+
+	// Test with some objects not migrated
+	allMigrated, err = store.CheckIfAllMigratedToXnet(ctx, 123)
+	require.Nil(t, err)
+	require.False(t, allMigrated, "Should return false when some objects are not migrated")
+
+	// Test with all objects migrated in another repo
+	allMigrated, err = store.CheckIfAllMigratedToXnet(ctx, 456)
+	require.Nil(t, err)
+	require.True(t, allMigrated, "Should return true when all objects are migrated")
+
+	// Update one object to migrated
+	err = store.UpdateXnetUsed(ctx, 123, "oid-1", true)
+	require.Nil(t, err)
+
+	// Test with one migrated, one not migrated
+	allMigrated, err = store.CheckIfAllMigratedToXnet(ctx, 123)
+	require.Nil(t, err)
+	require.False(t, allMigrated, "Should return false when not all objects are migrated")
+
+	// Update all objects to migrated
+	err = store.UpdateXnetUsed(ctx, 123, "oid-2", true)
+	require.Nil(t, err)
+
+	// Test with all objects migrated
+	allMigrated, err = store.CheckIfAllMigratedToXnet(ctx, 123)
+	require.Nil(t, err)
+	require.True(t, allMigrated, "Should return true when all objects are migrated")
+}
+
+func TestLfsMetaStore_ExistsByOidExclRepo(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewLfsMetaObjectStoreWithDB(db)
+
+	oid := "test-oid-exists"
+	repo1 := int64(1001)
+	repo2 := int64(1002)
+
+	// Test with no objects
+	exists, err := store.ExistsByOidExclRepo(ctx, oid, repo1)
+	require.Nil(t, err)
+	require.False(t, exists)
+
+	// Create object in repo1
+	_, err = store.Create(ctx, database.LfsMetaObject{
+		RepositoryID: repo1,
+		Oid:          oid,
+		Size:         1024,
+	})
+	require.Nil(t, err)
+
+	// Should be false because we exclude repo1
+	exists, err = store.ExistsByOidExclRepo(ctx, oid, repo1)
+	require.Nil(t, err)
+	require.False(t, exists)
+
+	// Should be true because we exclude repo2, and repo1 has the oid
+	exists, err = store.ExistsByOidExclRepo(ctx, oid, repo2)
+	require.Nil(t, err)
+	require.True(t, exists)
+
+	// Create object in repo2 as well
+	_, err = store.Create(ctx, database.LfsMetaObject{
+		RepositoryID: repo2,
+		Oid:          oid,
+		Size:         1024,
+	})
+	require.Nil(t, err)
+
+	// Now it should be true for both
+	exists, err = store.ExistsByOidExclRepo(ctx, oid, repo1)
+	require.Nil(t, err)
+	require.True(t, exists)
+}
+
+func TestLfsMetaStore_ExistsByOidInActiveRepoExclRepoIgnoresSoftDeletedRepositories(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.Background()
+	repoStore := database.NewRepoStoreWithDB(db)
+	store := database.NewLfsMetaObjectStoreWithDB(db)
+
+	repo1, err := repoStore.CreateRepo(ctx, database.Repository{
+		RepositoryType: types.ModelRepo, Path: "ns/deleting-one", Name: "deleting-one", GitPath: "models_ns/deleting-one",
+	})
+	require.NoError(t, err)
+	repo2, err := repoStore.CreateRepo(ctx, database.Repository{
+		RepositoryType: types.ModelRepo, Path: "ns/deleting-two", Name: "deleting-two", GitPath: "models_ns/deleting-two",
+	})
+	require.NoError(t, err)
+	activeRepo, err := repoStore.CreateRepo(ctx, database.Repository{
+		RepositoryType: types.ModelRepo, Path: "ns/active", Name: "active", GitPath: "models_ns/active",
+	})
+	require.NoError(t, err)
+	for _, repoID := range []int64{repo1.ID, repo2.ID, activeRepo.ID} {
+		_, err = store.Create(ctx, database.LfsMetaObject{RepositoryID: repoID, Oid: "shared"})
+		require.NoError(t, err)
+	}
+
+	_, err = db.Core.NewDelete().Model((*database.Repository)(nil)).Where("id = ? OR id = ?", repo1.ID, repo2.ID).Exec(ctx)
+	require.NoError(t, err)
+	exists, err := store.ExistsByOidInActiveRepoExclRepo(ctx, "shared", repo1.ID)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	_, err = db.Core.NewDelete().Model(activeRepo).WherePK().Exec(ctx)
+	require.NoError(t, err)
+	exists, err = store.ExistsByOidInActiveRepoExclRepo(ctx, "shared", repo1.ID)
+	require.NoError(t, err)
+	require.False(t, exists, "another soft-deleted repository must not retain the shared object")
+}

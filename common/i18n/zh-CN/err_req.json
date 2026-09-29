@@ -1,0 +1,50 @@
+{
+    "error.REQ-ERR-0": {
+        "other": "错误的请求"
+    },
+    "error.REQ-ERR-1": {
+        "other": "请求体格式错误"
+    },
+    "error.REQ-ERR-10": {
+        "other": "请求过于频繁，需要验证码"
+    },
+    "error.REQ-ERR-11": {
+        "other": "来自该IP位置的请求受限，需要验证码"
+    },
+    "error.REQ-ERR-12": {
+        "other": "验证码验证失败"
+    },
+    "error.REQ-ERR-13": {
+        "other": "目标命名空间不存在"
+    },
+    "error.REQ-ERR-14": {
+        "other": "新命名空间必须与当前命名空间不同"
+    },
+    "error.REQ-ERR-15": {
+        "other": "目标命名空间中已存在同名仓库"
+    },
+    "error.REQ-ERR-16": {
+        "other": "该仓库不支持转移所有权"
+    },
+    "error.REQ-ERR-17": {
+        "other": "当前上游 API 不支持连接测试"
+    },
+    "error.REQ-ERR-18": {
+        "other": "当前上游 API 不支持健康检查"
+    },
+    "error.REQ-ERR-2": {
+        "other": "请求体不能为空"
+    },
+    "error.REQ-ERR-3": {
+        "other": "请求体过大"
+    },
+    "error.REQ-ERR-5": {
+        "other": "重复的请求参数"
+    },
+    "error.REQ-ERR-6": {
+        "other": "无效的请求参数"
+    },
+    "error.REQ-ERR-9": {
+        "other": "不支持的内容类型"
+    }
+}

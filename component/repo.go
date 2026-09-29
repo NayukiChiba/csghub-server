@@ -1,0 +1,3899 @@
+package component
+
+import (
+	"bufio"
+	"bytes"
+	"cmp"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"path"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/minio/minio-go/v7"
+	"github.com/redis/go-redis/v9"
+	ignore "github.com/sabhiram/go-gitignore"
+	"github.com/spf13/cast"
+	"golang.org/x/sync/singleflight"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"gopkg.in/yaml.v3"
+	"opencsg.com/csghub-server/builder/deploy"
+	"opencsg.com/csghub-server/builder/git/gitserver"
+	"opencsg.com/csghub-server/builder/git/gitserver/gitaly"
+	"opencsg.com/csghub-server/builder/loki"
+	"opencsg.com/csghub-server/builder/multisync"
+	"opencsg.com/csghub-server/builder/rebac"
+	"opencsg.com/csghub-server/builder/rpc"
+	storecache "opencsg.com/csghub-server/builder/store/cache"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/builder/store/s3"
+	"opencsg.com/csghub-server/common/config"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/types"
+	"opencsg.com/csghub-server/common/utils/common"
+	"opencsg.com/csghub-server/mq"
+)
+
+const (
+	ErrNotFoundMessage    = "The target couldn't be found."
+	ErrGetContentsOrList  = "GetContentsOrList"
+	AdminSecret           = "gnuRYKce"
+	GitAttributesFileName = ".gitattributes"
+	GitIgnoreFileName     = ".gitignore"
+	DefaultTreeLimit      = 500
+	MaxTreeLimit          = 10000
+	DefaultLogTreeLimit   = 25
+	MaxLogTreeLimit       = 100
+	// HF commit requests encode regular file content as Base64 inside one NDJSON
+	// record. Reserve room for the record envelope and path in addition to the
+	// configured maximum decoded file size.
+	maxNDJSONRecordOverhead = 64 * 1024
+)
+
+type repoComponentImpl struct {
+	tagComponent                   TagComponent
+	industryTagComponent           IndustryTagComponent
+	userStore                      database.UserStore
+	orgStore                       database.OrgStore
+	namespaceStore                 database.NamespaceStore
+	repoStore                      database.RepoStore
+	repoFileStore                  database.RepoFileStore
+	repoRelationsStore             database.RepoRelationsStore
+	repoStatisticsStore            database.RepositoryStatisticsStore
+	mirrorStore                    database.MirrorStore
+	git                            gitserver.GitServer
+	s3Client                       s3.Client
+	repositoryPackageSyncer        *repositoryPackageSyncer
+	userSvcClient                  rpc.UserSvcClient
+	lfsBucket                      string
+	userLikesStore                 database.UserLikesStore
+	runtimeFrameworksStore         database.RuntimeFrameworksStore
+	deployTaskStore                database.DeployTaskStore
+	deployer                       deploy.Deployer
+	publicRootDomain               string
+	serverBaseUrl                  string
+	clusterInfoStore               database.ClusterInfoStore
+	mirrorSourceStore              database.MirrorSourceStore
+	tokenStore                     database.AccessTokenStore
+	syncVersionStore               database.SyncVersionStore
+	syncClientSettingStore         database.SyncClientSettingStore
+	fileStore                      database.FileStore
+	config                         *config.Config
+	accountingComponent            AccountingComponent
+	spaceResourceStore             database.SpaceResourceStore
+	lfsMetaObjectStore             database.LfsMetaObjectStore
+	userResourcesStore             database.UserResourcesStore
+	recomStore                     database.RecomStore
+	multiSyncClient                multisync.Client
+	sysMQ                          mq.MessageQueue
+	mirrorTaskStore                database.MirrorTaskStore
+	argoWorkFlowStore              database.ArgoWorkFlowStore
+	dataviewerStore                database.DataviewerStore
+	accountSyncQuotaStatementStore database.AccountSyncQuotaStatementStore
+	accountPriceStore              database.AccountPriceStore
+	notificationSvcClient          rpc.NotificationSvcClient
+	mirrorSvcClient                rpc.MirrorSvcClient
+	pendingDeletion                database.PendingDeletionStore
+	xnetClient                     rpc.XnetSvcClient
+	clusterComponent               ClusterComponent
+	modelStore                     database.ModelStore
+	tagStore                       database.TagStore
+	upstreamStore                  database.UpstreamStore
+	packageReader                  func(ctx context.Context, repoType types.RepositoryType, repoID int64, branch, commitID string) ([]byte, bool)
+	packageWriter                  func(ctx context.Context, repoType types.RepositoryType, repoID int64, commitID string, archive []byte) error
+	rebac                          rebac.Authorizer
+	repositoryAccessCache          storecache.RedisClient
+	extendRepoImpl
+}
+
+type RepoComponent interface {
+	CreateRepo(ctx context.Context, req types.CreateRepoReq) (*gitserver.CreateRepoResp, *database.Repository, *gitserver.CommitFilesReq, error)
+	UpdateRepo(ctx context.Context, req types.UpdateRepoReq) (*database.Repository, error)
+	DeleteRepo(ctx context.Context, req types.DeleteRepoReq) (*database.Repository, error)
+	// CreateFork creates a fork of a repository
+	CreateFork(ctx context.Context, req types.CreateForkReq) (*database.Repository, error)
+	// PublicToUser gets repositories visible to the given user.
+	PublicToUser(ctx context.Context, repoType types.RepositoryType, userName string, filter *types.RepoFilter, per, page int) (repos []*database.Repository, count int, err error)
+	// PublicToUserV2 is like PublicToUser but skips Tag eager-loading for faster list queries.
+	PublicToUserV2(ctx context.Context, repoType types.RepositoryType, userName string, filter *types.RepoFilter, per, page int) (repos []*database.Repository, count int, err error)
+	CreateFile(ctx context.Context, req *types.CreateFileReq) (*types.CreateFileResp, error)
+	UpdateFile(ctx context.Context, req *types.UpdateFileReq) (*types.UpdateFileResp, error)
+	DeleteFile(ctx context.Context, req *types.DeleteFileReq) (*types.DeleteFileResp, error)
+	Commits(ctx context.Context, req *types.GetCommitsReq) ([]types.Commit, *types.RepoPageOpts, error)
+	LastCommit(ctx context.Context, req *types.GetCommitsReq) (*types.Commit, error)
+	FileRaw(ctx context.Context, req *types.GetFileReq) (string, error)
+	DownloadFile(ctx context.Context, req *types.GetFileReq, userName string) (io.ReadCloser, int64, string, error)
+	InternalDownloadFile(ctx context.Context, req *types.GetFileReq) (io.ReadCloser, int64, string, error)
+	Branches(ctx context.Context, req *types.GetBranchesReq) ([]types.Branch, error)
+	Tags(ctx context.Context, req *types.GetTagsReq) ([]database.Tag, error)
+	UpdateTags(ctx context.Context, namespace, name string, repoType types.RepositoryType, category, currentUser string, tags []string) error
+	Tree(ctx context.Context, req *types.GetFileReq) ([]*types.File, error)
+	TreeV2(ctx context.Context, req *types.GetTreeRequest) (*types.GetRepoFileTreeResp, error)
+	RemoteTree(ctx context.Context, req *types.GetTreeRequest) (*types.GetRepoFileTreeResp, error)
+	LogsTree(ctx context.Context, req *types.GetLogsTreeRequest) (*types.LogsTreeResp, error)
+	UploadFile(ctx context.Context, req *types.CreateFileReq) error
+	SDKListFiles(ctx context.Context, repoType types.RepositoryType, namespace, name, ref, userName string) (*types.SDKFiles, error)
+	IsLfs(ctx context.Context, req *types.GetFileReq) (bool, int64, error)
+	HeadDownloadFile(ctx context.Context, req *types.GetFileReq, userName string) (*types.File, *types.Commit, error)
+	// SDKDownloadFile prepares a download and records it when req.CountDownload is true.
+	SDKDownloadFile(ctx context.Context, req *types.GetFileReq, userName string) (io.ReadCloser, int64, string, error)
+	// UpdateDownloads increase clone download count for repo by given count
+	UpdateDownloads(ctx context.Context, req *types.UpdateDownloadsReq) error
+	// IncrDownloads increase the click download count for repo by 1
+	IncrDownloads(ctx context.Context, repoType types.RepositoryType, namespace, name string) error
+	FileInfo(ctx context.Context, req *types.GetFileReq) (*types.File, error)
+	AllowReadAccessRepo(ctx context.Context, repo *database.Repository, username string) (bool, error)
+	AllowReadAccess(ctx context.Context, repoType types.RepositoryType, namespace, name, username string) (bool, error)
+	AllowWriteAccess(ctx context.Context, repoType types.RepositoryType, namespace, name, username string) (bool, error)
+	AllowAdminAccess(ctx context.Context, repoType types.RepositoryType, namespace, name, username string) (bool, error)
+	GetCommitWithDiff(ctx context.Context, req *types.GetCommitsReq) (*types.CommitResponse, error)
+	// get runtime framework list with type
+	ListRuntimeFrameworkWithType(ctx context.Context, deployType int) ([]types.RuntimeFramework, error)
+	// get runtime framework list
+	ListRuntimeFramework(ctx context.Context, repoType types.RepositoryType, namespace, name string, deployType int) ([]types.RuntimeFramework, error)
+	ListRuntimeFrameworkV2(ctx context.Context, repoType types.RepositoryType, namespace, name string, deployType int) ([]types.RuntimeFrameworkV2, error)
+	CreateRuntimeFramework(ctx context.Context, req *types.RuntimeFrameworkReq) (*types.RuntimeFramework, error)
+	UpdateRuntimeFramework(ctx context.Context, id int64, req *types.RuntimeFrameworkReq) (*types.RuntimeFramework, error)
+	DeleteRuntimeFramework(ctx context.Context, currentUser string, id int64) error
+	ListDeploy(ctx context.Context, repoType types.RepositoryType, namespace, name, currentUser string) ([]types.DeployRequest, error)
+	DeleteDeploy(ctx context.Context, delReq types.DeployActReq) error
+	DeployDetail(ctx context.Context, detailReq types.DeployActReq) (*types.DeployRequest, error)
+	DeployInstanceLogs(ctx context.Context, logReq types.DeployActReq) (*deploy.MultiLogReader, error)
+	DeployInstanceLastLogs(ctx context.Context, logReq types.DeployActReq) (*loki.LokiStream, error)
+	// check access repo permission by repo id
+	AllowAccessByRepoID(ctx context.Context, repoID int64, username string) (bool, error)
+	// check access endpoint for rproxy
+	AllowAccessEndpoint(ctx context.Context, currentUser string, deploy *database.Deploy) (bool, error)
+	// check access deploy permission
+	AllowAccessDeploy(ctx context.Context, req types.DeployActReq) (bool, error)
+	DeployStop(ctx context.Context, stopReq types.DeployActReq) error
+	AllowReadAccessByDeployID(ctx context.Context, repoType types.RepositoryType, namespace, name, currentUser string, deployID int64) (bool, error)
+	DeployStatus(ctx context.Context, repoType types.RepositoryType, namespace, name string, deployID int64) (types.ModelStatusEventData, error)
+	GetDeployBySvcName(ctx context.Context, svcName string) (*database.Deploy, error)
+	DeployUpdate(ctx context.Context, updateReq types.DeployActReq, req *types.DeployUpdateReq) error
+	DeployStart(ctx context.Context, startReq types.DeployActReq) error
+	AllFiles(ctx context.Context, req types.GetAllFilesReq) (*types.GetRepoFileTreeResp, error)
+	GetUserRepoPermission(ctx context.Context, userName string, repo *database.Repository) (*types.UserRepoPermission, error)
+	// CheckUserRepoPermission checks one effective permission on a repository.
+	CheckUserRepoPermission(ctx context.Context, userName string, repo *database.Repository, permission rebac.Permission) (bool, error)
+	CheckCurrentUserPermission(ctx context.Context, userName string, namespace string, permission rebac.Permission) (bool, error)
+	GetNameSpaceInfo(ctx context.Context, path string) (*types.Namespace, error)
+	RelatedRepos(ctx context.Context, repoID int64, currentUser string) (map[types.RepositoryType][]*database.Repository, error)
+	VisiableToUser(ctx context.Context, repos []*database.Repository, currentUser string) ([]*database.Repository, error)
+	GenerateEndpoint(ctx context.Context, deploy *database.Deploy) (string, string)
+	FixRepoSource(ctx context.Context) error
+	IsAdminRole(user database.User) bool
+	CheckAccountAndResource(ctx context.Context, chkReq types.CheckResourceAndAccountReq, resource *database.SpaceResource) (*types.CheckExclusiveResp, error)
+	DiffBetweenTwoCommits(ctx context.Context, req types.GetDiffBetweenCommitsReq) ([]types.GiteaCallbackPushReq_Commit, error)
+	RemoteDiff(ctx context.Context, req types.GetDiffBetweenCommitsReq) ([]types.RemoteDiffs, error)
+	SendAssetManagementMsg(ctx context.Context, req types.RepoNotificationReq) error
+	Preupload(ctx context.Context, req types.PreuploadReq) (*types.PreuploadResp, error)
+	CommitFiles(ctx context.Context, req types.CommitFilesReq) error
+	IsExists(ctx context.Context, repoType types.RepositoryType, namespace, name string) (bool, error)
+	ValidateYaml(ctx context.Context, req types.ValidateYamlReq) error
+	ParseNDJson(ctx *gin.Context) (*types.CommitFilesReq, error)
+	IsSyncing(ctx context.Context, repoType types.RepositoryType, namespace, name string) (bool, error)
+	ChangePath(ctx context.Context, req types.ChangePathReq) error
+	// TransferOwnership moves a repository when the caller administers both namespaces.
+	TransferOwnership(ctx context.Context, req types.TransferRepoReq) error
+	BatchMigrateRepoToHashedPath(ctx context.Context, auto bool, batchSize int, lastID int64) (int64, error)
+	GetMirrorTaskStatus(repo *database.Repository) types.MirrorTaskStatus
+	CheckDeployPermissionForUser(ctx context.Context, deployReq types.DeployActReq) (*database.User, *database.Deploy, error)
+	// CheckDeployReadAccess verifies view access on a deploy instance.
+	CheckDeployReadAccess(ctx context.Context, deployReq types.DeployActReq) (*database.User, *database.Deploy, error)
+	// CheckDeployOperateAccess verifies operate access (start/stop/delete/public switch) on a deploy instance.
+	CheckDeployOperateAccess(ctx context.Context, deployReq types.DeployActReq) (*database.User, *database.Deploy, error)
+	GetNamespaceBillingUUID(ctx context.Context, namespace string) (string, error)
+	DeletePendingDeletion(ctx context.Context) error
+	GetRepos(ctx context.Context, search, currentUser string, repoType types.RepositoryType) ([]string, error)
+	// GetRepoSizeByBranch gets the repository size for a specific branch
+	GetRepoSizeByBranch(ctx context.Context, repoType types.RepositoryType, namespace, name, branch, currentUser string) (types.RepoSizeResponse, error)
+	// BatchGetRepoExtra gets the default branch size for multiple repositories
+	BatchGetRepoExtra(ctx context.Context, repoIDs []int64, currentUser string) ([]types.RepoExtraItem, error)
+	// SyncRepositoryPackage stores the current branch archive package for supported repository types.
+	SyncRepositoryPackage(ctx context.Context, repo *database.Repository, namespace, name, branch string) error
+	// DownloadRepoZip downloads a supported repository as a zip archive.
+	DownloadRepoZip(ctx context.Context, req types.DownloadRepoZipReq, currentUser string) ([]byte, error)
+	advancedRepoInterface
+}
+
+func NewRepoComponentImpl(config *config.Config) (*repoComponentImpl, error) {
+	r, err := NewRepoComponent(config)
+	if err != nil {
+		return nil, err
+	}
+	return r.(*repoComponentImpl), nil
+}
+
+func (c *repoComponentImpl) CreateRepo(ctx context.Context, req types.CreateRepoReq) (*gitserver.CreateRepoResp, *database.Repository, *gitserver.CommitFilesReq, error) {
+	var commitFilesReq *gitserver.CommitFilesReq
+	// Name validation
+	valid, err := common.IsValidName(req.Name)
+	if !valid {
+		slog.ErrorContext(ctx, "repo name is invalid", slog.Any("error", err))
+		return nil, nil, commitFilesReq, errorx.ErrRepoNameInvalid
+	}
+
+	namespace, err := c.namespaceStore.FindByPath(ctx, req.Namespace)
+	if err != nil {
+		slog.ErrorContext(ctx, "namespace does not exist", slog.Any("error", err))
+		return nil, nil, commitFilesReq, errorx.ErrNamespaceNotFound
+	}
+
+	user, err := c.userStore.FindByUsername(ctx, req.Username)
+	if err != nil {
+		slog.ErrorContext(ctx, "user does not exist", slog.Any("error", err))
+		return nil, nil, commitFilesReq, errorx.ErrUserNotFound
+	}
+
+	if user.Email == "" {
+		slog.ErrorContext(ctx, "user email is empty", slog.Any("user", user))
+		return nil, nil, commitFilesReq, errorx.ErrUserEmailEmpty
+	}
+
+	if !user.CanAdmin() {
+		canWrite, err := c.CheckCurrentUserPermission(ctx, req.Username, req.Namespace, rebac.NamespaceCanWrite)
+		if err != nil {
+			return nil, nil, commitFilesReq, err
+		}
+		if !canWrite {
+			return nil, nil, commitFilesReq, errorx.ErrForbiddenMsg("users do not have permission to create repo in this namespace")
+		}
+	}
+	if req.DefaultBranch == "" {
+		req.DefaultBranch = types.MainBranch
+	}
+	complianceStatus, commercialPermission := types.ClassifyRepositoryLicenseForType(req.RepoType, req.License)
+
+	temPath := strings.SplitN(uuid.NewString(), "-", 2)
+	dbRepo := database.Repository{
+		UserID: user.ID,
+		// Path:           path.Join(req.Namespace, req.Name),
+		// GitPath:        fmt.Sprintf("%ss_%s/%s", string(req.RepoType), req.Namespace, req.Name),
+		Path:                 path.Join(temPath[0], temPath[1]),
+		GitPath:              fmt.Sprintf("%ss_%s/%s", string(req.RepoType), temPath[0], temPath[1]),
+		Name:                 req.Name,
+		Nickname:             req.Nickname,
+		Description:          req.Description,
+		Private:              req.Private,
+		License:              req.License,
+		ComplianceStatus:     complianceStatus,
+		CommercialPermission: commercialPermission,
+		DefaultBranch:        req.DefaultBranch,
+		RepositoryType:       req.RepoType,
+		StarCount:            req.StarCount,
+		User:                 user,
+	}
+	newDBRepo, err := c.repoStore.CreateRepo(ctx, dbRepo)
+	if err != nil {
+		return nil, nil, commitFilesReq, fmt.Errorf("fail to create database repo, error: %w", err)
+	}
+
+	if err := ensureRepositoryNamespaceRelationship(ctx, c.rebac, c.orgStore, namespace, newDBRepo.ID, newDBRepo.OrgInheritBlocked); err != nil {
+		return nil, nil, commitFilesReq, fmt.Errorf("failed to synchronize repository namespace relationship: %w", err)
+	}
+
+	err = c.recomStore.UpsertScore(ctx, []*database.RecomRepoScore{
+		{
+			RepositoryID: newDBRepo.ID,
+			Score:        0,
+			WeightName:   database.RecomWeightTotal,
+		},
+	})
+	if err != nil {
+		return nil, nil, commitFilesReq, fmt.Errorf("fail to upsert recom repo score, error: %w", err)
+	}
+
+	gitRepoReq := gitserver.CreateRepoReq{
+		Username:      req.Username,
+		Namespace:     temPath[0],
+		Name:          temPath[1],
+		Nickname:      req.Nickname,
+		License:       req.License,
+		DefaultBranch: req.DefaultBranch,
+		// Readme:        "Please introduce your space.",
+		Readme:   req.Readme,
+		Private:  req.Private,
+		RepoType: req.RepoType,
+	}
+	gitRepo, err := c.git.CreateRepo(ctx, gitRepoReq)
+	if err != nil {
+		slog.Error("fail to create repo in git ", slog.Any("req", req), slog.String("error", err.Error()))
+		return nil, nil, commitFilesReq, fmt.Errorf("fail to create repo in git, error: %w", err)
+	}
+
+	if len(req.CommitFiles) > 0 {
+		var gitCommitFiles []gitserver.CommitFile
+		for _, file := range req.CommitFiles {
+			gitCommitFiles = append(gitCommitFiles, gitserver.CommitFile{
+				Content: base64.StdEncoding.EncodeToString([]byte(file.Content)),
+				Path:    file.Path,
+				Action:  gitserver.CommitActionCreate,
+			})
+		}
+		commitFilesReq = &gitserver.CommitFilesReq{
+			Namespace: req.Namespace,
+			Name:      req.Name,
+			RepoType:  req.RepoType,
+			Revision:  req.DefaultBranch,
+			Username:  user.Username,
+			Email:     user.Email,
+			Message:   types.InitCommitMessage,
+			Files:     gitCommitFiles,
+		}
+	}
+	if newDBRepo.Private {
+		c.clearRepositoryAccessCache(ctx, user.UUID)
+	}
+
+	return gitRepo, newDBRepo, commitFilesReq, nil
+}
+
+func (c *repoComponentImpl) UpdateRepo(ctx context.Context, req types.UpdateRepoReq) (*database.Repository, error) {
+	repo, err := c.repoStore.Find(ctx, req.Namespace, string(req.RepoType), req.Name)
+	if err != nil {
+		return nil, errors.New("repository does not exist")
+	}
+	originalRepo := *repo
+	complianceUpdateRequested := req.ComplianceStatus != nil
+
+	namespace, err := c.namespaceStore.FindByPath(ctx, req.Namespace)
+	if err != nil {
+		return nil, errors.New("namespace does not exist")
+	}
+
+	user, err := c.userStore.FindByUsername(ctx, req.Username)
+	if err != nil {
+		return nil, errors.New("user does not exist")
+	}
+
+	// Admin users have full permissions.
+	if user.CanAdmin() {
+		if req.ComplianceStatus != nil {
+			if !types.SupportsLicenseCompliance(req.RepoType) {
+				return nil, errorx.BadRequest(errors.New("license compliance can only be updated for models and datasets"), nil)
+			}
+			if !req.ComplianceStatus.IsValid() {
+				return nil, errorx.BadRequest(errors.New("invalid compliance status"), nil)
+			}
+			repo.ComplianceStatus = *req.ComplianceStatus
+		}
+		if req.Private != nil {
+			repo.Private = *req.Private
+		}
+		if req.XnetEnabled != nil {
+			repo.XnetEnabled = *req.XnetEnabled
+		}
+	} else {
+		if req.ComplianceStatus != nil {
+			return nil, errorx.ErrForbiddenMsg("only admins can update license compliance")
+		}
+		canWrite, err := c.CheckUserRepoPermission(ctx, req.Username, repo, rebac.RepositoryCanWrite)
+		if err != nil {
+			return nil, err
+		}
+		if !canWrite {
+			if namespace.NamespaceType == database.OrgNamespace {
+				return nil, errorx.ErrForbiddenMsg("users do not have permission to update repo in this organization")
+			}
+			return nil, errorx.ErrForbiddenMsg("users do not have permission to update repo in this namespace")
+		}
+
+		// Preserve the edition-independent privacy rules for non-platform administrators.
+		if namespace.NamespaceType == database.OrgNamespace {
+			// Non-admins cannot change the privacy of an organization's repository.
+			if req.Private != nil {
+				return nil, errorx.ErrForbiddenMsg("only admins can change the privacy of an organization repository")
+			}
+		} else {
+			// Repository administrators can change the privacy of personal repositories.
+			if req.Private != nil {
+				canAdmin, err := c.CheckUserRepoPermission(ctx, req.Username, repo, rebac.RepositoryCanAdmin)
+				if err != nil {
+					return nil, err
+				}
+				if !canAdmin {
+					return nil, errorx.ErrForbiddenMsg("users do not have permission to update repo privacy in this namespace")
+				}
+				// Additional check if making the repository public.
+				if !*req.Private {
+					if err := c.allowPublic(repo); err != nil {
+						return nil, err
+					}
+				}
+				repo.Private = *req.Private
+			}
+		}
+	}
+
+	if req.Nickname != nil {
+		repo.Nickname = *req.Nickname
+	}
+	if req.Description != nil {
+		repo.Description = *req.Description
+	}
+
+	if req.DefaultBranch != nil {
+		repo.DefaultBranch = *req.DefaultBranch
+	}
+	defaultBranchChanged := repo.DefaultBranch != originalRepo.DefaultBranch
+	if defaultBranchChanged && types.SupportsLicenseCompliance(req.RepoType) {
+		repo.License = ""
+		repo.ComplianceStatus = types.ComplianceStatusPendingReview
+		repo.CommercialPermission = types.CommercialPermissionCustomTerms
+	}
+
+	gitRepoChanged := repo.Nickname != originalRepo.Nickname ||
+		repo.Description != originalRepo.Description ||
+		repo.Private != originalRepo.Private ||
+		repo.DefaultBranch != originalRepo.DefaultBranch
+	repositoryUpdateRequired := !complianceUpdateRequested || gitRepoChanged || repo.XnetEnabled != originalRepo.XnetEnabled
+
+	if repositoryUpdateRequired {
+		gitRepoReq := gitserver.UpdateRepoReq{
+			Namespace:     req.Namespace,
+			Name:          req.Name,
+			Nickname:      repo.Nickname,
+			Description:   repo.Description,
+			DefaultBranch: repo.DefaultBranch,
+			Private:       repo.Private,
+			RepoType:      req.RepoType,
+		}
+		_, err = c.git.UpdateRepo(ctx, gitRepoReq)
+		if err != nil {
+			slog.Error("fail to update repo in git ", slog.Any("req", req), slog.String("error", err.Error()))
+			return nil, fmt.Errorf("fail to update repo in git, error: %w", err)
+		}
+	}
+
+	resRepo := repo
+	if repositoryUpdateRequired {
+		resRepo, err = c.repoStore.UpdateRepo(ctx, *repo)
+		if err != nil {
+			slog.Error("fail to update repo in database", slog.Any("req", req), slog.String("error", err.Error()))
+			return nil, fmt.Errorf("fail to update repo in database, error: %w", err)
+		}
+	}
+
+	if defaultBranchChanged && types.SupportsLicenseCompliance(req.RepoType) {
+		if err := c.repoStore.UpdateLicenseCompliance(ctx, repo.ID, &repo.License, repo.ComplianceStatus, repo.CommercialPermission); err != nil {
+			return nil, fmt.Errorf("fail to reset license compliance after default branch change: %w", err)
+		}
+		if err := c.refreshLicenseComplianceFromReadme(ctx, repo); err != nil {
+			return nil, err
+		}
+		resRepo, err = c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+		if err != nil {
+			return nil, fmt.Errorf("fail to reload repo after default branch change: %w", err)
+		}
+	} else if complianceUpdateRequested {
+		if err := c.repoStore.UpdateLicenseCompliance(ctx, repo.ID, nil, repo.ComplianceStatus, repo.CommercialPermission); err != nil {
+			return nil, fmt.Errorf("fail to update license compliance: %w", err)
+		}
+		resRepo.ComplianceStatus = repo.ComplianceStatus
+		resRepo.CommercialPermission = repo.CommercialPermission
+	}
+
+	return resRepo, nil
+}
+
+func (c *repoComponentImpl) refreshLicenseComplianceFromReadme(ctx context.Context, repo *database.Repository) error {
+	namespace, name := repo.NamespaceAndName()
+	content, err := c.git.GetRepoFileRaw(ctx, gitserver.GetRepoInfoByPathReq{
+		Namespace: namespace,
+		Name:      name,
+		Ref:       repo.DefaultBranch,
+		Path:      types.ReadmeFileName,
+		RepoType:  repo.RepositoryType,
+	})
+	if err != nil {
+		if isRepositoryContentNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("fail to read README after default branch change: %w", err)
+	}
+	if _, err := c.tagComponent.UpdateMetaTags(ctx, getTagScopeByRepoType(repo.RepositoryType), namespace, name, content); err != nil {
+		return fmt.Errorf("fail to refresh license after default branch change: %w", err)
+	}
+	return nil
+}
+
+func (c *repoComponentImpl) DeleteRepo(ctx context.Context, req types.DeleteRepoReq) (*database.Repository, error) {
+	repo, err := c.repoStore.Find(ctx, req.Namespace, string(req.RepoType), req.Name)
+	if err != nil {
+		return nil, errors.New("repository does not exist")
+	}
+
+	namespace, err := c.namespaceStore.FindByPath(ctx, req.Namespace)
+	if err != nil {
+		return nil, errors.New("namespace does not exist")
+	}
+
+	user, err := c.userStore.FindByUsername(ctx, req.Username)
+	if err != nil {
+		return nil, errors.New("user does not exist")
+	}
+
+	if !user.CanAdmin() {
+		canAdmin, err := c.CheckUserRepoPermission(ctx, req.Username, repo, rebac.RepositoryCanAdmin)
+		if err != nil {
+			return nil, err
+		}
+		if !canAdmin {
+			if namespace.NamespaceType == database.OrgNamespace {
+				return nil, errorx.ErrForbiddenMsg("users do not have permission to delete repo in this organization")
+			}
+			return nil, errorx.ErrForbiddenMsg("users do not have permission to delete repo in this namespace")
+		}
+	}
+
+	err = c.repoStore.DeleteRepo(ctx, *repo)
+	if err != nil {
+		return nil, fmt.Errorf("fail to schedule repository deletion: %w", err)
+	}
+	if repo.Private {
+		c.clearRepositoryAccessCache(ctx, user.UUID)
+	}
+
+	repo.User = user
+	return repo, nil
+}
+
+func (c *repoComponentImpl) CreateFork(ctx context.Context, req types.CreateForkReq) (*database.Repository, error) {
+	// 1. Verify source repository exists
+	sourceRepo, err := c.repoStore.FindByPath(ctx, req.SourceRepoType, req.SourceNamespace, req.SourceName)
+	if err != nil {
+		return nil, fmt.Errorf("source repository does not exist, error: %w", err)
+	}
+
+	// Forking exposes the source repository contents, so the caller must be able to read it.
+	canReadSource, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, sourceRepo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check source repository read permission, error: %w", err)
+	}
+	if !canReadSource {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to read source repository")
+	}
+
+	// 2. Check if target repository path is already occupied
+	targetExists, _ := c.IsExists(ctx, req.SourceRepoType, req.TargetNamespace, req.TargetName)
+	if targetExists {
+		return nil, errorx.BadRequest(errors.New("target repository path is already occupied"), nil)
+	}
+
+	// 3. Create target repository in database
+	targetNamespace, err := c.namespaceStore.FindByPath(ctx, req.TargetNamespace)
+	if err != nil {
+		return nil, fmt.Errorf("target namespace does not exist, error: %w", err)
+	}
+
+	user, err := c.userStore.FindByUsername(ctx, req.CurrentUser)
+	if err != nil {
+		return nil, fmt.Errorf("user does not exist, error: %w", err)
+	}
+
+	// Platform administrators retain the existing global bypass for namespace writes.
+	if !user.CanAdmin() {
+		canWriteTarget, err := c.CheckCurrentUserPermission(ctx, req.CurrentUser, req.TargetNamespace, rebac.NamespaceCanWrite)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check target namespace write permission, error: %w", err)
+		}
+		if !canWriteTarget {
+			return nil, errorx.ErrForbiddenMsg("users do not have permission to write to target namespace")
+		}
+	}
+
+	temPath := strings.SplitN(uuid.NewString(), "-", 2)
+	dbRepo := database.Repository{
+		UserID:               user.ID,
+		Path:                 path.Join(temPath[0], temPath[1]),
+		GitPath:              fmt.Sprintf("%ss_%s/%s", string(req.SourceRepoType), temPath[0], temPath[1]),
+		Name:                 req.TargetName,
+		Nickname:             sourceRepo.Nickname,
+		Description:          sourceRepo.Description,
+		Private:              sourceRepo.Private,
+		License:              sourceRepo.License,
+		ComplianceStatus:     sourceRepo.ComplianceStatus,
+		CommercialPermission: sourceRepo.CommercialPermission,
+		DefaultBranch:        sourceRepo.DefaultBranch,
+		RepositoryType:       req.SourceRepoType,
+		StarCount:            0,
+		User:                 user,
+	}
+
+	newDBRepo, err := c.repoStore.CreateRepo(ctx, dbRepo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create database repo, error: %w", err)
+	}
+
+	if err := ensureRepositoryNamespaceRelationship(ctx, c.rebac, c.orgStore, targetNamespace, newDBRepo.ID, newDBRepo.OrgInheritBlocked); err != nil {
+		return nil, fmt.Errorf("failed to synchronize fork repository namespace relationship: %w", err)
+	}
+
+	err = c.recomStore.UpsertScore(ctx, []*database.RecomRepoScore{
+		{
+			RepositoryID: newDBRepo.ID,
+			Score:        0,
+			WeightName:   database.RecomWeightTotal,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to upsert recom repo score, error: %w", err)
+	}
+
+	// 4. Call gitserver CreateFork
+	forkReq := gitserver.CreateForkReq{
+		SourceRepoType:  req.SourceRepoType,
+		SourceNamespace: req.SourceNamespace,
+		SourceName:      req.SourceName,
+		TargetRepoType:  req.SourceRepoType,
+		TargetNamespace: temPath[0],
+		TargetName:      temPath[1],
+		Revision:        sourceRepo.DefaultBranch,
+	}
+
+	err = c.git.CreateFork(ctx, forkReq)
+	if err != nil {
+		slog.Error("failed to create fork in git", slog.Any("req", forkReq), slog.String("error", err.Error()))
+		return nil, fmt.Errorf("failed to create fork in git, error: %w", err)
+	}
+
+	// 5. Copy LFS objects from source to target repository
+	if err := c.copyLfsObjects(ctx, sourceRepo.ID, newDBRepo.ID); err != nil {
+		slog.Error("failed to copy LFS objects", slog.Any("source_repo_id", sourceRepo.ID), slog.Any("target_repo_id", newDBRepo.ID), slog.String("error", err.Error()))
+	}
+
+	return newDBRepo, nil
+}
+
+func (c *repoComponentImpl) copyLfsObjects(ctx context.Context, sourceRepoID, targetRepoID int64) error {
+	lfsMetas, err := c.lfsMetaObjectStore.FindByRepoID(ctx, sourceRepoID)
+	if err != nil {
+		return fmt.Errorf("failed to find LFS meta objects for source repo: %w", err)
+	}
+
+	if len(lfsMetas) == 0 {
+		return nil
+	}
+
+	// Get source and target repo information
+	sourceRepo, err := c.repoStore.FindById(ctx, sourceRepoID)
+	if err != nil {
+		return fmt.Errorf("failed to find source repo: %w", err)
+	}
+
+	targetRepo, err := c.repoStore.FindById(ctx, targetRepoID)
+	if err != nil {
+		return fmt.Errorf("failed to find target repo: %w", err)
+	}
+
+	slog.InfoContext(ctx, "Copying LFS objects", slog.Int64("source_repo_id", sourceRepoID), slog.Int64("target_repo_id", targetRepoID), slog.Int("count", len(lfsMetas)))
+
+	for _, meta := range lfsMetas {
+		sourceKey := common.BuildLfsPath(sourceRepoID, meta.Oid, sourceRepo.Migrated)
+		targetKey := common.BuildLfsPath(targetRepoID, meta.Oid, targetRepo.Migrated)
+
+		_, err := c.s3Client.CopyObject(ctx,
+			minio.CopyDestOptions{
+				Bucket: c.lfsBucket,
+				Object: targetKey,
+			},
+			minio.CopySrcOptions{
+				Bucket: c.lfsBucket,
+				Object: sourceKey,
+			})
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to copy LFS object", slog.String("source_key", sourceKey), slog.String("target_key", targetKey), slog.Any("error", err))
+			continue
+		}
+	}
+
+	slog.InfoContext(ctx, "Completed copying LFS objects", slog.Int64("source_repo_id", sourceRepoID), slog.Int64("target_repo_id", targetRepoID))
+	return nil
+}
+
+// repositoryAccessCacheKeyPrefix versions the per-user authorization snapshot format.
+const repositoryAccessCacheKeyPrefix = "repo:access:read:v2:"
+
+var repositoryAccessListFlight singleflight.Group
+
+// repositoryAccessSnapshot stores a validated OpenFGA ListObjects response.
+// Permission changes may remain stale until the configured TTL expires.
+type repositoryAccessSnapshot struct {
+	SchemaVersion int       `json:"schema_version"`
+	RepositoryIDs []int64   `json:"repository_ids"`
+	FetchedAt     time.Time `json:"fetched_at"`
+}
+
+// clearRepositoryAccessCache removes one user's cached readable repository snapshot.
+// Cache failures are logged without changing the repository operation result.
+func (c *repoComponentImpl) clearRepositoryAccessCache(ctx context.Context, userUUID string) {
+	if c.repositoryAccessCache == nil || userUUID == "" {
+		return
+	}
+	cacheKey := repositoryAccessCacheKeyPrefix + userUUID
+	if err := c.repositoryAccessCache.Del(ctx, cacheKey); err != nil {
+		slog.ErrorContext(ctx, "failed to clear repository access cache",
+			"user_uuid", userUUID,
+			"cache_key", cacheKey,
+			"error", err,
+		)
+	}
+}
+
+// loadRepositoryReadScope resolves the effective repository visibility for list queries.
+// Only the returned repository IDs are cached; search results remain user-specific database queries.
+func (c *repoComponentImpl) loadRepositoryReadScope(ctx context.Context, currentUser string) (database.RepositoryAccessScope, error) {
+	return loadRepositoryReadScope(ctx, currentUser, c.userSvcClient, c.rebac, c.repositoryAccessCache, c.config)
+}
+
+// loadRepositoryReadScope resolves a user's list-query scope using the shared ReBAC and cache rules.
+// The per-user snapshot is intentionally TTL-only, so short-lived permission staleness is allowed.
+func loadRepositoryReadScope(ctx context.Context, currentUser string, userSvcClient rpc.UserSvcClient, authorizer rebac.Authorizer, accessCache storecache.RedisClient, cfg *config.Config) (database.RepositoryAccessScope, error) {
+	if currentUser == "" {
+		return database.NewRepositoryAccessScope(database.RepositoryAccessPublic, nil), nil
+	}
+
+	user, err := userSvcClient.GetUserInfo(ctx, currentUser, currentUser)
+	if err != nil {
+		return database.RepositoryAccessScope{}, fmt.Errorf("failed to get user info, error: %w", err)
+	}
+	if user == nil {
+		return database.RepositoryAccessScope{}, fmt.Errorf("user %q not found", currentUser)
+	}
+	if (&database.User{RoleMask: strings.Join(user.Roles, ",")}).CanAdmin() {
+		return database.NewRepositoryAccessScope(database.RepositoryAccessAdmin, nil), nil
+	}
+	if user.UUID == "" {
+		return database.RepositoryAccessScope{}, fmt.Errorf("user %q has no UUID", currentUser)
+	}
+
+	cacheKey := repositoryAccessCacheKeyPrefix + user.UUID
+	cacheTTL := time.Minute
+	if cfg != nil && cfg.Search.RepositoryAccessListCacheTTL > 0 {
+		cacheTTL = time.Duration(cfg.Search.RepositoryAccessListCacheTTL) * time.Second
+	}
+	if accessCache != nil {
+		cached, cacheErr := accessCache.Get(ctx, cacheKey)
+		if cacheErr == nil {
+			var snapshot repositoryAccessSnapshot
+			if json.Unmarshal([]byte(cached), &snapshot) == nil && snapshot.SchemaVersion == 1 && snapshot.FetchedAt.After(time.Time{}) && time.Since(snapshot.FetchedAt) < cacheTTL && validRepositoryAccessIDs(snapshot.RepositoryIDs) {
+				return database.NewRepositoryAccessScope(database.RepositoryAccessReadable, snapshot.RepositoryIDs), nil
+			}
+			slog.WarnContext(ctx, "invalid repository access cache value", "user_uuid", user.UUID)
+		} else if !errors.Is(cacheErr, redis.Nil) {
+			slog.WarnContext(ctx, "failed to read repository access cache", "user_uuid", user.UUID, "error", cacheErr)
+		}
+	}
+	if authorizer == nil {
+		return database.RepositoryAccessScope{}, errors.New("ReBAC authorizer is nil")
+	}
+
+	fetchedAt := time.Now()
+	flightResult, err, _ := repositoryAccessListFlight.Do(cacheKey, func() (any, error) {
+		return authorizer.ListObjects(ctx, rebac.ListObjectsRequest{
+			Subject:     rebac.UserSubject(user.UUID),
+			Relation:    rebac.RepositoryCanRead,
+			ObjectType:  rebac.ObjectTypeRepository,
+			Consistency: rebac.ConsistencyHigher,
+		})
+	})
+	if err != nil {
+		return database.RepositoryAccessScope{}, fmt.Errorf("failed to list readable repositories, error: %w", err)
+	}
+	result, ok := flightResult.(rebac.ListObjectsResult)
+	if !ok {
+		return database.RepositoryAccessScope{}, errors.New("invalid ReBAC ListObjects result")
+	}
+
+	ids := make([]int64, 0, len(result.Objects))
+	for _, object := range result.Objects {
+		if object.Type != rebac.ObjectTypeRepository {
+			return database.RepositoryAccessScope{}, fmt.Errorf("unexpected ReBAC object type %q", object.Type)
+		}
+		id, parseErr := strconv.ParseInt(object.ID, 10, 64)
+		if parseErr != nil || id <= 0 {
+			return database.RepositoryAccessScope{}, fmt.Errorf("invalid repository object ID %q", object.ID)
+		}
+		ids = append(ids, id)
+	}
+	scope := database.NewRepositoryAccessScope(database.RepositoryAccessReadable, ids)
+
+	if accessCache != nil {
+		remainingTTL := cacheTTL - time.Since(fetchedAt)
+		if remainingTTL > 0 {
+			snapshot := repositoryAccessSnapshot{SchemaVersion: 1, RepositoryIDs: scope.ReadableRepositoryIDs, FetchedAt: fetchedAt}
+			value, marshalErr := json.Marshal(snapshot)
+			if marshalErr == nil {
+				if setErr := accessCache.SetEx(ctx, cacheKey, string(value), remainingTTL); setErr != nil {
+					slog.WarnContext(ctx, "failed to write repository access cache", "user_uuid", user.UUID, "error", setErr)
+				}
+			}
+		}
+	}
+	return scope, nil
+}
+
+// validRepositoryAccessIDs rejects malformed permission snapshots before they
+// can widen or otherwise corrupt a repository list query.
+func validRepositoryAccessIDs(ids []int64) bool {
+	for _, id := range ids {
+		if id <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// PublicToUser gets repositories visible to the authenticated user.
+func (c *repoComponentImpl) PublicToUser(ctx context.Context, repoType types.RepositoryType, userName string, filter *types.RepoFilter, per, page int) (repos []*database.Repository, count int, err error) {
+	scope, err := c.loadRepositoryReadScope(ctx, userName)
+	if err != nil {
+		return nil, 0, err
+	}
+	repos, count, err = c.repoStore.PublicToUserWithAccess(ctx, repoType, scope, filter, per, page)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get user public repos, error: %w", err)
+	}
+
+	return repos, count, nil
+}
+
+// PublicToUserV2 gets visible repositories without eager-loading Tags for faster list queries.
+func (c *repoComponentImpl) PublicToUserV2(ctx context.Context, repoType types.RepositoryType, userName string, filter *types.RepoFilter, per, page int) (repos []*database.Repository, count int, err error) {
+	scope, err := c.loadRepositoryReadScope(ctx, userName)
+	if err != nil {
+		return nil, 0, err
+	}
+	repos, count, err = c.repoStore.PublicToUserV2WithAccess(ctx, repoType, scope, filter, per, page)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get user public repos v2, error: %w", err)
+	}
+
+	return repos, count, nil
+}
+
+// RelatedRepos gets all repos related to the given repo, and return them by repo type
+func (c *repoComponentImpl) RelatedRepos(ctx context.Context, repoID int64, currentUser string) (map[types.RepositoryType][]*database.Repository, error) {
+	fromRelations, err := c.repoRelationsStore.From(ctx, repoID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get repo relation from, error: %w", err)
+	}
+	var toRepoIDs []int64
+	for _, rel := range fromRelations {
+		toRepoIDs = append(toRepoIDs, rel.ToRepoID)
+	}
+
+	toRelations, err := c.repoRelationsStore.To(ctx, repoID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get repo relation to, error: %w", err)
+	}
+	var fromRepoIDs []int64
+	for _, rel := range toRelations {
+		fromRepoIDs = append(fromRepoIDs, rel.FromRepoID)
+	}
+
+	// combine from and to related repos and then remove duplicates
+	var relatedRepoIDs []int64
+	relatedRepoIDs = append(relatedRepoIDs, toRepoIDs...)
+	relatedRepoIDs = append(relatedRepoIDs, fromRepoIDs...)
+	slices.Sort(relatedRepoIDs)
+	relatedRepoIDs = slices.Compact(relatedRepoIDs)
+
+	var opts []database.SelectOption
+	opts = append(opts, database.Columns("id", "repository_type", "path", "user_id", "private", "name",
+		"nickname", "description", "download_count", "updated_at"))
+
+	relatedRepos, err := c.repoStore.FindByIds(ctx, relatedRepoIDs, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get relation to repositories by ids, error: %w", err)
+	}
+
+	relatedRepos, err = c.VisiableToUser(ctx, relatedRepos, currentUser)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check related repositories visiable to user:%s, %w", currentUser, err)
+	}
+	res := make(map[types.RepositoryType][]*database.Repository)
+	for _, repo := range relatedRepos {
+		res[repo.RepositoryType] = append(res[repo.RepositoryType], repo)
+	}
+	return res, nil
+}
+
+func (c *repoComponentImpl) VisiableToUser(ctx context.Context, repos []*database.Repository, currentUser string) ([]*database.Repository, error) {
+	var res []*database.Repository
+	for _, repo := range repos {
+		if repo.Private {
+			if len(currentUser) == 0 {
+				continue
+			}
+			canRead, err := c.CheckUserRepoPermission(ctx, currentUser, repo, rebac.RepositoryCanRead)
+			if err != nil {
+				return nil, err
+			}
+			if canRead {
+				res = append(res, repo)
+			}
+		} else {
+			res = append(res, repo)
+		}
+	}
+	return res, nil
+}
+
+func (c *repoComponentImpl) CreateFile(ctx context.Context, req *types.CreateFileReq) (*types.CreateFileResp, error) {
+	slog.Debug("creating file get request", slog.String("namespace", req.Namespace), slog.String("filepath", req.FilePath))
+	var (
+		err    error
+		user   database.User
+		useLfs bool
+	)
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanWrite)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrUnauthorized
+	}
+
+	user, err = c.userStore.FindByUsername(ctx, req.Username)
+	if err != nil {
+		return nil, fmt.Errorf("fail to check user, cause: %w", err)
+	}
+	req.Email = user.Email
+
+	_, err = c.namespaceStore.FindByPath(ctx, req.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("fail to check namespace, cause: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	useLfs, req = c.checkIfShouldUseLfs(ctx, req)
+
+	if useLfs {
+		objectKey := common.BuildLfsPath(repo.ID, req.Pointer.Oid, repo.Migrated)
+		uploadInfo, err := c.s3Client.PutObject(ctx, c.config.S3.Bucket, objectKey, bytes.NewReader(req.OriginalContent), req.Pointer.Size, minio.PutObjectOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload to Minio: %w", err)
+		}
+
+		if uploadInfo.Size != req.Pointer.Size {
+			return nil, fmt.Errorf("uploaded file size does not match expected size: %d != %d", uploadInfo.Size, req.Pointer.Size)
+		}
+		_, err = c.lfsMetaObjectStore.UpdateOrCreate(ctx, database.LfsMetaObject{
+			Oid:          req.Pointer.Oid,
+			Size:         req.Pointer.Size,
+			RepositoryID: repo.ID,
+			Existing:     true,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create LFS meta object: %w", err)
+		}
+	} else {
+		if int64(len(req.Content)) > c.config.Git.MaxUnLfsFileSize {
+			return nil, fmt.Errorf("file size exceeds the maximum allowed size for non-LFS files: %d > %d", len(req.Content), c.config.Git.MaxUnLfsFileSize)
+		}
+	}
+
+	// TODO:check sensitive content of file
+	isDefaultBranch := req.Branch == repo.DefaultBranch
+	isRootReadme := types.IsRootReadme(req.FilePath)
+	refreshLicenseCompliance := types.SupportsLicenseCompliance(req.RepoType) && isDefaultBranch
+	if isRootReadme && isDefaultBranch {
+		err = c.createReadmeFile(ctx, req)
+	} else if isRootReadme {
+		err = c.git.CreateRepoFile(req)
+	} else {
+		err = c.createLibraryFile(ctx, req)
+	}
+
+	if err != nil {
+		slog.Error("failed to create repo file", slog.String("file", req.FilePath), slog.Any("error", err), slog.String("namespace", req.Namespace), slog.String("name", req.Name))
+		return nil, err
+	}
+	if refreshLicenseCompliance && types.IsRootLicenseDocument(req.FilePath) {
+		if err := c.markRepositoryLicenseForReview(ctx, repo.ID); err != nil {
+			return nil, err
+		}
+	}
+	err = c.repoStore.SetUpdateTimeByPath(ctx, req.RepoType, req.Namespace, req.Name, time.Now())
+	if err != nil {
+		slog.Error("failed to set repo update time", slog.Any("error", err), slog.String("repo_type", string(req.RepoType)), slog.String("namespace", req.Namespace), slog.String("name", req.Name))
+	}
+	if supportedRepositoryPackageType(req.RepoType) && c.repositoryPackageSyncer != nil {
+		c.asyncSyncRepositoryPackage(ctx, repo, req.Namespace, req.Name, req.Branch)
+	}
+
+	var resp types.CreateFileResp
+	return &resp, nil
+}
+
+func (c *repoComponentImpl) createReadmeFile(ctx context.Context, req *types.CreateFileReq) error {
+	var err error
+	contentDecoded, _ := base64.RawStdEncoding.DecodeString(req.Content)
+	_, err = c.tagComponent.UpdateMetaTags(ctx, getTagScopeByRepoType(req.RepoType), req.Namespace, req.Name, string(contentDecoded))
+	if err != nil {
+		return fmt.Errorf("failed to update meta tags, cause: %w", err)
+	}
+
+	err = c.git.CreateRepoFile(req)
+	if err != nil {
+		return fmt.Errorf("failed to create %s file, cause: %w", req.RepoType, err)
+	}
+
+	return err
+}
+
+func (c *repoComponentImpl) createLibraryFile(ctx context.Context, req *types.CreateFileReq) error {
+	var err error
+	err = c.tagComponent.UpdateLibraryTags(ctx, getTagScopeByRepoType(req.RepoType), req.Namespace, req.Name, "", req.FilePath)
+	if err != nil {
+		slog.Error(fmt.Sprintf("failed to set %s's tags", req.RepoType), slog.String("namespace", req.Namespace),
+			slog.String("name", req.Name), slog.Any("error", err))
+		return fmt.Errorf("failed to set %s's tags, cause: %w", req.RepoType, err)
+	}
+	err = c.git.CreateRepoFile(req)
+	if err != nil {
+		return err
+	}
+
+	return err
+}
+
+func (c *repoComponentImpl) UpdateFile(ctx context.Context, req *types.UpdateFileReq) (*types.UpdateFileResp, error) {
+	slog.Debug("update file get request", slog.String("namespace", req.Namespace), slog.String("filePath", req.FilePath),
+		slog.String("origin_path", req.OriginPath))
+
+	var (
+		err    error
+		user   database.User
+		useLfs bool
+	)
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanWrite)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to update file in this repo")
+	}
+
+	user, err = c.userStore.FindByUsername(ctx, req.Username)
+	if err != nil {
+		return nil, fmt.Errorf("fail to check user, cause: %w", err)
+	}
+	req.Email = user.Email
+
+	_, err = c.namespaceStore.FindByPath(ctx, req.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("fail to check namespace, cause: %w", err)
+	}
+
+	useLfs, req = c.checkIfShouldUseLfsUpdate(ctx, req)
+
+	if useLfs {
+		objectKey := common.BuildLfsPath(repo.ID, req.Pointer.Oid, repo.Migrated)
+		uploadInfo, err := c.s3Client.PutObject(ctx, c.config.S3.Bucket, objectKey, bytes.NewReader(req.OriginalContent), req.Pointer.Size, minio.PutObjectOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload to Minio: %w", err)
+		}
+
+		if uploadInfo.Size != req.Pointer.Size {
+			return nil, fmt.Errorf("uploaded file size does not match expected size: %d != %d", uploadInfo.Size, req.Pointer.Size)
+		}
+		_, err = c.lfsMetaObjectStore.UpdateOrCreate(ctx, database.LfsMetaObject{
+			Oid:          req.Pointer.Oid,
+			Size:         req.Pointer.Size,
+			RepositoryID: repo.ID,
+			Existing:     true,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create LFS meta object: %w", err)
+		}
+	} else {
+		if int64(len(req.Content)) > c.config.Git.MaxUnLfsFileSize {
+			return nil, fmt.Errorf("file size exceeds the maximum allowed size for non-LFS files: %d > %d", len(req.Content), c.config.Git.MaxUnLfsFileSize)
+		}
+	}
+
+	err = c.git.UpdateRepoFile(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update %s file, cause: %w", req.RepoType, err)
+	}
+
+	// TODO:check sensitive content of file
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	isDefaultBranch := req.Branch == repo.DefaultBranch
+	isRootReadme := types.IsRootReadme(req.FilePath)
+	refreshLicenseCompliance := types.SupportsLicenseCompliance(req.RepoType) && isDefaultBranch
+	if isRootReadme && isDefaultBranch {
+		slog.Debug("file is readme", slog.String("content", req.Content))
+		err = c.updateReadmeFile(ctx, req)
+	} else if !isRootReadme {
+		slog.Debug("file is not readme", slog.String("filePath", req.FilePath), slog.String("originPath", req.OriginPath))
+		err = c.updateLibraryFile(ctx, req)
+	}
+	if err != nil {
+		slog.Error("failed to update file", slog.String("file", req.FilePath), slog.Any("error", err), slog.String("namespace", req.Namespace), slog.String("name", req.Name))
+	}
+	if refreshLicenseCompliance &&
+		(types.IsRootLicenseDocument(req.FilePath) || types.IsRootLicenseDocument(req.OriginPath)) {
+		if err := c.markRepositoryLicenseForReview(ctx, repo.ID); err != nil {
+			return nil, err
+		}
+	}
+
+	err = c.repoStore.SetUpdateTimeByPath(ctx, req.RepoType, req.Namespace, req.Name, time.Now())
+	if err != nil {
+		slog.Error("failed to set repo update time", slog.Any("error", err), slog.String("repo_type", string(req.RepoType)), slog.String("namespace", req.Namespace), slog.String("name", req.Name))
+	}
+	if supportedRepositoryPackageType(req.RepoType) && c.repositoryPackageSyncer != nil {
+		c.asyncSyncRepositoryPackage(ctx, repo, req.Namespace, req.Name, req.Branch)
+	}
+
+	resp := new(types.UpdateFileResp)
+	return resp, nil
+}
+
+func (c *repoComponentImpl) DeleteFile(ctx context.Context, req *types.DeleteFileReq) (*types.DeleteFileResp, error) {
+	slog.Debug("delete file get request", slog.String("namespace", req.Namespace), slog.String("filePath", req.FilePath),
+		slog.String("origin_path", req.OriginPath))
+
+	var (
+		err  error
+		user database.User
+	)
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanWrite)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to delete file in this repo")
+	}
+
+	user, err = c.userStore.FindByUsername(ctx, req.Username)
+	if err != nil {
+		return nil, fmt.Errorf("fail to check user, cause: %w", err)
+	}
+	req.Email = user.Email
+
+	_, err = c.namespaceStore.FindByPath(ctx, req.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("fail to check namespace, cause: %w", err)
+	}
+
+	err = c.git.DeleteRepoFile(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to delete %s file, cause: %w", req.RepoType, err)
+	}
+
+	// TODO:check sensitive content of file
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	isDefaultBranch := req.Branch == repo.DefaultBranch
+	isRootReadme := types.IsRootReadme(req.FilePath)
+	refreshLicenseCompliance := types.SupportsLicenseCompliance(req.RepoType) && isDefaultBranch
+	if isRootReadme && isDefaultBranch {
+		slog.Debug("file is readme", slog.String("content", req.Content))
+		err = c.deleteReadmeFile(ctx, req)
+	} else if !isRootReadme {
+		slog.Debug("file is not readme", slog.String("filePath", req.FilePath), slog.String("originPath", req.OriginPath))
+		err = c.deleteLibraryFile(ctx, req)
+	}
+
+	if err != nil {
+		slog.Error("failed to delete file", slog.String("file", req.FilePath), slog.Any("error", err), slog.String("namespace", req.Namespace), slog.String("name", req.Name))
+	}
+	if refreshLicenseCompliance &&
+		(types.IsRootLicenseDocument(req.FilePath) || types.IsRootLicenseDocument(req.OriginPath)) {
+		if err := c.markRepositoryLicenseForReview(ctx, repo.ID); err != nil {
+			return nil, err
+		}
+	}
+
+	err = c.repoStore.SetUpdateTimeByPath(ctx, req.RepoType, req.Namespace, req.Name, time.Now())
+	if err != nil {
+		slog.Error("failed to set repo update time", slog.Any("error", err), slog.String("repo_type", string(req.RepoType)), slog.String("namespace", req.Namespace), slog.String("name", req.Name))
+	}
+	if supportedRepositoryPackageType(req.RepoType) && c.repositoryPackageSyncer != nil {
+		c.asyncSyncRepositoryPackage(ctx, repo, req.Namespace, req.Name, req.Branch)
+	}
+
+	resp := new(types.DeleteFileResp)
+	return resp, nil
+}
+
+func (c *repoComponentImpl) updateLibraryFile(ctx context.Context, req *types.UpdateFileReq) error {
+	err := c.changeLibraryFile(ctx, req.FilePath, req.OriginPath, req.Namespace, req.Name, req.RepoType)
+	return err
+}
+
+func (c *repoComponentImpl) deleteLibraryFile(ctx context.Context, req *types.DeleteFileReq) error {
+	err := c.changeLibraryFile(ctx, req.FilePath, req.OriginPath, req.Namespace, req.Name, req.RepoType)
+	return err
+}
+
+func (c *repoComponentImpl) changeLibraryFile(ctx context.Context, filePath, originPath, namespace, name string, repoType types.RepositoryType) error {
+	var err error
+
+	isFileRenamed := filePath != originPath
+	// need to handle tag change only if file renamed
+	if isFileRenamed {
+		err = c.tagComponent.UpdateLibraryTags(ctx, getTagScopeByRepoType(repoType), namespace, name, originPath, filePath)
+		if err != nil {
+			slog.Error(fmt.Sprintf("failed to set %s's tags", repoType), slog.String("namespace", namespace),
+				slog.String("name", name), slog.Any("error", err))
+			return fmt.Errorf("failed to set %s's tags, cause: %w", repoType, err)
+		}
+	}
+
+	return err
+}
+
+func (c *repoComponentImpl) updateReadmeFile(ctx context.Context, req *types.UpdateFileReq) error {
+	slog.Debug("file is readme", slog.String("content", req.Content))
+	err := c.changeReadmeFile(ctx, req.Content, req.Namespace, req.Name, req.RepoType)
+	if err != nil {
+		return fmt.Errorf("failed to update meta tags for update readme, cause: %w", err)
+	}
+	return err
+}
+
+func (c *repoComponentImpl) deleteReadmeFile(ctx context.Context, req *types.DeleteFileReq) error {
+	if c.industryTagComponent != nil {
+		err := c.industryTagComponent.ClearRepoAutoIndustryTags(ctx, types.ClearRepoIndustryTagsReq{
+			Namespace: req.Namespace,
+			Name:      req.Name,
+			RepoType:  req.RepoType,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to clear repo industry tags, cause: %w", err)
+		}
+	}
+	err := c.changeReadmeFile(ctx, req.Content, req.Namespace, req.Name, req.RepoType)
+	if err != nil {
+		return fmt.Errorf("failed to update meta tags for delete readme, cause: %w", err)
+	}
+	return err
+}
+
+func (c *repoComponentImpl) changeReadmeFile(ctx context.Context, content, namespace, name string, repoType types.RepositoryType) error {
+	contentDecoded, _ := base64.RawStdEncoding.DecodeString(content)
+	_, err := c.tagComponent.UpdateMetaTags(ctx, getTagScopeByRepoType(repoType), namespace, name, string(contentDecoded))
+	if err != nil {
+		return fmt.Errorf("failed to update meta tags, cause: %w", err)
+	}
+	return err
+}
+
+func (c *repoComponentImpl) markRepositoryLicenseForReview(ctx context.Context, repoID int64) error {
+	if err := c.repoStore.UpdateLicenseCompliance(
+		ctx,
+		repoID,
+		nil,
+		types.ComplianceStatusPendingReview,
+		types.CommercialPermissionCustomTerms,
+	); err != nil {
+		return fmt.Errorf("failed to mark repository license for review: %w", err)
+	}
+	return nil
+}
+
+func (c *repoComponentImpl) Commits(ctx context.Context, req *types.GetCommitsReq) ([]types.Commit, *types.RepoPageOpts, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, nil, errorx.ErrUnauthorized
+	}
+
+	if req.Ref == "" {
+		req.Ref = repo.DefaultBranch
+	}
+	getCommitsReq := gitserver.GetRepoCommitsReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Ref,
+		Per:       req.Per,
+		Page:      req.Page,
+		RepoType:  req.RepoType,
+	}
+	commits, pageOpt, err := c.git.GetRepoCommits(ctx, getCommitsReq)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get git %s repository commits, error: %w", req.RepoType, err)
+	}
+	return commits, pageOpt, nil
+}
+
+func (c *repoComponentImpl) LastCommit(ctx context.Context, req *types.GetCommitsReq) (*types.Commit, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to get last commit in this repo")
+	}
+
+	if req.Ref == "" {
+		req.Ref = repo.DefaultBranch
+	}
+	getLastCommitReq := gitserver.GetRepoLastCommitReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Ref,
+		RepoType:  req.RepoType,
+	}
+	commit, err := c.git.GetRepoLastCommit(ctx, getLastCommitReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get git %s repository last commit, error: %w", req.RepoType, err)
+	}
+	return commit, nil
+}
+
+func (c *repoComponentImpl) FileRaw(ctx context.Context, req *types.GetFileReq) (string, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil || repo == nil {
+		return "", fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return "", fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return "", errorx.ErrForbiddenMsg("users do not have permission to get file raw in this repo")
+	}
+
+	if repo.Source != types.LocalSource && strings.ToLower(req.Path) == "readme.md" {
+		_, err := c.mirrorStore.FindByRepoID(ctx, repo.ID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return repo.Readme, nil
+			}
+		}
+	}
+	if req.Ref == "" {
+		req.Ref = repo.DefaultBranch
+	}
+	getFileRawReq := gitserver.GetRepoInfoByPathReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Ref,
+		Path:      req.Path,
+		RepoType:  req.RepoType,
+	}
+	raw, err := c.git.GetRepoFileRaw(ctx, getFileRawReq)
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return "", errorx.ErrNotFound
+		}
+		return "", fmt.Errorf("failed to get git %s repository file raw, error: %w", req.RepoType, err)
+	}
+	return raw, nil
+}
+
+func (c *repoComponentImpl) DownloadFile(ctx context.Context, req *types.GetFileReq, _ string) (io.ReadCloser, int64, string, error) {
+	var (
+		reader      io.ReadCloser
+		downloadUrl string
+		size        int64
+	)
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("failed to find repo, error: %w", err)
+	}
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, 0, "", errorx.ErrForbiddenMsg("users do not have permission to download file in this repo")
+	}
+
+	err = c.repoStore.UpdateRepoFileDownloads(ctx, repo, time.Now(), 1)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("failed to update %s file download count, error: %w", fmt.Sprintf("%s/%s/%s", req.RepoType, req.Namespace, req.Name), err)
+	}
+	if req.Ref == "" {
+		req.Ref = repo.DefaultBranch
+	}
+	if req.Lfs {
+		objectKey := common.BuildLfsPath(repo.ID, strings.ReplaceAll(req.Path, "/", ""), repo.Migrated)
+		reqParams := make(url.Values)
+		if req.SaveAs != "" {
+			// allow rename when download through content-disposition header
+			reqParams.Set("response-content-disposition", fmt.Sprintf("attachment;filename=%s", req.SaveAs))
+		}
+		if repo.XnetEnabled {
+			signedUrl, err := c.xnetClient.PresignedGetObject(ctx, objectKey, types.OssFileExpire, reqParams)
+			if err != nil {
+				return nil, 0, downloadUrl, err
+			}
+			downloadUrl = signedUrl.String()
+		} else {
+			signedUrl, err := c.s3Client.PresignedGetObject(ctx, c.lfsBucket, objectKey, types.OssFileExpire, reqParams)
+			if err != nil {
+				return nil, 0, downloadUrl, err
+			}
+			downloadUrl = signedUrl.String()
+		}
+		return nil, 0, downloadUrl, nil
+	}
+
+	getFileReaderReq := gitserver.GetRepoInfoByPathReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Ref,
+		Path:      req.Path,
+		RepoType:  req.RepoType,
+	}
+	reader, size, err = c.git.GetRepoFileReader(ctx, getFileReaderReq)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("failed to download git %s repository file, error: %w", req.RepoType, err)
+	}
+	return reader, size, downloadUrl, nil
+}
+
+func (c *repoComponentImpl) Branches(ctx context.Context, req *types.GetBranchesReq) ([]types.Branch, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to get branches in this repo")
+	}
+
+	getBranchesReq := gitserver.GetBranchesReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Per:       req.Per,
+		Page:      req.Page,
+		RepoType:  req.RepoType,
+	}
+	bs, err := c.git.GetRepoBranches(ctx, getBranchesReq)
+	if err != nil {
+		if repo.Source != types.LocalSource {
+			return []types.Branch{}, nil
+		}
+		return nil, fmt.Errorf("failed to get git %s repository branches, error: %w", req.RepoType, err)
+	}
+	for i := range bs {
+		bs[i].IsDefault = bs[i].Name == repo.DefaultBranch
+	}
+	return bs, nil
+}
+
+func (c *repoComponentImpl) Tags(ctx context.Context, req *types.GetTagsReq) ([]database.Tag, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find %s, error: %w", req.RepoType, err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to get tags in this repo")
+	}
+
+	tags, err := c.repoStore.Tags(ctx, repo.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get %s tags, error: %w", req.RepoType, err)
+	}
+	return tags, nil
+}
+
+func (c *repoComponentImpl) UpdateTags(ctx context.Context, namespace, name string, repoType types.RepositoryType, category, currentUser string, tags []string) error {
+	repo, err := c.repoStore.FindByPath(ctx, repoType, namespace, name)
+	if err != nil {
+		return fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, currentUser, repo, rebac.RepositoryCanWrite)
+	if err != nil {
+		return fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return errorx.ErrForbiddenMsg("users do not have permission to update tags in this repo")
+	}
+
+	tagScope := getTagScopeByRepoType(repoType)
+	err = c.tagComponent.UpdateRepoTagsByCategory(ctx, tagScope, repo.ID, category, tags)
+
+	return err
+}
+
+func (c *repoComponentImpl) Tree(ctx context.Context, req *types.GetFileReq) ([]*types.File, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+	if repo == nil {
+		return nil, fmt.Errorf("repo does not exist, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to get tree in this repo")
+	}
+
+	if repo.Source != types.LocalSource {
+		_, err := c.mirrorStore.FindByRepoID(ctx, repo.ID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				if req.Path == "" {
+					req.Path = "/"
+				}
+				files, err := c.fileStore.FindByParentPath(ctx, repo.ID, req.Path, nil)
+				if err != nil {
+					if errors.Is(err, sql.ErrNoRows) {
+						return []*types.File{}, nil
+					}
+					return nil, err
+				}
+				var resFiles []*types.File
+				for _, f := range files {
+					resFiles = append(resFiles, &types.File{
+						Name: f.Name,
+						Path: f.Path,
+						Size: f.Size,
+						Commit: types.Commit{
+							Message:       f.LastCommitMessage,
+							CommitterDate: f.LastCommitDate,
+						},
+					})
+				}
+				return resFiles, nil
+			}
+		}
+	}
+	if req.Ref == "" {
+		req.Ref = repo.DefaultBranch
+	}
+	getRepoFileTree := gitserver.GetRepoInfoByPathReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Ref,
+		Path:      req.Path,
+		RepoType:  req.RepoType,
+	}
+	tree, err := c.git.GetRepoFileTree(ctx, getRepoFileTree)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get git %s repository file tree, error: %w", req.RepoType, err)
+	}
+	return tree, nil
+}
+
+func (c *repoComponentImpl) TreeV2(ctx context.Context, req *types.GetTreeRequest) (*types.GetRepoFileTreeResp, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+	if repo == nil {
+		return nil, fmt.Errorf("repo does not exist, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to get tree in this repo")
+	}
+
+	if req.Limit == 0 {
+		req.Limit = DefaultTreeLimit
+	} else if req.Limit > MaxTreeLimit {
+		req.Limit = MaxTreeLimit
+	}
+
+	if repo.Source != types.LocalSource {
+		_, err := c.mirrorStore.FindByRepoID(ctx, repo.ID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				if req.Path == "" {
+					req.Path = "/"
+				}
+
+				offset := 0
+				if req.Cursor != "" {
+					r, err := base64.StdEncoding.DecodeString(req.Cursor)
+					if err == nil {
+						offset = cast.ToInt(string(r))
+					}
+				}
+				files, err := c.fileStore.FindByParentPath(
+					ctx, repo.ID, req.Path, &types.OffsetPagination{
+						Limit:  req.Limit,
+						Offset: offset,
+					},
+				)
+				if err != nil {
+					if errors.Is(err, sql.ErrNoRows) {
+						return nil, nil
+					}
+					return nil, err
+				}
+				var resFiles []*types.File
+				for _, f := range files {
+					resFiles = append(resFiles, &types.File{
+						Name: f.Name,
+						Path: f.Path,
+						Size: f.Size,
+						Commit: types.Commit{
+							Message:       f.LastCommitMessage,
+							CommitterDate: f.LastCommitDate,
+						},
+					})
+				}
+
+				cursor := ""
+				if len(files) == req.Limit {
+					cursor = base64.StdEncoding.EncodeToString(
+						[]byte(cast.ToString(offset + req.Limit)),
+					)
+				}
+				return &types.GetRepoFileTreeResp{
+					Files:  resFiles,
+					Cursor: cursor,
+				}, nil
+			}
+		}
+	}
+	if req.Ref == "" {
+		req.Ref = repo.DefaultBranch
+	}
+	tree, err := c.git.GetTree(ctx, *req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get git %s repository file tree, error: %w", req.RepoType, err)
+	}
+	return tree, nil
+}
+
+func (c *repoComponentImpl) LogsTree(ctx context.Context, req *types.GetLogsTreeRequest) (*types.LogsTreeResp, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+	if repo == nil {
+		return nil, fmt.Errorf("repo does not exist, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to get logs tree in this repo")
+	}
+
+	if req.Limit == 0 {
+		req.Limit = DefaultLogTreeLimit
+	} else if req.Limit > MaxLogTreeLimit {
+		req.Limit = MaxLogTreeLimit
+	}
+
+	if repo.Source != types.LocalSource {
+		_, err := c.mirrorStore.FindByRepoID(ctx, repo.ID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				if req.Path == "" {
+					req.Path = "/"
+				}
+				files, err := c.fileStore.FindByParentPath(
+					ctx, repo.ID, req.Path, &types.OffsetPagination{
+						Offset: req.Offset,
+						Limit:  req.Limit,
+					},
+				)
+				if err != nil {
+					if errors.Is(err, sql.ErrNoRows) {
+						return nil, nil
+					}
+					return nil, err
+				}
+				var commits []*types.CommitForTree
+				for _, f := range files {
+					commits = append(commits, &types.CommitForTree{
+						Message:       f.LastCommitMessage,
+						CommitterDate: f.LastCommitDate,
+					})
+				}
+				return &types.LogsTreeResp{
+					Commits: commits,
+				}, nil
+			}
+		}
+	}
+	if req.Ref == "" {
+		req.Ref = repo.DefaultBranch
+	}
+
+	tree, err := c.git.GetLogsTree(ctx, *req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get git %s repository file tree, error: %w", req.RepoType, err)
+	}
+	return tree, nil
+}
+
+func (c *repoComponentImpl) UploadFile(ctx context.Context, req *types.CreateFileReq) error {
+	f, err := c.git.GetRepoFileContents(ctx, gitserver.GetRepoInfoByPathReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Branch,
+		Path:      req.FilePath,
+		RepoType:  req.RepoType,
+	})
+	if err != nil {
+		_, err = c.CreateFile(ctx, req)
+		if err != nil {
+			return fmt.Errorf("fail to create file for file uploading, %w", err)
+		}
+		return nil
+	}
+	var updateFileReq types.UpdateFileReq
+
+	updateFileReq.Username = req.Username
+	updateFileReq.Message = req.Message
+	updateFileReq.Branch = req.Branch
+	updateFileReq.Content = req.Content
+	updateFileReq.Namespace = req.Namespace
+	updateFileReq.Name = req.Name
+	updateFileReq.FilePath = req.FilePath
+	// we need file sha, not commit SHA
+	updateFileReq.SHA = f.SHA
+	updateFileReq.RepoType = req.RepoType
+	updateFileReq.OriginalContent = req.OriginalContent
+	updateFileReq.CurrentUser = req.CurrentUser
+
+	_, err = c.UpdateFile(ctx, &updateFileReq)
+
+	return err
+}
+
+func (c *repoComponentImpl) SDKListFiles(ctx context.Context, repoType types.RepositoryType, namespace, name, ref, userName string) (*types.SDKFiles, error) {
+	var sdkFiles []types.SDKFile
+	repo, err := c.repoStore.FindByPath(ctx, repoType, namespace, name)
+	if err != nil || repo == nil {
+		return nil, errorx.ErrNotFound
+	}
+
+	canRead, err := c.AllowReadAccessRepo(ctx, repo, userName)
+	if err != nil {
+		return nil, err
+	}
+	if !canRead {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to access this repo")
+	}
+
+	if ref == "" {
+		ref = repo.DefaultBranch
+	}
+
+	filePaths, err := GetFilePaths(ctx, namespace, name, "", repoType, ref, c.git.GetTree)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get all %s files, error: %w", repoType, err)
+	}
+
+	for _, filePath := range filePaths {
+		sdkFiles = append(sdkFiles, types.SDKFile{Filename: filePath})
+	}
+	return &types.SDKFiles{
+		ID:        fmt.Sprintf("%s/%s", namespace, name),
+		Siblings:  sdkFiles,
+		Private:   repo.Private,
+		Downloads: repo.DownloadCount,
+		Likes:     repo.Likes,
+		Tags:      []string{},
+		SHA:       repo.DefaultBranch,
+	}, nil
+}
+
+// IsLfs reports whether a repository file is an LFS pointer and returns its downloadable content size.
+func (c *repoComponentImpl) IsLfs(ctx context.Context, req *types.GetFileReq) (bool, int64, error) {
+	getFileRawReq := gitserver.GetRepoInfoByPathReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Ref,
+		Path:      req.Path,
+		RepoType:  req.RepoType,
+	}
+	content, err := c.git.GetRepoFileRaw(ctx, getFileRawReq)
+	if err != nil {
+		if isRepositoryContentNotFound(err) {
+			return false, -1, errorx.ErrNotFound
+		}
+		slog.Error("failed to get %s file raw", string(req.RepoType), slog.String("namespace", req.Namespace), slog.String("name", req.Name), slog.String("path", req.Path))
+		return false, -1, err
+	}
+
+	if !strings.HasPrefix(content, types.LFSPrefix) {
+		return false, int64(len(content)), nil
+	}
+	pointer, err := gitaly.ReadPointerFromBuffer([]byte(content))
+	if err != nil {
+		return false, -1, fmt.Errorf("failed to parse LFS pointer: %w", err)
+	}
+	return true, pointer.Size, nil
+}
+
+// HeadDownloadFile returns repository file metadata and its latest commit.
+func (c *repoComponentImpl) HeadDownloadFile(ctx context.Context, req *types.GetFileReq, userName string) (*types.File, *types.Commit, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		if isRepositoryContentNotFound(err) {
+			return nil, nil, errorx.ErrNotFound
+		}
+		return nil, nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+	canRead, err := c.AllowReadAccessRepo(ctx, repo, userName)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !canRead {
+		return nil, nil, errorx.ErrForbiddenMsg("users do not have permission to download file in this repo")
+	}
+	if req.Ref == "" {
+		req.Ref = repo.DefaultBranch
+	}
+	getFileContentReq := gitserver.GetRepoInfoByPathReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Ref,
+		Path:      req.Path,
+		RepoType:  req.RepoType,
+	}
+	file, err := c.git.GetRepoFileContents(ctx, getFileContentReq)
+	if err != nil {
+		slog.Error("err.Error()", slog.Any("err.Error()", err.Error()))
+		if isRepositoryContentNotFound(err) || err.Error() == ErrNotFoundMessage || err.Error() == ErrGetContentsOrList {
+			return nil, nil, errorx.ErrNotFound
+		}
+		return nil, nil, fmt.Errorf("failed to download git %s repository file, error: %w", req.RepoType, err)
+	}
+
+	lastCommitReq := gitserver.GetRepoLastCommitReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Ref,
+		RepoType:  req.RepoType,
+	}
+
+	lastCommit, err := c.git.GetRepoLastCommit(ctx, lastCommitReq)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get last commit, error: %w", err)
+	}
+
+	if file != nil && repo.XnetEnabled && file.Lfs {
+		file.XnetEnabled = true
+	}
+	return file, lastCommit, nil
+}
+
+// isRepositoryContentNotFound identifies lower-layer errors that mean a repository or file does not exist.
+func isRepositoryContentNotFound(err error) bool {
+	return errors.Is(err, errorx.ErrNotFound) ||
+		errors.Is(err, errorx.ErrDatabaseNoRows) ||
+		errors.Is(err, errorx.ErrGitRepoNotFound) ||
+		errors.Is(err, errorx.ErrGitFileNotFound)
+}
+
+// SDKDownloadFile authorizes and prepares a download, recording it when req.CountDownload is true.
+func (c *repoComponentImpl) SDKDownloadFile(ctx context.Context, req *types.GetFileReq, userName string) (io.ReadCloser, int64, string, error) {
+	var downloadUrl string
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	canRead, err := c.AllowReadAccessRepo(ctx, repo, userName)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	if !canRead {
+		return nil, 0, "", errorx.ErrForbiddenMsg("users do not have permission to download file in this repo")
+	}
+
+	if req.CountDownload {
+		err = c.repoStore.UpdateRepoFileDownloads(ctx, repo, time.Now(), 1)
+		if err != nil {
+			return nil, 0, "", fmt.Errorf("failed to update %s file download count, error: %w", fmt.Sprintf("%s/%s/%s", req.RepoType, req.Namespace, req.Name), err)
+		}
+	}
+
+	if req.Ref == "" {
+		req.Ref = repo.DefaultBranch
+	}
+	if req.Lfs {
+		getFileContentReq := gitserver.GetRepoInfoByPathReq{
+			Namespace: req.Namespace,
+			Name:      req.Name,
+			Ref:       req.Ref,
+			Path:      req.Path,
+			RepoType:  req.RepoType,
+		}
+		file, err := c.git.GetRepoFileContents(ctx, getFileContentReq)
+		if err != nil {
+			return nil, 0, "", err
+		}
+		objectKey := common.BuildLfsPath(repo.ID, file.LfsSHA256, repo.Migrated)
+		reqParams := make(url.Values)
+		if req.SaveAs != "" {
+			// allow rename when download through content-disposition header
+			reqParams.Set("response-content-disposition", fmt.Sprintf("attachment;filename=%s", req.SaveAs))
+		}
+		if repo.XnetEnabled {
+			signedUrl, err := c.xnetClient.PresignedGetObject(ctx, objectKey, types.OssFileExpire, reqParams)
+			if err != nil {
+				return nil, 0, downloadUrl, err
+			}
+			downloadUrl = signedUrl.String()
+		} else {
+			signedUrl, err := c.s3Client.PresignedGetObject(ctx, c.lfsBucket, objectKey, types.OssFileExpire, reqParams)
+			if err != nil {
+				return nil, 0, downloadUrl, err
+			}
+			downloadUrl = signedUrl.String()
+		}
+		return nil, 0, downloadUrl, nil
+	}
+	getFileReaderReq := gitserver.GetRepoInfoByPathReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Ref,
+		Path:      req.Path,
+		RepoType:  req.RepoType,
+		Limit:     req.Limit,
+	}
+	reader, size, err := c.git.GetRepoFileReader(ctx, getFileReaderReq)
+	if err != nil {
+		if err.Error() == ErrNotFoundMessage {
+			return nil, 0, downloadUrl, errorx.ErrNotFound
+		}
+		return nil, 0, "", fmt.Errorf("failed to download git %s repository file, error: %w", req.RepoType, err)
+	}
+	return reader, size, downloadUrl, nil
+}
+
+func (c *repoComponentImpl) InternalDownloadFile(ctx context.Context, req *types.GetFileReq) (io.ReadCloser, int64, string, error) {
+	var downloadUrl string
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("failed to find repo, error: %w", err)
+	}
+	if req.Ref == "" {
+		req.Ref = repo.DefaultBranch
+	}
+	if req.Lfs {
+		getFileContentReq := gitserver.GetRepoInfoByPathReq{
+			Namespace: req.Namespace,
+			Name:      req.Name,
+			Ref:       req.Ref,
+			Path:      req.Path,
+			RepoType:  req.RepoType,
+		}
+		file, err := c.git.GetRepoFileContents(ctx, getFileContentReq)
+		if err != nil {
+			return nil, 0, "", err
+		}
+		objectKey := common.BuildLfsPath(repo.ID, file.LfsSHA256, repo.Migrated)
+		reqParams := make(url.Values)
+		if req.SaveAs != "" {
+			// allow rename when download through content-disposition header
+			reqParams.Set("response-content-disposition", fmt.Sprintf("attachment;filename=%s", req.SaveAs))
+		}
+		signedUrl, err := c.s3Client.PresignedGetObject(ctx, c.lfsBucket, objectKey, types.OssFileExpire, reqParams)
+		if err != nil {
+			if err.Error() == ErrNotFoundMessage || err.Error() == ErrGetContentsOrList {
+				return nil, 0, downloadUrl, errorx.ErrNotFound
+			}
+			return nil, 0, downloadUrl, err
+		}
+		return nil, 0, signedUrl.String(), nil
+	}
+	getFileReaderReq := gitserver.GetRepoInfoByPathReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Ref,
+		Path:      req.Path,
+		RepoType:  req.RepoType,
+	}
+	reader, size, err := c.git.GetRepoFileReader(ctx, getFileReaderReq)
+	if err != nil {
+		if err.Error() == ErrNotFoundMessage {
+			return nil, 0, downloadUrl, errorx.ErrNotFound
+		}
+		return nil, 0, "", fmt.Errorf("failed to download git %s repository file, error: %w", req.RepoType, err)
+	}
+	return reader, size, downloadUrl, nil
+}
+
+// UpdateDownloads increase clone download count for repo by given count
+func (c *repoComponentImpl) UpdateDownloads(ctx context.Context, req *types.UpdateDownloadsReq) error {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return fmt.Errorf("failed to find %s, error: %w", req.RepoType, err)
+	}
+
+	err = c.repoStore.UpdateRepoCloneDownloads(ctx, repo, req.Date, req.CloneCount)
+	if err != nil {
+		return fmt.Errorf("failed to update %s download count, error: %w", req.RepoType, err)
+	}
+	return err
+}
+
+// IncrDownloads increase the click download count for repo by 1
+func (c *repoComponentImpl) IncrDownloads(ctx context.Context, repoType types.RepositoryType, namespace, name string) error {
+	repo, err := c.repoStore.FindByPath(ctx, repoType, namespace, name)
+	if err != nil {
+		return fmt.Errorf("failed to find %s, error: %w", repoType, err)
+	}
+
+	err = c.repoStore.UpdateRepoFileDownloads(ctx, repo, time.Now(), 1)
+	if err != nil {
+		return fmt.Errorf("failed to incr download count, error: %w", err)
+	}
+	return err
+}
+
+func (c *repoComponentImpl) FileInfo(ctx context.Context, req *types.GetFileReq) (*types.File, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to get file info in this repo")
+	}
+
+	if req.Ref == "" {
+		req.Ref = repo.DefaultBranch
+	}
+
+	if repo.Source != types.LocalSource && strings.ToLower(req.Path) == "readme.md" {
+		_, err := c.mirrorStore.FindByRepoID(ctx, repo.ID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				content := base64.StdEncoding.EncodeToString([]byte(repo.Readme))
+				return &types.File{
+					Name:    "readme.md",
+					Path:    "readme.md",
+					Content: content,
+				}, nil
+			}
+		}
+	}
+
+	getFileContentReq := gitserver.GetRepoInfoByPathReq{
+		Namespace:   req.Namespace,
+		Name:        req.Name,
+		Ref:         req.Ref,
+		Path:        req.Path,
+		RepoType:    req.RepoType,
+		MaxFileSize: c.adjustMaxFileSize(req.MaxFileSize),
+	}
+	file, err := c.git.GetRepoFileContents(ctx, getFileContentReq)
+	if err != nil {
+		if errors.Is(err, errorx.ErrFileTooLarge) {
+			// return basic file info, but tell client not to show the file content
+			file.PreviewCode = types.FilePreviewCodeTooLarge
+			return file, nil
+		}
+		return nil, fmt.Errorf("failed to get git model repository file info, error: %w", err)
+	}
+	decodedFileContent, _ := base64.StdEncoding.DecodeString(file.Content)
+	file.PreviewCode = c.getFilePreviewCode(decodedFileContent)
+	return file, nil
+}
+
+func (c *repoComponentImpl) getFilePreviewCode(fileContent []byte) types.FilePreviewCode {
+	// detect the file content type like text/plain, image/jpeg, etc
+	detectedType := http.DetectContentType(fileContent)
+	switch {
+	case strings.HasPrefix(detectedType, "text"):
+		return types.FilePreviewCodeNormal
+	default:
+		return types.FilePreviewCodeNotText
+	}
+}
+
+func (c *repoComponentImpl) adjustMaxFileSize(maxFileSize int64) int64 {
+	// same with aliyun green check large content size
+	const maxModerationContentSize = 100 * 9000
+	if maxFileSize == 0 || maxFileSize > maxModerationContentSize {
+		maxFileSize = maxModerationContentSize
+	}
+	return maxFileSize
+}
+
+func getTagScopeByRepoType(repoType types.RepositoryType) types.TagScope {
+	switch repoType {
+	case types.ModelRepo:
+		return types.ModelTagScope
+	case types.DatasetRepo:
+		return types.DatasetTagScope
+	case types.CodeRepo:
+		return types.CodeTagScope
+	case types.SpaceRepo:
+		return types.SpaceTagScope
+	case types.PromptRepo:
+		return types.PromptTagScope
+	case types.MCPServerRepo:
+		return types.MCPTagScope
+	case types.SkillRepo:
+		return types.SkillTagScope
+	default:
+		panic("convert repo type to tag scope failed, unknown repo type:" + repoType)
+	}
+}
+
+func (c *repoComponentImpl) AllowReadAccessRepo(ctx context.Context, repo *database.Repository, username string) (bool, error) {
+	if !repo.Private {
+		return true, nil
+	}
+
+	if username == "" {
+		return false, errorx.ErrUserNotFound
+	}
+
+	return c.CheckUserRepoPermission(ctx, username, repo, rebac.RepositoryCanRead)
+}
+
+func (c *repoComponentImpl) AllowReadAccess(ctx context.Context, repoType types.RepositoryType, namespace, name, username string) (bool, error) {
+	repo, err := c.repoStore.FindByPath(ctx, repoType, namespace, name)
+	if err != nil {
+		return false, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+	return c.AllowReadAccessRepo(ctx, repo, username)
+}
+
+func (c *repoComponentImpl) AllowWriteAccess(ctx context.Context, repoType types.RepositoryType, namespace, name, username string) (bool, error) {
+	repo, err := c.repoStore.FindByPath(ctx, repoType, namespace, name)
+	if err != nil {
+		return false, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	if username == "" {
+		return false, errorx.ErrUserNotFound
+	}
+
+	return c.CheckUserRepoPermission(ctx, username, repo, rebac.RepositoryCanWrite)
+}
+
+func (c *repoComponentImpl) AllowAdminAccess(ctx context.Context, repoType types.RepositoryType, namespace, name, username string) (bool, error) {
+	repo, err := c.repoStore.FindByPath(ctx, repoType, namespace, name)
+	if err != nil {
+		return false, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	if username == "" {
+		return false, errorx.ErrUserNotFound
+	}
+
+	return c.CheckUserRepoPermission(ctx, username, repo, rebac.RepositoryCanAdmin)
+}
+
+func (c *repoComponentImpl) GetUserRepoPermission(ctx context.Context, userName string, repo *database.Repository) (*types.UserRepoPermission, error) {
+	if userName == "" {
+		// Anonymous users can only read public repositories.
+		return &types.UserRepoPermission{CanRead: !repo.Private}, nil
+	}
+
+	user, err := c.userStore.FindByUsername(ctx, userName)
+	if err != nil {
+		return nil, fmt.Errorf("find user %q for repository permission: %w", userName, err)
+	}
+	// Platform administrators retain their global bypass until platform roles are migrated to ReBAC.
+	if user.CanAdmin() {
+		return &types.UserRepoPermission{CanRead: true, CanWrite: true, CanAdmin: true}, nil
+	}
+	readCorrelationID := rebac.BatchCheckCorrelationID(0)
+	writeCorrelationID := rebac.BatchCheckCorrelationID(1)
+	adminCorrelationID := rebac.BatchCheckCorrelationID(2)
+	request := rebac.BatchCheckRequest{Checks: []rebac.BatchCheckItem{
+		{
+			CorrelationID: readCorrelationID,
+			Check: rebac.CheckRequest{
+				Subject:     rebac.UserSubject(user.UUID),
+				Relation:    rebac.RepositoryCanRead,
+				Object:      rebac.RepositoryObject(repo.ID),
+				Consistency: rebac.ConsistencyHigher,
+			},
+		},
+		{
+			CorrelationID: writeCorrelationID,
+			Check: rebac.CheckRequest{
+				Subject:     rebac.UserSubject(user.UUID),
+				Relation:    rebac.RepositoryCanWrite,
+				Object:      rebac.RepositoryObject(repo.ID),
+				Consistency: rebac.ConsistencyHigher,
+			},
+		},
+		{
+			CorrelationID: adminCorrelationID,
+			Check: rebac.CheckRequest{
+				Subject:     rebac.UserSubject(user.UUID),
+				Relation:    rebac.RepositoryCanAdmin,
+				Object:      rebac.RepositoryObject(repo.ID),
+				Consistency: rebac.ConsistencyHigher,
+			},
+		},
+	}}
+	result, err := c.rebac.BatchCheck(ctx, request)
+	if err != nil {
+		return nil, fmt.Errorf("check repository permissions: %w", err)
+	}
+	decision := func(correlationID string, permission rebac.Permission) (bool, error) {
+		outcome, exists := result.Results[correlationID]
+		if !exists {
+			return false, fmt.Errorf("missing ReBAC batch result %q for repository permission %q", correlationID, permission)
+		}
+		if outcome.Err != nil {
+			return false, fmt.Errorf("check repository ReBAC permission %q with correlation ID %q: %w", permission, correlationID, outcome.Err)
+		}
+		return outcome.Decision.Allowed, nil
+	}
+	canRead, err := decision(readCorrelationID, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, err
+	}
+	canWrite, err := decision(writeCorrelationID, rebac.RepositoryCanWrite)
+	if err != nil {
+		return nil, err
+	}
+	canAdmin, err := decision(adminCorrelationID, rebac.RepositoryCanAdmin)
+	if err != nil {
+		return nil, err
+	}
+	return &types.UserRepoPermission{
+		CanRead:  canRead || !repo.Private,
+		CanWrite: canWrite,
+		CanAdmin: canAdmin,
+	}, nil
+}
+
+// CheckUserRepoPermission checks one effective repository permission.
+func (c *repoComponentImpl) CheckUserRepoPermission(ctx context.Context, userName string, repo *database.Repository, permission rebac.Permission) (bool, error) {
+	switch permission {
+	case rebac.RepositoryCanRead, rebac.RepositoryCanWrite, rebac.RepositoryCanAdmin:
+	default:
+		return false, fmt.Errorf("unsupported repository permission %q", permission)
+	}
+
+	if userName == "" {
+		return permission == rebac.RepositoryCanRead && !repo.Private, nil
+	}
+
+	user, err := c.userStore.FindByUsername(ctx, userName)
+	if err != nil {
+		return false, fmt.Errorf("find user %q for repository permission: %w", userName, err)
+	}
+	// Platform administrators retain their global bypass until platform roles are migrated to ReBAC.
+	if user.CanAdmin() {
+		return true, nil
+	}
+
+	decision, err := c.rebac.Check(ctx, rebac.CheckRequest{
+		Subject:     rebac.UserSubject(user.UUID),
+		Relation:    permission,
+		Object:      rebac.RepositoryObject(repo.ID),
+		Consistency: rebac.ConsistencyHigher,
+	})
+	if err != nil {
+		return false, fmt.Errorf("check repository permission: %w", err)
+	}
+	if permission == rebac.RepositoryCanRead && !repo.Private {
+		return true, nil
+	}
+	if permission == rebac.RepositoryCanRead && repo.Private && !decision.Allowed {
+		c.clearRepositoryAccessCache(ctx, user.UUID)
+	}
+	return decision.Allowed, nil
+}
+
+// CheckCurrentUserPermission resolves a namespace path and checks its effective ReBAC permission.
+func (c *repoComponentImpl) CheckCurrentUserPermission(ctx context.Context, userName string, namespace string, permission rebac.Permission) (bool, error) {
+	switch permission {
+	case rebac.NamespaceCanRead, rebac.NamespaceCanWrite, rebac.NamespaceCanAdmin:
+	default:
+		return false, fmt.Errorf("unsupported namespace permission %q", permission)
+	}
+
+	user, err := c.userStore.FindByUsername(ctx, userName)
+	if err != nil {
+		return false, fmt.Errorf("find user %q: %w", userName, err)
+	}
+
+	if user.CanAdmin() {
+		return true, nil
+	}
+
+	ns, err := c.namespaceStore.FindByPath(ctx, namespace)
+	if err != nil {
+		return false, fmt.Errorf("find namespace %q: %w", namespace, err)
+	}
+
+	decision, err := c.rebac.Check(ctx, rebac.CheckRequest{
+		Subject:  rebac.UserSubject(user.UUID),
+		Relation: permission,
+		Object:   rebac.NamespaceObject(ns.UUID),
+	})
+	if err != nil {
+		return false, fmt.Errorf("check namespace permission: %w", err)
+	}
+
+	return decision.Allowed, nil
+}
+
+func (c *repoComponentImpl) GetNamespaceBillingUUID(ctx context.Context, namespace string) (string, error) {
+	ns, err := c.namespaceStore.FindByPath(ctx, namespace)
+	if err != nil {
+		return "", fmt.Errorf("failed to find namespace '%s', error: %w", namespace, err)
+	}
+	return ns.UUID, nil
+}
+
+func (c *repoComponentImpl) GetCommitWithDiff(ctx context.Context, req *types.GetCommitsReq) (*types.CommitResponse, error) {
+	// get commit diff by commit id
+	if req.Ref == "" {
+		return nil, fmt.Errorf("failed to find request commit id")
+	}
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to get commit in this repo")
+	}
+	getCommitReq := gitserver.GetRepoLastCommitReq{
+		Namespace: req.Namespace, // user name or org name
+		Name:      req.Name,      // repo name
+		Ref:       req.Ref,       // commit id
+		RepoType:  req.RepoType,  // repo type
+	}
+	resp, errGSC := c.git.GetSingleCommit(ctx, getCommitReq)
+	if errGSC != nil {
+		return nil, fmt.Errorf("failed to get git %s repository %s commit id '%s', error: %w", req.RepoType, req.Name, req.Ref, errGSC)
+	}
+
+	return resp, nil
+}
+
+func (c *repoComponentImpl) AllFiles(ctx context.Context, req types.GetAllFilesReq) (*types.GetRepoFileTreeResp, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+	if repo == nil {
+		return nil, fmt.Errorf("failed to find repo")
+	}
+	if repo.Private {
+		read, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check permission to get all files, error: %w", err)
+		}
+
+		if !read {
+			return nil, errorx.ErrForbiddenMsg("users do not have permission to get all files for this repo")
+		}
+	}
+	resp, err := c.git.GetTree(ctx, types.GetTreeRequest{
+		Ref:       req.Ref,
+		RepoType:  req.RepoType,
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Limit:     req.Limit,
+		Cursor:    req.Cursor,
+		Path:      req.Path,
+	})
+	if err != nil {
+		slog.Error("fail to get all files of repository", slog.Any("repoType", req.RepoType), slog.String("namespace", req.Namespace), slog.String("name", req.Name), slog.String("error", err.Error()))
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *repoComponentImpl) IsAdminRole(user database.User) bool {
+	slog.Debug("Check if user is admin", slog.Any("user", user))
+	return user.CanAdmin()
+}
+
+func (c *repoComponentImpl) IsInSameOrg(ctx context.Context, currentID int64, ownerID int64) bool {
+	orgs, _ := c.orgStore.GetSharedOrgIDs(ctx, []int64{currentID, ownerID})
+	return len(orgs) > 0
+}
+
+func (c *repoComponentImpl) GetNameSpaceInfo(ctx context.Context, path string) (*types.Namespace, error) {
+	nsResp, err := c.userSvcClient.GetNameSpaceInfo(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get namespace infor from user service, path: %s, error: %w", path, err)
+	}
+	ns := &types.Namespace{
+		Path:   nsResp.Path,
+		Avatar: nsResp.Avatar,
+		Type:   nsResp.Type,
+	}
+	return ns, nil
+}
+
+func (c *repoComponentImpl) checkIfShouldUseLfs(ctx context.Context, req *types.CreateFileReq) (bool, *types.CreateFileReq) {
+	gFile, err := c.git.GetRepoFileContents(ctx, gitserver.GetRepoInfoByPathReq{
+		RepoType:  req.RepoType,
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Branch,
+		Path:      GitAttributesFileName,
+	})
+	if err != nil {
+		return false, req
+	}
+	fileName := filepath.Base(req.FilePath)
+	decodedBytes, _ := base64.StdEncoding.DecodeString(gFile.Content)
+	attributes := parseGitattributesContent(string(decodedBytes))
+	useLfs := shouldUseLFS(fileName, attributes)
+	if !useLfs {
+		return false, req
+	}
+	pointer, pointerFile := generateLFSPointerFromContent(req.OriginalContent)
+	req.Content = pointerFile
+	req.Pointer = pointer
+	return true, req
+}
+
+func (c *repoComponentImpl) checkIfShouldUseLfsUpdate(ctx context.Context, req *types.UpdateFileReq) (bool, *types.UpdateFileReq) {
+	gFile, err := c.git.GetRepoFileContents(ctx, gitserver.GetRepoInfoByPathReq{
+		RepoType:  req.RepoType,
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Branch,
+		Path:      GitAttributesFileName,
+	})
+	if err != nil {
+		return false, req
+	}
+	fileName := filepath.Base(req.FilePath)
+	decodedBytes, _ := base64.StdEncoding.DecodeString(gFile.Content)
+	attributes := parseGitattributesContent(string(decodedBytes))
+	useLfs := shouldUseLFS(fileName, attributes)
+	if !useLfs {
+		return false, req
+	}
+	pointer, pointerFile := generateLFSPointerFromContent(req.OriginalContent)
+	req.Content = pointerFile
+	req.Pointer = pointer
+	return true, req
+}
+
+func (c *repoComponentImpl) FixRepoSource(ctx context.Context) error {
+	batch, batchSize := 1, 1000
+	for {
+		var updateRepos []*database.Repository
+		repos, err := c.repoStore.FindMirrorReposWithBatch(ctx, batchSize, batch)
+		if err != nil {
+			return err
+		}
+		if len(repos) == 0 {
+			break
+		}
+		for _, repo := range repos {
+			sourceType, sourcePath, err := common.GetSourceTypeAndPathFromURL(repo.Mirror.SourceUrl)
+			if err == nil {
+				repo.UpdateSourceBySourceTypeAndSourcePath(sourceType, sourcePath)
+				updateRepos = append(updateRepos, &repo)
+			}
+		}
+		if len(updateRepos) > 0 {
+			err = c.repoStore.BulkUpdateSourcePath(ctx, updateRepos)
+			if err != nil {
+				return err
+			}
+		}
+		batch++
+	}
+	return nil
+}
+
+func (c *repoComponentImpl) RemoteTree(ctx context.Context, req *types.GetTreeRequest) (*types.GetRepoFileTreeResp, error) {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+	if repo == nil {
+		return nil, fmt.Errorf("repo does not exist, error: %w", err)
+	}
+
+	if repo.Source == types.LocalSource {
+		return nil, fmt.Errorf("repo is not a remote repo")
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to get tree in this repo")
+	}
+
+	if req.Path == "" {
+		req.Path = "/"
+	}
+
+	offset := 0
+	if req.Cursor != "" {
+		r, err := base64.StdEncoding.DecodeString(req.Cursor)
+		if err == nil {
+			offset = cast.ToInt(string(r))
+		}
+	}
+	files, err := c.fileStore.FindByParentPath(
+		ctx, repo.ID, req.Path, &types.OffsetPagination{
+			Limit:  req.Limit,
+			Offset: offset,
+		},
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var resFiles []*types.File
+	for _, f := range files {
+		resFiles = append(resFiles, &types.File{
+			Name: f.Name,
+			Path: f.Path,
+			Size: f.Size,
+			Commit: types.Commit{
+				Message:       f.LastCommitMessage,
+				CommitterDate: f.LastCommitDate,
+			},
+		})
+	}
+
+	cursor := ""
+	if len(files) == req.Limit {
+		cursor = base64.StdEncoding.EncodeToString(
+			[]byte(cast.ToString(offset + req.Limit)),
+		)
+	}
+	return &types.GetRepoFileTreeResp{
+		Files:  resFiles,
+		Cursor: cursor,
+	}, nil
+}
+
+func (c *repoComponentImpl) DiffBetweenTwoCommits(ctx context.Context, req types.GetDiffBetweenCommitsReq) ([]types.GiteaCallbackPushReq_Commit, error) {
+	var rightCommit string
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, err: %w", err)
+	}
+	if repo == nil {
+		return nil, errors.New("repo not found")
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to get diff bewtween two commits in this repo")
+	}
+
+	rightCommit = req.RightCommitID
+	if rightCommit == "" {
+		lastCommit, err := c.git.GetRepoLastCommit(ctx, gitserver.GetRepoLastCommitReq{
+			RepoType:  req.RepoType,
+			Namespace: req.Namespace,
+			Name:      req.Name,
+			Ref:       repo.DefaultBranch,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get last commit, err: %w", err)
+		}
+		rightCommit = lastCommit.ID
+	}
+
+	diff, err := c.git.GetDiffBetweenTwoCommits(ctx, gitserver.GetDiffBetweenTwoCommitsReq{
+		Namespace:     req.Namespace,
+		Name:          req.Name,
+		RepoType:      req.RepoType,
+		LeftCommitId:  req.LeftCommitID,
+		RightCommitId: rightCommit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get diff, err: %w", err)
+	}
+
+	return diff.Commits, nil
+}
+
+func (c *repoComponentImpl) Preupload(ctx context.Context, req types.PreuploadReq) (*types.PreuploadResp, error) {
+	var (
+		resp               types.PreuploadResp
+		filePathOidMapping = make(map[string]*types.File)
+		paths              []string
+	)
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find repo, err: %w", err)
+	}
+	if repo == nil {
+		return nil, errors.New("repo not found")
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanWrite)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to get diff bewtween two commits in this repo")
+	}
+
+	for _, file := range req.Files {
+		paths = append(paths, file.Path)
+	}
+
+	existFiles, err := c.git.GetFilesByRevisionAndPaths(ctx, gitserver.GetFilesByRevisionAndPathsReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		RepoType:  req.RepoType,
+		Revision:  req.Revision,
+		Paths:     paths,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get repo files, err: %w", err)
+	}
+
+	for _, file := range existFiles {
+		filePathOidMapping[file.Path] = file
+	}
+
+	gFile, err := c.git.GetRepoFileContents(ctx, gitserver.GetRepoInfoByPathReq{
+		RepoType:  req.RepoType,
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Revision,
+		Path:      GitAttributesFileName,
+	})
+	if err != nil && status.Code(err) != codes.InvalidArgument {
+		return nil, fmt.Errorf("failed to get gitattributes file, err: %w", err)
+	}
+
+	var sourceGContent string
+	if gFile != nil {
+		sourceGContent = gFile.Content
+	}
+	gContent, _ := base64.StdEncoding.DecodeString(sourceGContent)
+	attributes := parseGitattributesContent(string(gContent))
+
+	iFile, err := c.git.GetRepoFileContents(ctx, gitserver.GetRepoInfoByPathReq{
+		RepoType:  req.RepoType,
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Ref:       req.Revision,
+		Path:      GitIgnoreFileName,
+	})
+	code := status.Code(err)
+	if err != nil && code != codes.InvalidArgument {
+		return nil, fmt.Errorf("failed to get .gitignore file, err: %w", err)
+	}
+
+	var sourceIContent string
+	if iFile != nil {
+		sourceIContent = iFile.Content
+	}
+
+	iContent, _ := base64.StdEncoding.DecodeString(sourceIContent)
+	ig := ignore.CompileIgnoreLines(string(iContent))
+
+	for _, file := range req.Files {
+		var (
+			uploadMode types.UploadMode
+			oid        string
+			isDir      bool
+		)
+		fileName := filepath.Base(file.Path)
+		if shouldUseLFS(fileName, attributes) || file.Size > c.config.Git.MaxUnLfsFileSize {
+			uploadMode = types.UploadModeLFS
+		} else {
+			uploadMode = types.UploadModeRegular
+		}
+		if file, ok := filePathOidMapping[file.Path]; ok {
+			if file.Lfs {
+				oid = file.LfsSHA256
+			} else {
+				oid = file.SHA
+			}
+		}
+		for k := range filePathOidMapping {
+			if strings.HasPrefix(k, fmt.Sprintf("%s/", file.Path)) {
+				isDir = true
+				break
+			}
+		}
+		resp.Files = append(resp.Files, types.PreuploadRespFile{
+			Path:         file.Path,
+			UploadMode:   uploadMode,
+			OID:          oid,
+			ShouldIgnore: ig.MatchesPath(file.Path),
+			IsDir:        isDir,
+		})
+	}
+
+	return &resp, nil
+}
+
+func (c *repoComponentImpl) CommitFiles(ctx context.Context, req types.CommitFilesReq) error {
+	var (
+		files    []gitserver.CommitFile
+		lfsFiles []types.Pointer
+	)
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return fmt.Errorf("failed to find repo, err: %w", err)
+	}
+	if repo == nil {
+		return errors.New("repo not found")
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, req.CurrentUser, repo, rebac.RepositoryCanWrite)
+	if err != nil {
+		return fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return errorx.ErrForbiddenMsg("users do not have permission to get diff bewtween two commits in this repo")
+	}
+
+	user, err := c.userStore.FindByUsername(ctx, req.CurrentUser)
+	if err != nil {
+		return fmt.Errorf("failed to find user, err: %w", err)
+	}
+	existFiles, err := c.git.GetRepoAllFiles(ctx, gitserver.GetRepoAllFilesReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		RepoType:  req.RepoType,
+		Ref:       req.Revision,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get repo files, err: %w", err)
+	}
+
+	for _, file := range req.Files {
+		for _, existFile := range existFiles {
+			if existFile.Path == file.Path {
+				file.Action = types.CommitActionUpdate
+			}
+		}
+		var action gitserver.CommitAction
+		switch file.Action {
+		case types.CommitActionCreate:
+			action = gitserver.CommitActionCreate
+		case types.CommitActionUpdate:
+			action = gitserver.CommitActionUpdate
+		case types.CommitActionDelete:
+			action = gitserver.CommitActionDelete
+		default:
+			return fmt.Errorf("invalid action: %s", file.Action)
+		}
+		cleanedContent := cleanBase64(file.Content)
+		content, err := base64.StdEncoding.DecodeString(cleanedContent)
+		if err != nil {
+			return fmt.Errorf("failed to decode content, err: %w", err)
+		}
+		pointer, isLFSPointer := parseCanonicalLFSPointer(content)
+		if !isLFSPointer && c.config.Git.MaxUnLfsFileSize > 0 && int64(len(content)) > c.config.Git.MaxUnLfsFileSize {
+			return fmt.Errorf(
+				"%w: file %s exceeds the maximum allowed size for non-LFS files: %d > %d",
+				errorx.ErrFileTooLarge, file.Path, len(content), c.config.Git.MaxUnLfsFileSize,
+			)
+		}
+
+		files = append(files, gitserver.CommitFile{
+			Path:    file.Path,
+			Content: cleanedContent,
+			Action:  action,
+		})
+		if isLFSPointer {
+			lfsFiles = append(lfsFiles, pointer)
+		}
+	}
+
+	for _, lfsFile := range lfsFiles {
+		if repo.XnetEnabled {
+			lfsExistReq := &types.XetFileExistsReq{
+				RepoID:    strconv.FormatInt(repo.ID, 10),
+				ObjectKey: lfsFile.Oid,
+			}
+			if lfsFileExist, err := c.xnetClient.FileExists(ctx, lfsExistReq); err != nil || !lfsFileExist {
+				return fmt.Errorf("failed to request xnet, exist:%t err: %w", lfsFileExist, err)
+			}
+		}
+		_, err := c.lfsMetaObjectStore.UpdateOrCreate(ctx, database.LfsMetaObject{
+			Oid:          lfsFile.Oid,
+			Size:         lfsFile.Size,
+			Existing:     true,
+			RepositoryID: repo.ID,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to update or create lfs meta object, err: %w", err)
+		}
+	}
+
+	err = c.git.CommitFiles(ctx, gitserver.CommitFilesReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		RepoType:  req.RepoType,
+		Revision:  req.Revision,
+		Username:  user.Username,
+		Email:     user.Email,
+		Message:   req.Message,
+		Files:     files,
+	})
+	if err != nil {
+		return err
+	}
+	if supportedRepositoryPackageType(req.RepoType) && c.repositoryPackageSyncer != nil {
+		c.asyncSyncRepositoryPackage(ctx, repo, req.Namespace, req.Name, req.Revision)
+	}
+	return nil
+}
+
+func (c *repoComponentImpl) IsExists(ctx context.Context, repoType types.RepositoryType, namespace, name string) (bool, error) {
+	_, err := c.repoStore.FindByPath(ctx, repoType, namespace, name)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func parseGitattributesContent(content string) map[string][]string {
+	attributes := make(map[string][]string)
+	scanner := bufio.NewScanner(strings.NewReader(content))
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			attributes[parts[0]] = parts[1:]
+		}
+	}
+
+	return attributes
+}
+
+func shouldUseLFS(filePath string, attributes map[string][]string) bool {
+	filePath = strings.ToLower(filePath)
+	for pattern, attrs := range attributes {
+		matched, _ := filepath.Match(pattern, filePath)
+		if matched {
+			for _, attr := range attrs {
+				if attr == "filter=lfs" || attr == "lfs" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func generateLFSPointerFromContent(content []byte) (*types.Pointer, string) {
+	hash := sha256.New()
+
+	hash.Write(content)
+	oid := fmt.Sprintf("sha256:%x", hash.Sum(nil))
+
+	fileSize := int64(len(content))
+
+	lfsPointerContent := fmt.Sprintf(`version https://git-lfs.github.com/spec/v1
+oid %s
+size %d
+`, oid, fileSize)
+	encodingContent := base64.StdEncoding.EncodeToString([]byte(lfsPointerContent))
+	pointer := types.Pointer{
+		Oid:  strings.Split(oid, ":")[1],
+		Size: fileSize,
+	}
+
+	return &pointer, encodingContent
+}
+
+func sanitizeBase64(input string) string {
+	var sb strings.Builder
+	for i := 0; i < len(input); i++ {
+		c := input[i]
+		if (c >= 'A' && c <= 'Z') ||
+			(c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') ||
+			c == '+' || c == '/' || c == '=' {
+			sb.WriteByte(c)
+		}
+	}
+	return sb.String()
+}
+
+func cleanBase64(input string) string {
+	cleaned := sanitizeBase64(input)
+
+	cleaned = strings.ReplaceAll(cleaned, "=", "")
+	if m := len(cleaned) % 4; m != 0 {
+		cleaned += strings.Repeat("=", 4-m)
+	}
+	return cleaned
+}
+
+func parseCanonicalLFSPointer(content []byte) (types.Pointer, bool) {
+	pointer, err := gitaly.ReadPointerFromBuffer(content)
+	if err != nil || !pointer.Valid() {
+		return types.Pointer{}, false
+	}
+
+	expected := fmt.Sprintf(
+		"%s\n%s%s\nsize %d",
+		gitaly.MetaFileIdentifier, gitaly.MetaFileOidPrefix, pointer.Oid, pointer.Size,
+	)
+	if !bytes.Equal(bytes.TrimSuffix(content, []byte("\n")), []byte(expected)) {
+		return types.Pointer{}, false
+	}
+
+	return pointer, true
+}
+
+func (c *repoComponentImpl) SendAssetManagementMsg(ctx context.Context, req types.RepoNotificationReq) error {
+	if req.RepoType == types.UnknownRepo {
+		return fmt.Errorf("unknown repository")
+	}
+	if req.UserUUID == "" {
+		return fmt.Errorf("no user UUID provided")
+	}
+
+	var repoUrl string
+	if req.Operation == types.OperationCreate {
+		repoUrl = GetRepoUrl(req.RepoType, req.RepoPath)
+	}
+
+	msg := types.NotificationMessage{
+		UserUUIDs:        []string{req.UserUUID},
+		NotificationType: types.NotificationAssetManagement,
+		Template:         string(types.MessageScenarioAssetManagement),
+		Payload: map[string]any{
+			"repo_type": req.RepoType,
+			"repo_path": req.RepoPath,
+			"operation": req.Operation,
+		},
+	}
+
+	if repoUrl != "" {
+		msg.ClickActionURL = repoUrl
+	}
+
+	msgBytes, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal message, err: %w", err)
+	}
+
+	notificationMsg := types.MessageRequest{
+		Scenario:   types.MessageScenarioAssetManagement,
+		Parameters: string(msgBytes),
+		Priority:   types.MessagePriorityHigh,
+	}
+
+	var sendErr error
+	retryCount := c.config.Notification.NotificationRetryCount
+	for i := range retryCount {
+		if sendErr = c.notificationSvcClient.Send(ctx, &notificationMsg); sendErr == nil {
+			break
+		}
+		if i < retryCount-1 {
+			slog.Warn("failed to send notification, retrying", "notification_msg", notificationMsg, "attempt", i+1, "error", sendErr.Error())
+		}
+	}
+
+	if sendErr != nil {
+		return fmt.Errorf("failed to send notification after %d attempts, err: %w", retryCount, sendErr)
+	}
+
+	return nil
+}
+
+func GetRepoUrl(repoType types.RepositoryType, repoPath string) string {
+	if repoType == types.UnknownRepo || repoPath == "" {
+		return ""
+	}
+
+	switch repoType {
+	case types.ModelRepo:
+		return fmt.Sprintf("/models/%s", repoPath)
+	case types.DatasetRepo:
+		return fmt.Sprintf("/datasets/%s", repoPath)
+	case types.SpaceRepo:
+		return fmt.Sprintf("/spaces/%s", repoPath)
+	case types.CodeRepo:
+		return fmt.Sprintf("/codes/%s", repoPath)
+	case types.PromptRepo:
+		return fmt.Sprintf("/prompts/library/%s", repoPath)
+	case types.MCPServerRepo:
+		return fmt.Sprintf("/mcp/servers/%s", repoPath)
+	default:
+		return ""
+	}
+}
+
+// ValidateYaml
+func (c *repoComponentImpl) ValidateYaml(ctx context.Context, req types.ValidateYamlReq) error {
+	meta := metaText(req.Content)
+	if len(meta) == 0 {
+		return nil
+	}
+
+	categoryContents := make(map[string]any)
+	// parse yaml string
+	err := yaml.Unmarshal([]byte(meta), categoryContents)
+	if err != nil {
+		slog.Error("error unmarshall meta for tags", slog.Any("error", err), slog.String("meta", meta))
+		return err
+	}
+	return nil
+}
+
+func metaText(readme string) string {
+	splits := strings.Split(readme, "---")
+	if len(splits) < 2 {
+		return ""
+	}
+
+	return splits[1]
+}
+
+func (c *repoComponentImpl) ParseNDJson(ctx *gin.Context) (*types.CommitFilesReq, error) {
+	req := &types.CommitFilesReq{}
+	maxRecordSize, err := maxNDJSONRecordSize(c.config.Git.MaxUnLfsFileSize)
+	if err != nil {
+		return nil, err
+	}
+	scanner := bufio.NewScanner(ctx.Request.Body)
+	scanner.Buffer(make([]byte, bufio.MaxScanTokenSize), maxRecordSize)
+
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+
+		var item types.FormField
+		if err := json.Unmarshal(line, &item); err != nil {
+			return nil, fmt.Errorf("invalid JSON on line %d: %v", lineNumber, err)
+		}
+
+		// Parse based on key type
+		switch item.Key {
+		case "header":
+			var header types.CommitHeader
+			if err := json.Unmarshal(item.Value, &header); err != nil {
+				return nil, fmt.Errorf("invalid header format on line %d: %v", lineNumber, err)
+			}
+			req.Message = header.Summary
+		case "file":
+			var file types.CommitFile
+			if err := json.Unmarshal(item.Value, &file); err != nil {
+				return nil, fmt.Errorf("invalid file format on line %d: %v", lineNumber, err)
+			}
+			req.Files = append(req.Files, types.CommitFileReq{
+				Path:    file.Path,
+				Content: file.Content,
+				Action:  types.CommitActionCreate,
+			})
+		case "lfsFile":
+			var file types.CommitLFSFile
+			if err := json.Unmarshal(item.Value, &file); err != nil {
+				return nil, fmt.Errorf("invalid file format on line %d: %v", lineNumber, err)
+			}
+			oid := fmt.Sprintf("%s:%s", file.Algo, file.OID)
+			formattedStr := fmt.Sprintf("version %s\noid %s\nsize %d\n", "https://git-lfs.github.com/spec/v1", oid, file.Size)
+
+			// Encode the string to Base64
+			content := base64.StdEncoding.EncodeToString([]byte(formattedStr))
+			req.Files = append(req.Files, types.CommitFileReq{
+				Path:    file.Path,
+				Content: content,
+				Action:  types.CommitActionCreate,
+			})
+
+		case "deletedFolder":
+			var file types.CommitFile
+			if err := json.Unmarshal(item.Value, &file); err != nil {
+				return nil, fmt.Errorf("invalid file format on line %d: %v", lineNumber, err)
+			}
+			req.Files = append(req.Files, types.CommitFileReq{
+				Path:   file.Path,
+				Action: types.CommitActionDelete,
+			})
+		case "deletedFile":
+			var file types.CommitFile
+			if err := json.Unmarshal(item.Value, &file); err != nil {
+				return nil, fmt.Errorf("invalid file format on line %d: %v", lineNumber, err)
+			}
+			req.Files = append(req.Files, types.CommitFileReq{
+				Path:   file.Path,
+				Action: types.CommitActionDelete,
+			})
+
+		default:
+			return nil, fmt.Errorf("unknown key type '%s' on line %d", item.Key, lineNumber)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading NDJSON: %w", err)
+	}
+	return req, nil
+}
+
+func maxNDJSONRecordSize(maxUnLfsFileSize int64) (int, error) {
+	if maxUnLfsFileSize <= 0 {
+		return 0, fmt.Errorf("max non-LFS file size must be positive")
+	}
+
+	maxInt := int64(^uint(0) >> 1)
+	maxInputSize := ((maxInt - maxNDJSONRecordOverhead) / 4 * 3) - 2
+	if maxUnLfsFileSize > maxInputSize {
+		return 0, fmt.Errorf("max non-LFS file size is too large: %d", maxUnLfsFileSize)
+	}
+
+	encodedSize := ((maxUnLfsFileSize + 2) / 3) * 4
+	return int(encodedSize + maxNDJSONRecordOverhead), nil
+}
+
+func (c *repoComponentImpl) IsSyncing(ctx context.Context, repoType types.RepositoryType, namespace, name string) (bool, error) {
+	repo, err := c.repoStore.FindByPath(ctx, repoType, namespace, name)
+	if err != nil {
+		return false, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	m, err := c.mirrorStore.FindByRepoID(ctx, repo.ID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to find mirror, error: %w", err)
+	}
+
+	if m != nil && m.CurrentTask != nil {
+		if m.CurrentTask.Status == types.MirrorRepoSyncStart {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func (c *repoComponentImpl) ChangePath(ctx context.Context, req types.ChangePathReq) error {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	newNamespace, newName, err := common.GetNamespaceAndNameFromPath(req.NewPath)
+	if err != nil {
+		return fmt.Errorf("failed to get namespace and name from new path, error: %w", err)
+	}
+
+	// Check new namespace exists
+	nsExists, err := c.namespaceStore.Exists(ctx, newNamespace)
+	if err != nil {
+		return fmt.Errorf("failed to check if new namespace exists, error: %w", err)
+	}
+	if !nsExists {
+		return errorx.TargetNamespaceNotFound(newNamespace)
+	}
+
+	// Check new path exists
+	_, err = c.repoStore.FindByPath(ctx, req.RepoType, newNamespace, newName)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to check if new path exists, error: %w", err)
+	}
+
+	if err == nil {
+		return errorx.BadRequest(errors.New("new path already exists"), errorx.Ctx().Set("new_path", req.NewPath))
+	}
+
+	// Check for dependent entities that would be affected by path change
+	if err := c.checkChangePathDependencies(ctx, repo); err != nil {
+		return err
+	}
+
+	if !repo.Hashed {
+		// Migrate repo to hashed path
+		// newPath := common.BuildHashedRelativePath(repo.ID)
+		// err = c.git.CopyRepository(ctx, gitserver.CopyRepositoryReq{
+		// 	RepoType:  req.RepoType,
+		// 	Namespace: req.Namespace,
+		// 	Name:      req.Name,
+		// 	NewPath:   newPath + ".git",
+		// })
+		// if err != nil {
+		// 	return fmt.Errorf("failed to move repo to hashed path, error: %w", err)
+		// }
+		return errorx.BadRequest(errors.New("repository not suported to change path"), errorx.Ctx())
+	}
+	sourceNamespace, err := c.namespaceStore.FindByPath(ctx, req.Namespace)
+	if err != nil {
+		return fmt.Errorf("failed to find source namespace, error: %w", err)
+	}
+	targetNamespace, err := c.namespaceStore.FindByPath(ctx, newNamespace)
+	if err != nil {
+		return fmt.Errorf("failed to find target namespace, error: %w", err)
+	}
+
+	repo.Path = req.NewPath
+	repo.GitPath = fmt.Sprintf("%ss_%s/%s", req.RepoType, newNamespace, newName)
+	repo.Hashed = true
+	_, err = c.repoStore.UpdateRepo(ctx, *repo)
+	if err != nil {
+		return fmt.Errorf("failed to update repo, error: %w", err)
+	}
+	if err := deleteRepositoryNamespaceRelationship(ctx, c.rebac, c.orgStore, sourceNamespace, repo.ID); err != nil {
+		return fmt.Errorf("failed to delete source repository namespace relationship: %w", err)
+	}
+	if err := ensureRepositoryNamespaceRelationship(ctx, c.rebac, c.orgStore, targetNamespace, repo.ID, repo.OrgInheritBlocked); err != nil {
+		return fmt.Errorf("failed to create target repository namespace relationship: %w", err)
+	}
+
+	return nil
+}
+
+// TransferOwnership moves a repository between namespaces administered by the caller.
+func (c *repoComponentImpl) TransferOwnership(ctx context.Context, req types.TransferRepoReq) error {
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		return fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	// Repository ownership transfer requires administrator access to the source namespace.
+	canAdminSource, err := c.CheckCurrentUserPermission(ctx, req.CurrentUser, req.Namespace, rebac.NamespaceCanAdmin)
+	if err != nil {
+		return fmt.Errorf("failed to check source namespace permission, error: %w", err)
+	}
+	if !canAdminSource {
+		return errorx.ErrNoSourceTransferPermission
+	}
+
+	// The caller must also be an administrator of the target namespace.
+	canAdminTarget, err := c.CheckCurrentUserPermission(ctx, req.CurrentUser, req.NewNamespace, rebac.NamespaceCanAdmin)
+	if err != nil {
+		return fmt.Errorf("failed to check target namespace permission, error: %w", err)
+	}
+	if !canAdminTarget {
+		return errorx.ErrNoTargetTransferPermission
+	}
+
+	// Prevent transfer to self
+	if req.NewNamespace == req.Namespace {
+		return errorx.ErrTransferSameNamespace
+	}
+
+	// Check new path doesn't already exist
+	_, err = c.repoStore.FindByPath(ctx, req.RepoType, req.NewNamespace, req.Name)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("failed to check if new path exists, error: %w", err)
+	}
+	if err == nil {
+		return errorx.ErrTransferTargetExists
+	}
+
+	if !repo.Hashed {
+		return errorx.ErrTransferNotSupported
+	}
+
+	// Check for dependent entities that would be affected by path change
+	if err := c.checkChangePathDependencies(ctx, repo); err != nil {
+		return err
+	}
+	sourceNamespace, err := c.namespaceStore.FindByPath(ctx, req.Namespace)
+	if err != nil {
+		return fmt.Errorf("failed to find source namespace, error: %w", err)
+	}
+	targetNamespace, err := c.namespaceStore.FindByPath(ctx, req.NewNamespace)
+	if err != nil {
+		return fmt.Errorf("failed to find target namespace, error: %w", err)
+	}
+
+	newPath := fmt.Sprintf("%s/%s", req.NewNamespace, req.Name)
+	repo.Path = newPath
+	repo.GitPath = fmt.Sprintf("%ss_%s/%s", req.RepoType, req.NewNamespace, req.Name)
+	repo.Hashed = true
+	repo.UserID = targetNamespace.UserID
+	_, err = c.repoStore.UpdateRepo(ctx, *repo)
+	if err != nil {
+		return fmt.Errorf("failed to update repo, error: %w", err)
+	}
+	if err := deleteRepositoryNamespaceRelationship(ctx, c.rebac, c.orgStore, sourceNamespace, repo.ID); err != nil {
+		return fmt.Errorf("failed to delete source repository namespace relationship: %w", err)
+	}
+	if err := ensureRepositoryNamespaceRelationship(ctx, c.rebac, c.orgStore, targetNamespace, repo.ID, repo.OrgInheritBlocked); err != nil {
+		return fmt.Errorf("failed to create target repository namespace relationship: %w", err)
+	}
+
+	return nil
+}
+
+func (c *repoComponentImpl) checkChangePathDependencies(ctx context.Context, repo *database.Repository) error {
+	blocker := checkOne(func() (bool, error) {
+		cnt, err := c.deployTaskStore.CountByRepoID(ctx, repo.ID)
+		return cnt > 0, err
+	}, "deploy tasks", repo)
+	if blocker != nil {
+		return blocker
+	}
+	blocker = checkOne(func() (bool, error) {
+		cnt, err := c.argoWorkFlowStore.CountByRepoPath(ctx, repo.Path)
+		return cnt > 0, err
+	}, "argo workflows", repo)
+	if blocker != nil {
+		return blocker
+	}
+	blocker = checkOne(func() (bool, error) {
+		job, err := c.dataviewerStore.GetLastSuccessfulJobByRepoID(ctx, repo.ID)
+		if err != nil || job == nil {
+			return false, err
+		}
+		return job.CardData != "", nil
+	}, "dataviewers", repo)
+	if blocker != nil {
+		return blocker
+	}
+	blocker = checkOne(func() (bool, error) {
+		cnt, err := c.accountSyncQuotaStatementStore.CountByRepoPath(ctx, repo.Path)
+		return cnt > 0, err
+	}, "account sync quota statements", repo)
+	if blocker != nil {
+		return blocker
+	}
+	blocker = checkOne(func() (bool, error) {
+		resourceIDs := []string{
+			fmt.Sprintf(types.CSGHubResourceFmt, types.ProviderTypeServerless, repo.Path),
+			fmt.Sprintf(types.CSGHubResourceFmt, types.ProviderTypeInference, repo.Path),
+		}
+		cnt, err := c.accountPriceStore.CountByResourceIDs(ctx, resourceIDs)
+		return cnt > 0, err
+	}, "account prices", repo)
+	if blocker != nil {
+		return blocker
+	}
+	return nil
+}
+
+func checkOne(check func() (bool, error), entity string, repo *database.Repository) error {
+	blocked, err := check()
+	if err != nil {
+		return fmt.Errorf("failed to check %s for repo %s: %w", entity, repo.Path, err)
+	}
+	if blocked {
+		return errorx.ChangePathBlocked(
+			fmt.Errorf("cannot change path: the following dependent entities exist: %s. Please remove them first", entity),
+			errorx.Ctx().Set("repo_path", repo.Path).Set("entity", entity),
+		)
+	}
+	return nil
+}
+
+func (c *repoComponentImpl) BatchMigrateRepoToHashedPath(ctx context.Context, auto bool, batchSize int, lastID int64) (int64, error) {
+	if !c.config.Git.RepoDataMigrateEnable {
+		return lastID, nil
+	}
+
+	var maxID int64
+	maxID = lastID
+	for {
+		repos, err := c.repoStore.FindUnhashedRepos(ctx, batchSize, lastID)
+		if err != nil {
+			return lastID, fmt.Errorf("failed to find unhashed repos, error: %w", err)
+		}
+
+		if len(repos) == 0 {
+			break
+		}
+
+		for _, repo := range repos {
+			if repo.ID > maxID {
+				maxID = repo.ID
+			}
+			err := c.migrateRepoToHashedPath(ctx, &repo)
+			if err != nil {
+				slog.Error("failed to migrate repo to hashed path", slog.Any("error", err))
+			}
+			slog.Info("migrated repo to hashed path", slog.Any("repo_type", repo.RepositoryType), slog.String("repo_path", repo.Path))
+		}
+		lastID = maxID
+		if !auto {
+			break
+		}
+	}
+	return maxID, nil
+}
+
+func (c *repoComponentImpl) migrateRepoToHashedPath(ctx context.Context, repo *database.Repository) error {
+	newPath := common.BuildHashedRelativePath(repo.ID)
+	namespace, name := repo.NamespaceAndName()
+	err := c.git.CopyRepository(ctx, gitserver.CopyRepositoryReq{
+		Namespace: namespace,
+		Name:      name,
+		RepoType:  repo.RepositoryType,
+		NewPath:   newPath,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to migrate %s repo %s to hashed path, error: %w", repo.RepositoryType, repo.Path, err)
+	}
+
+	repo.Hashed = true
+	_, err = c.repoStore.UpdateRepo(ctx, *repo)
+	if err != nil {
+		return fmt.Errorf("failed to update repo, error: %w", err)
+	}
+	return nil
+}
+
+func (c *repoComponentImpl) GetMirrorTaskStatus(repo *database.Repository) types.MirrorTaskStatus {
+	var (
+		mirrorTaskStatus types.MirrorTaskStatus
+	)
+
+	if repo.Mirror.CurrentTask != nil {
+		mirrorTaskStatus = repo.Mirror.CurrentTask.Status
+	}
+
+	return mirrorTaskStatus
+}
+
+func (c *repoComponentImpl) RandomPath() []string {
+	return strings.SplitN(uuid.NewString(), "-", 2)
+}
+
+func (c *repoComponentImpl) GetRepos(ctx context.Context, search, _ string, repoType types.RepositoryType) ([]string, error) {
+	var repoPaths []string
+	repos, _, err := c.repoStore.GetReposBySearch(ctx, search, repoType, 1, 10)
+	if err != nil {
+		return repoPaths, fmt.Errorf("failed to get repos, error: %w", err)
+	}
+	for _, repo := range repos {
+		repoPaths = append(repoPaths, repo.Path)
+	}
+	return repoPaths, nil
+}
+
+// GetRepoSizeByBranch gets the repository size for a specific branch
+func (c *repoComponentImpl) GetRepoSizeByBranch(ctx context.Context, repoType types.RepositoryType, namespace, name, branch, currentUser string) (types.RepoSizeResponse, error) {
+	repo, err := c.repoStore.FindByPath(ctx, repoType, namespace, name)
+	if err != nil {
+		return types.RepoSizeResponse{}, fmt.Errorf("failed to find repo, error: %w", err)
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, currentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return types.RepoSizeResponse{}, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+	if !permission {
+		return types.RepoSizeResponse{}, errorx.ErrForbiddenMsg("users do not have permission to get repo size in this repo")
+	}
+
+	// Get repository statistics from database
+	stats, err := c.repoStatisticsStore.FindByRepositoryIDAndBranch(ctx, repo.ID, branch)
+	if err != nil {
+		if errors.Is(err, errorx.ErrNotFound) {
+			return types.RepoSizeResponse{}, errorx.ErrNotFound
+		}
+		return types.RepoSizeResponse{}, fmt.Errorf("failed to get repo statistics, error: %w", err)
+	}
+
+	return types.RepoSizeResponse{
+		TotalSize:      stats.TotalSize,
+		LastCommitSize: stats.LastCommitSize,
+	}, nil
+}
+
+// BatchGetRepoExtra gets the default branch size for multiple repositories by their IDs.
+// Only repositories the current user has read permission for are included in the result.
+func (c *repoComponentImpl) BatchGetRepoExtra(ctx context.Context, repoIDs []int64, currentUser string) ([]types.RepoExtraItem, error) {
+	repos, err := c.repoStore.FindByIds(ctx, repoIDs)
+	if err != nil {
+		return nil, errorx.BatchGetRepoExtraFailed(fmt.Errorf("failed to find repos by ids, error: %w", err))
+	}
+
+	readableRepos, err := c.batchReadableRepositories(ctx, repos, currentUser)
+	if err != nil {
+		return nil, errorx.BatchGetRepoExtraFailed(err)
+	}
+
+	// Collect readable repo IDs for enrichment queries
+	readableRepoIDs := make([]int64, len(readableRepos))
+	for i, repo := range readableRepos {
+		readableRepoIDs[i] = repo.ID
+	}
+
+	// Collect repos that have a default branch for statistics lookup
+	repoDefaultBranches := make(map[int64]string, len(readableRepos))
+	for _, repo := range readableRepos {
+		if repo.DefaultBranch != "" {
+			repoDefaultBranches[repo.ID] = repo.DefaultBranch
+		}
+	}
+
+	sizeMap := make(map[int64]int64, len(readableRepos))
+	lastCommitSizeMap := make(map[int64]int64, len(readableRepos))
+
+	if len(repoDefaultBranches) > 0 {
+		repoIDsWithBranch := make([]int64, 0, len(repoDefaultBranches))
+		for repoID := range repoDefaultBranches {
+			repoIDsWithBranch = append(repoIDsWithBranch, repoID)
+		}
+		slices.Sort(repoIDsWithBranch)
+
+		stats, err := c.repoStatisticsStore.FindByRepositoryIDs(ctx, repoIDsWithBranch)
+		if err != nil {
+			return nil, errorx.BatchGetRepoExtraFailed(fmt.Errorf("failed to find repo statistics, error: %w", err))
+		}
+
+		for _, stat := range stats {
+			if defaultBranch, ok := repoDefaultBranches[stat.RepositoryID]; ok && stat.Branch == defaultBranch {
+				sizeMap[stat.RepositoryID] = stat.TotalSize
+				lastCommitSizeMap[stat.RepositoryID] = stat.LastCommitSize
+			}
+		}
+	}
+
+	// Load enrichment data (tags, mirror, multi-source, clone info)
+	var tagMap map[int64][]database.Tag
+	var modelMap map[int64]database.Model
+	if len(readableRepoIDs) > 0 {
+		if c.tagStore != nil {
+			tm, err := c.tagStore.ByRepoIDs(ctx, readableRepoIDs)
+			if err != nil {
+				slog.Warn("failed to load tags for repo extras", "error", err)
+			} else {
+				tagMap = tm
+			}
+		}
+		if c.modelStore != nil {
+			models, err := c.modelStore.ByRepoIDs(ctx, readableRepoIDs)
+			if err != nil {
+				slog.Warn("failed to load models for repo extras", "error", err)
+			} else {
+				modelMap = make(map[int64]database.Model, len(models))
+				for _, m := range models {
+					modelMap[m.RepositoryID] = m
+				}
+			}
+		}
+	}
+
+	result := make([]types.RepoExtraItem, 0, len(readableRepos))
+	for _, repo := range readableRepos {
+		item := types.RepoExtraItem{
+			RepoID:         repo.ID,
+			Size:           sizeMap[repo.ID],
+			LastCommitSize: lastCommitSizeMap[repo.ID],
+		}
+		// Populate enrichment fields
+		if tagMap != nil {
+			if tags, ok := tagMap[repo.ID]; ok {
+				for _, t := range tags {
+					item.Tags = append(item.Tags, types.RepoTag{
+						Name:      t.Name,
+						Category:  t.Category,
+						Group:     t.Group,
+						BuiltIn:   t.BuiltIn,
+						ShowName:  t.I18nKey,
+						I18nKey:   t.I18nKey,
+						CreatedAt: t.CreatedAt,
+						UpdatedAt: t.UpdatedAt,
+					})
+				}
+			}
+		}
+		if m, ok := modelMap[repo.ID]; ok {
+			if m.Repository.Mirror.CurrentTask != nil {
+				item.MirrorTaskStatus = m.Repository.Mirror.CurrentTask.Status
+			}
+			item.MultiSource = types.MultiSource{
+				HFPath:  m.Repository.HFPath,
+				MSPath:  m.Repository.MSPath,
+				CSGPath: m.Repository.CSGPath,
+			}
+			cloneInfo := common.BuildCloneInfo(c.config, m.Repository)
+			item.Repository = &cloneInfo
+			item.ReportURL = m.ReportURL
+		}
+		result = append(result, item)
+	}
+	slices.SortFunc(result, func(a, b types.RepoExtraItem) int {
+		return cmp.Compare(a.RepoID, b.RepoID)
+	})
+
+	return result, nil
+}
+
+// batchReadableRepositories checks exactly the requested repositories in one ReBAC batch.
+// Public repositories remain readable by the effective repository permission rule.
+func (c *repoComponentImpl) batchReadableRepositories(ctx context.Context, repos []*database.Repository, currentUser string) ([]*database.Repository, error) {
+	if len(repos) == 0 {
+		return nil, nil
+	}
+	if currentUser == "" {
+		readable := make([]*database.Repository, 0, len(repos))
+		for _, repo := range repos {
+			if !repo.Private {
+				readable = append(readable, repo)
+			}
+		}
+		return readable, nil
+	}
+
+	user, err := c.userSvcClient.GetUserInfo(ctx, currentUser, currentUser)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user info, error: %w", err)
+	}
+	if user == nil {
+		return nil, fmt.Errorf("user %q not found", currentUser)
+	}
+	if (&database.User{RoleMask: strings.Join(user.Roles, ",")}).CanAdmin() {
+		return repos, nil
+	}
+	if user.UUID == "" {
+		return nil, fmt.Errorf("user %q has no UUID", currentUser)
+	}
+
+	checks := make([]rebac.BatchCheckItem, 0, len(repos))
+	for index, repo := range repos {
+		checks = append(checks, rebac.BatchCheckItem{
+			CorrelationID: rebac.BatchCheckCorrelationID(index),
+			Check: rebac.CheckRequest{
+				Subject:     rebac.UserSubject(user.UUID),
+				Relation:    rebac.RepositoryCanRead,
+				Object:      rebac.RepositoryObject(repo.ID),
+				Consistency: rebac.ConsistencyHigher,
+			},
+		})
+	}
+	readable := make([]*database.Repository, 0, len(repos))
+	for start := 0; start < len(checks); start += rebac.DefaultMaxBatchSize {
+		end := min(start+rebac.DefaultMaxBatchSize, len(checks))
+		result, batchErr := c.rebac.BatchCheck(ctx, rebac.BatchCheckRequest{Checks: checks[start:end]})
+		if batchErr != nil {
+			return nil, fmt.Errorf("batch check repository read permissions: %w", batchErr)
+		}
+		for index := start; index < end; index++ {
+			repo := repos[index]
+			// Correlation IDs are assigned when the complete request list is built.
+			// Preserve that global index when reading each chunk's response.
+			correlationID := rebac.BatchCheckCorrelationID(index)
+			outcome, exists := result.Results[correlationID]
+			if !exists {
+				return nil, fmt.Errorf("missing ReBAC batch result %q", correlationID)
+			}
+			if outcome.Err != nil {
+				return nil, fmt.Errorf("batch check repository %d: %w", repo.ID, outcome.Err)
+			}
+			if !repo.Private || outcome.Decision.Allowed {
+				readable = append(readable, repo)
+			}
+		}
+	}
+	return readable, nil
+}
+
+func (c *repoComponentImpl) SyncRepositoryPackage(ctx context.Context, repo *database.Repository, namespace, name, branch string) error {
+	if c.repositoryPackageSyncer == nil || repo == nil || !supportedRepositoryPackageType(repo.RepositoryType) {
+		return nil
+	}
+	return c.repositoryPackageSyncer.SyncRepoBranch(ctx, repo, namespace, name, branch)
+}
+
+func (c *repoComponentImpl) asyncSyncRepositoryPackage(ctx context.Context, repo *database.Repository, namespace, name, branch string) {
+	if c.repositoryPackageSyncer == nil || repo == nil || !supportedRepositoryPackageType(repo.RepositoryType) {
+		return
+	}
+	repoCopy := *repo
+	go func() {
+		syncCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), repositoryPackageSyncTimeout)
+		defer cancel()
+		if err := c.repositoryPackageSyncer.SyncRepoBranch(syncCtx, &repoCopy, namespace, name, branch); err != nil {
+			slog.WarnContext(syncCtx, "failed to async sync repository package",
+				slog.Any("error", err),
+				slog.String("repo_type", string(repoCopy.RepositoryType)),
+				slog.Int64("repo_id", repoCopy.ID),
+				slog.String("namespace", namespace),
+				slog.String("name", name),
+				slog.String("branch", branch),
+			)
+		}
+	}()
+}
+
+func (c *repoComponentImpl) DownloadRepoZip(ctx context.Context, req types.DownloadRepoZipReq, currentUser string) ([]byte, error) {
+	if !supportedRepositoryPackageType(req.RepoType) {
+		return nil, errorx.RepoNotFound(fmt.Errorf("unsupported repository package type %s", req.RepoType), errorx.Ctx().Set("namespace", req.Namespace).Set("name", req.Name))
+	}
+	repo, err := c.repoStore.FindByPath(ctx, req.RepoType, req.Namespace, req.Name)
+	if err != nil {
+		if req.RepoType == types.SkillRepo {
+			return nil, errorx.SkillNotFound(err, errorx.Ctx().Set("namespace", req.Namespace).Set("name", req.Name))
+		}
+		return nil, errorx.RepoNotFound(err, errorx.Ctx().Set("namespace", req.Namespace).Set("name", req.Name))
+	}
+
+	permission, err := c.CheckUserRepoPermission(ctx, currentUser, repo, rebac.RepositoryCanRead)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user repo permission, error: %w", err)
+	}
+
+	if !permission {
+		return nil, errorx.ErrForbiddenMsg("users do not have permission to download code zip in this repo")
+	}
+
+	revision := req.Revision
+	if revision == "" {
+		revision = repo.DefaultBranch
+	}
+	if revision == "" {
+		if req.RepoType == types.CodeRepo {
+			return nil, errorx.RepoNoDefaultBranch(errorx.Ctx().Set("namespace", req.Namespace).Set("name", req.Name))
+		}
+		revision = types.MainBranch
+	}
+
+	archiveRevision := revision
+	resolvedCommitID := ""
+	commitID, err := c.resolveRepositoryArchiveCommit(ctx, req.RepoType, req.Namespace, req.Name, revision)
+	if err == nil {
+		archiveRevision = commitID
+		resolvedCommitID = commitID
+		if archiveData, ok := c.readRepositoryPackageArchive(ctx, req.RepoType, repo.ID, revision, commitID); ok {
+			return archiveData, nil
+		}
+	} else {
+		slog.WarnContext(ctx, "failed to resolve repository archive commit for package cache lookup",
+			slog.Any("error", err),
+			slog.String("repo_type", string(req.RepoType)),
+			slog.String("namespace", req.Namespace),
+			slog.String("name", req.Name),
+			slog.String("revision", revision),
+		)
+	}
+
+	archiveData, err := c.git.GetArchive(ctx, gitserver.GetArchiveReq{
+		Namespace: req.Namespace,
+		Name:      req.Name,
+		Revision:  archiveRevision,
+		RepoType:  req.RepoType,
+	})
+	if err != nil {
+		return nil, errorx.RepoZipDownloadFailed(err, errorx.Ctx().Set("repo_type", req.RepoType).Set("namespace", req.Namespace).Set("name", req.Name).Set("revision", revision))
+	}
+	if resolvedCommitID != "" {
+		c.asyncWriteRepositoryPackageArchive(ctx, req.RepoType, repo.ID, resolvedCommitID, archiveData)
+	}
+
+	return archiveData, nil
+}
+
+func (c *repoComponentImpl) resolveRepositoryArchiveCommit(ctx context.Context, repoType types.RepositoryType, namespace, name, revision string) (string, error) {
+	branch, err := c.git.GetRepoBranchByName(ctx, gitserver.GetBranchReq{
+		Namespace: namespace,
+		Name:      name,
+		Ref:       revision,
+		RepoType:  repoType,
+	})
+	if err != nil {
+		return "", err
+	}
+	if branch == nil || branch.Commit.ID == "" {
+		return "", fmt.Errorf("empty branch commit id")
+	}
+	return branch.Commit.ID, nil
+}
+
+func (c *repoComponentImpl) readRepositoryPackageArchive(ctx context.Context, repoType types.RepositoryType, repoID int64, branch, commitID string) ([]byte, bool) {
+	if c.packageReader != nil {
+		return c.packageReader(ctx, repoType, repoID, branch, commitID)
+	}
+	return readRepositoryPackageFromS3(ctx, c.config, c.s3Client, repoType, repoID, branch, commitID)
+}
+
+func (c *repoComponentImpl) asyncWriteRepositoryPackageArchive(ctx context.Context, repoType types.RepositoryType, repoID int64, commitID string, archive []byte) {
+	asyncWriteRepositoryPackageArchive(ctx, repoType, repoID, commitID, archive, c.writeRepositoryPackageArchive, "failed to async upload repository package to s3")
+}
+
+func (c *repoComponentImpl) writeRepositoryPackageArchive(ctx context.Context, repoType types.RepositoryType, repoID int64, commitID string, archive []byte) error {
+	if c.packageWriter != nil {
+		return c.packageWriter(ctx, repoType, repoID, commitID, archive)
+	}
+	if c.repositoryPackageSyncer == nil {
+		return nil
+	}
+	return c.repositoryPackageSyncer.WriteArchive(ctx, repoType, repoID, commitID, archive)
+}

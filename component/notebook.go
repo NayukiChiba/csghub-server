@@ -1,0 +1,442 @@
+package component
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strconv"
+	"strings"
+
+	"opencsg.com/csghub-server/builder/deploy"
+	"opencsg.com/csghub-server/builder/deploy/common"
+	"opencsg.com/csghub-server/builder/rebac"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/config"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/types"
+)
+
+type NotebookComponent interface {
+	CreateNotebook(ctx context.Context, req *types.CreateNotebookReq) (*types.NotebookRes, error)
+	GetNotebook(ctx context.Context, req *types.GetNotebookReq) (*types.NotebookRes, error)
+	DeleteNotebook(ctx context.Context, req *types.DeleteNotebookReq) error
+	UpdateNotebook(ctx context.Context, req *types.UpdateNotebookReq) error
+	StartNotebook(ctx context.Context, req *types.StartNotebookReq) error
+	StopNotebook(ctx context.Context, req *types.StopNotebookReq) error
+	Wakeup(ctx context.Context, currentUser string, id int64) error
+	StatusNotebook(ctx context.Context, req *types.StatusNotebookReq) (string, error)
+	LogsNotebook(ctx context.Context, req *types.StatusNotebookReq) (*deploy.MultiLogReader, error)
+}
+
+func NewNotebookComponent(config *config.Config) (NotebookComponent, error) {
+	c := &notebookComponentImpl{}
+	c.deployTaskStore = database.NewDeployTaskStore()
+	c.deployer = deploy.NewDeployer()
+	c.userStore = database.NewUserStore()
+	c.runtimeFrameworksStore = database.NewRuntimeFrameworksStore()
+	c.spaceResourceStore = database.NewSpaceResourceStore()
+	repoComponent, err := NewRepoComponent(config)
+	if err != nil {
+		return nil, err
+	}
+	c.repoComponent = repoComponent
+	return c, nil
+}
+
+type notebookComponentImpl struct {
+	deployTaskStore        database.DeployTaskStore
+	deployer               deploy.Deployer
+	userStore              database.UserStore
+	runtimeFrameworksStore database.RuntimeFrameworksStore
+	spaceResourceStore     database.SpaceResourceStore
+	repoComponent          RepoComponent
+}
+
+func (c *notebookComponentImpl) CreateNotebook(ctx context.Context, req *types.CreateNotebookReq) (*types.NotebookRes, error) {
+	if req.OwnerNamespace == "" {
+		req.OwnerNamespace = req.CurrentUser
+	}
+
+	user, err := c.userStore.FindByUsername(ctx, req.CurrentUser)
+	if err != nil {
+		return nil, fmt.Errorf("cannot find user for notebook creation, %w", err)
+	}
+
+	if !user.CanAdmin() {
+		canWrite, err := c.repoComponent.CheckCurrentUserPermission(ctx, req.CurrentUser, req.OwnerNamespace, rebac.NamespaceCanWrite)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check namespace permission, error: %w", err)
+		}
+		if !canWrite {
+			return nil, errorx.ErrForbiddenMsg("users do not have permission to create notebook in this namespace")
+		}
+	}
+
+	frame, err := c.runtimeFrameworksStore.FindEnabledByID(ctx, req.RuntimeFrameworkID)
+	if err != nil {
+		return nil, fmt.Errorf("cannot find available runtime framework, %w", err)
+	}
+
+	// put repo-type and namespace/name in annotation
+	annotations := make(map[string]string)
+	annotations[types.ResDeployUser] = user.Username
+	annoStr, err := json.Marshal(annotations)
+	if err != nil {
+		return nil, errorx.InternalServerError(err, nil)
+	}
+
+	resource, err := c.spaceResourceStore.FindByID(ctx, req.ResourceID)
+	if err != nil {
+		return nil, fmt.Errorf("cannot find resource, %w", err)
+	}
+
+	// resource available only if err is nil, err message should contain
+	// the reason why resource is unavailable
+	exclusiveResp, err := c.repoComponent.CheckAccountAndResource(ctx,
+		types.CheckResourceAndAccountReq{
+			UserName:      req.OwnerNamespace,
+			ClusterID:     resource.ClusterID,
+			OrderDetailID: req.OrderDetailID,
+			CurrentUser:   req.CurrentUser,
+		},
+		resource)
+	if err != nil {
+		return nil, err
+	}
+
+	// choose image
+	var hardware types.HardWare
+	err = json.Unmarshal([]byte(resource.Resources), &hardware)
+	if err != nil {
+		return nil, errorx.InternalServerError(err, nil)
+	}
+
+	// notebook only support single instance now
+	if hardware.Replicas > 1 {
+		return nil, errorx.ErrMultiHostNotebookNotSupported
+	}
+
+	billingUUID := user.UUID
+	if req.OwnerNamespace != req.CurrentUser {
+		resolved, err := c.repoComponent.GetNamespaceBillingUUID(ctx, req.OwnerNamespace)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve billing UUID for namespace %s, error: %w", req.OwnerNamespace, err)
+		}
+		billingUUID = resolved
+	}
+
+	dp := types.DeployRequest{
+		DeployName:       req.DeployName,
+		SpaceID:          0,
+		Hardware:         resource.Resources,
+		UserID:           user.ID,
+		RuntimeFramework: frame.FrameName,
+		ContainerPort:    frame.ContainerPort,
+		ImageID:          frame.FrameImage,
+		MinReplica:       req.MinReplica,
+		MaxReplica:       1,
+		Annotation:       string(annoStr),
+		ClusterID:        resource.ClusterID,
+		SecureLevel:      2,
+		Type:             types.NotebookType,
+		UserUUID:         billingUUID,
+		OrderDetailID:    req.OrderDetailID,
+		SKU:              strconv.FormatInt(resource.ID, 10),
+		OwnerNamespace:   req.OwnerNamespace,
+		DeployExtend: types.DeployExtend{
+			NodeAffinity: exclusiveResp.NodeAffinity,
+			Tolerations:  exclusiveResp.Tolerations,
+		},
+	}
+
+	deployID, err := c.deployer.Deploy(ctx, dp)
+	if err != nil {
+		return nil, fmt.Errorf("cannot deploy notebook, %w", err)
+	}
+	return &types.NotebookRes{
+		ID: deployID,
+	}, nil
+}
+
+// GetNotebook
+func (c *notebookComponentImpl) GetNotebook(ctx context.Context, req *types.GetNotebookReq) (*types.NotebookRes, error) {
+	deployReq := &types.DeployActReq{
+		DeployID:    req.ID,
+		CurrentUser: req.CurrentUser,
+	}
+	_, deploy, err := c.repoComponent.CheckDeployPermissionForUser(ctx, *deployReq)
+	if err != nil {
+		return nil, err
+	}
+	reqReplica := types.DeployRequest{
+		DeployID:  deploy.ID,
+		SvcName:   deploy.SvcName,
+		ClusterID: deploy.ClusterID,
+	}
+	_, _, instList, err := c.deployer.GetReplica(ctx, reqReplica)
+	if err != nil {
+		slog.Warn("fail to get deploy replica", slog.Any("req", req), slog.Any("error", err))
+	}
+	endpoint, _ := c.repoComponent.GenerateEndpoint(ctx, deploy)
+	image := deploy.ImageID
+	imagePairs := strings.Split(image, ":")
+	imageVersion := "latest"
+	if len(imagePairs) == 2 {
+		imageVersion = imagePairs[1]
+	}
+	resource := ""
+	var hardware types.HardWare
+	_ = json.Unmarshal([]byte(deploy.Hardware), &hardware)
+	resource, _ = common.GetResourceAndType(hardware)
+	return &types.NotebookRes{
+		ID:                      deploy.ID,
+		DeployName:              deploy.DeployName,
+		Status:                  deployStatusCodeToString(deploy.Status),
+		ClusterID:               deploy.ClusterID,
+		Endpoint:                endpoint,
+		ResourceID:              deploy.SKU,
+		ResourceName:            resource,
+		MinReplica:              deploy.MinReplica,
+		MaxReplica:              deploy.MaxReplica,
+		Instances:               instList,
+		SvcName:                 deploy.SvcName,
+		RuntimeFramework:        deploy.RuntimeFramework,
+		CreatedAt:               deploy.CreatedAt,
+		UpdatedAt:               deploy.UpdatedAt,
+		SecureLevel:             deploy.SecureLevel,
+		RuntimeFrameworkVersion: imageVersion,
+		UserUUID:                deploy.UserUUID,
+		OwnerNamespace:          deploy.OwnerNamespace,
+	}, nil
+}
+
+// StatusNotebook
+func (c *notebookComponentImpl) StatusNotebook(ctx context.Context, req *types.StatusNotebookReq) (string, error) {
+	deployReq := &types.DeployActReq{
+		DeployID:    req.ID,
+		CurrentUser: req.CurrentUser,
+	}
+	_, deploy, err := c.repoComponent.CheckDeployPermissionForUser(ctx, *deployReq)
+	if err != nil {
+		return "", fmt.Errorf("cannot find notebook for status check, %w", err)
+	}
+	return deployStatusCodeToString(deploy.Status), nil
+}
+
+func (c *notebookComponentImpl) LogsNotebook(ctx context.Context, req *types.StatusNotebookReq) (*deploy.MultiLogReader, error) {
+	deployReq := &types.DeployActReq{
+		DeployID:    req.ID,
+		CurrentUser: req.CurrentUser,
+	}
+	_, deploy, err := c.repoComponent.CheckDeployPermissionForUser(ctx, *deployReq)
+	if err != nil {
+		return nil, fmt.Errorf("cannot find notebook for status check, %w", err)
+	}
+	return c.deployer.InstanceLogs(ctx, types.DeployRequest{
+		DeployID:     deploy.ID,
+		InstanceName: req.InstanceName,
+		Since:        req.Since,
+	})
+}
+
+// DeleteNotebook
+func (c *notebookComponentImpl) DeleteNotebook(ctx context.Context, req *types.DeleteNotebookReq) error {
+	deployReq := &types.DeployActReq{
+		DeployID:    req.ID,
+		CurrentUser: req.CurrentUser,
+	}
+	_, deploy, err := c.repoComponent.CheckDeployOperateAccess(ctx, *deployReq)
+	if err != nil {
+		return err
+	}
+	// delete service
+	deployRepo := types.DeployRequest{
+		SpaceID:   0,
+		DeployID:  deploy.ID,
+		SvcName:   deploy.SvcName,
+		ClusterID: deploy.ClusterID,
+	}
+	// purge service
+	err = c.deployer.Purge(ctx, deployRepo)
+	if err != nil {
+		slog.Warn("faile to purge notebook instance", slog.Any("error", err))
+	}
+	// the store matches by deploy id only; authorization happened above, so
+	// organization write members can delete instances they did not create
+	err = c.deployTaskStore.DeleteDeployByID(ctx, deploy.ID)
+	if err != nil {
+		return fmt.Errorf("cannot delete notebook, %w", err)
+	}
+	return nil
+}
+
+// UpdateNotebook
+func (c *notebookComponentImpl) UpdateNotebook(ctx context.Context, req *types.UpdateNotebookReq) error {
+	deployReq := &types.DeployActReq{
+		DeployID:    req.ID,
+		CurrentUser: req.CurrentUser,
+	}
+	_, deploy, err := c.repoComponent.CheckDeployOperateAccess(ctx, *deployReq)
+	if err != nil {
+		return fmt.Errorf("cannot find deploy for notebook, %w", err)
+	}
+
+	deployRepo := types.DeployRequest{
+		DeployID:  deploy.ID,
+		SvcName:   deploy.SvcName,
+		ClusterID: deploy.ClusterID,
+	}
+
+	exist, err := c.deployer.Exist(ctx, deployRepo)
+	if err != nil {
+		return fmt.Errorf("check deploy exists, err: %w", err)
+	}
+	if exist {
+		return errorx.ErrDeployStopFirst
+	}
+
+	resource, err := c.spaceResourceStore.FindByID(ctx, req.ResourceID)
+	if err != nil {
+		return fmt.Errorf("cannot find resource, %w", err)
+	}
+
+	notebookBillingNs := deploy.OwnerNamespace
+	if notebookBillingNs == "" {
+		notebookBillingNs = req.CurrentUser
+	}
+	exclusiveResp, err := c.repoComponent.CheckAccountAndResource(ctx,
+		types.CheckResourceAndAccountReq{
+			UserName:      notebookBillingNs,
+			ClusterID:     resource.ClusterID,
+			OrderDetailID: deploy.OrderDetailID,
+			CurrentUser:   req.CurrentUser,
+		},
+		resource)
+	if err != nil {
+		return fmt.Errorf("resource is not available, %w", err)
+	}
+
+	var hardware types.HardWare
+	err = json.Unmarshal([]byte(resource.Resources), &hardware)
+	if err != nil {
+		return errorx.InternalServerError(err, nil)
+	}
+
+	// notebook only support single instance now
+	if hardware.Replicas > 1 {
+		return errorx.ErrMultiHostNotebookNotSupported
+	}
+
+	dur := &types.DeployUpdateReq{
+		ResourceID: &req.ResourceID,
+		ClusterID:  &resource.ClusterID,
+		DeployExtend: types.DeployExtend{
+			NodeAffinity: exclusiveResp.NodeAffinity,
+			Tolerations:  exclusiveResp.Tolerations,
+		},
+	}
+
+	err = c.deployer.UpdateDeploy(ctx, dur, deploy)
+	return err
+
+}
+
+// StartNotebook
+func (c *notebookComponentImpl) StartNotebook(ctx context.Context, req *types.StartNotebookReq) error {
+	deployReq := &types.DeployActReq{
+		DeployID:    req.ID,
+		CurrentUser: req.CurrentUser,
+	}
+	_, deploy, err := c.repoComponent.CheckDeployOperateAccess(ctx, *deployReq)
+	if err != nil {
+		return fmt.Errorf("cannot find deploy for notebook, %w", err)
+	}
+
+	deployRepo := types.DeployRequest{
+		DeployID:  deploy.ID,
+		SvcName:   deploy.SvcName,
+		ClusterID: deploy.ClusterID,
+	}
+
+	exist, err := c.deployer.Exist(ctx, deployRepo)
+	if err != nil {
+		return fmt.Errorf("check notebook exists, err: %w", err)
+	}
+	if exist {
+		// deploy instance is running
+		return errors.New("deploy already started")
+	}
+
+	// start deploy
+	err = c.deployer.StartDeploy(ctx, deploy)
+	if err != nil {
+		return fmt.Errorf("fail to start notebook, %w", err)
+	}
+	return nil
+}
+
+// StopNotebook
+func (c *notebookComponentImpl) StopNotebook(ctx context.Context, req *types.StopNotebookReq) error {
+	deployReq := &types.DeployActReq{
+		DeployID:    req.ID,
+		CurrentUser: req.CurrentUser,
+	}
+	_, deploy, err := c.repoComponent.CheckDeployOperateAccess(ctx, *deployReq)
+	if err != nil {
+		return err
+	}
+
+	deployRepo := types.DeployRequest{
+		DeployID:  deploy.ID,
+		SvcName:   deploy.SvcName,
+		ClusterID: deploy.ClusterID,
+	}
+
+	// stop deploy
+	err = c.deployer.Stop(ctx, deployRepo)
+	if err != nil {
+		return fmt.Errorf("fail to stop notebook, %w", err)
+	}
+	exist, err := c.deployer.Exist(ctx, deployRepo)
+	if err != nil {
+		// fail to check service
+		return err
+	}
+
+	if exist {
+		// fail to delete service
+		return errors.New("fail to stop notebook instance")
+	}
+	// update database deploy to stopped. The store matches the deploy by id
+	// only, so organization write members can stop instances they did not
+	// create
+	err = c.deployTaskStore.StopDeployByID(ctx, deploy.ID)
+	if err != nil {
+		return fmt.Errorf("fail to stop notebook instance, %w", err)
+	}
+	return nil
+}
+
+func (c *notebookComponentImpl) Wakeup(ctx context.Context, currentUser string, deployId int64) error {
+	// wake up operates the instance, so the caller needs operate access
+	_, _, err := c.repoComponent.CheckDeployOperateAccess(ctx, types.DeployActReq{
+		DeployID:    deployId,
+		CurrentUser: currentUser,
+	})
+	if err != nil {
+		return err
+	}
+	// get Deploy for inference
+	deploy, err := c.deployTaskStore.GetDeployByID(ctx, deployId)
+	if err != nil {
+		return fmt.Errorf("can't get notebook deployment,%w", err)
+	}
+	return c.deployer.Wakeup(ctx, types.DeployRequest{
+		DeployID:  deployId,
+		SvcName:   deploy.SvcName,
+		Endpoint:  deploy.Endpoint,
+		ClusterID: deploy.ClusterID,
+	})
+}

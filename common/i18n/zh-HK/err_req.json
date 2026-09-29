@@ -1,0 +1,50 @@
+{
+    "error.REQ-ERR-0": {
+        "other": "錯誤的請求"
+    },
+    "error.REQ-ERR-1": {
+        "other": "請求體格式錯誤"
+    },
+    "error.REQ-ERR-10": {
+        "other": "請求過於頻繁，需要驗證碼"
+    },
+    "error.REQ-ERR-11": {
+        "other": "來自該IP位置的請求受限，需要驗證碼"
+    },
+    "error.REQ-ERR-12": {
+        "other": "驗證碼驗證失敗"
+    },
+    "error.REQ-ERR-13": {
+        "other": "目標命名空間不存在"
+    },
+    "error.REQ-ERR-14": {
+        "other": "新命名空間必須與當前命名空間不同"
+    },
+    "error.REQ-ERR-15": {
+        "other": "目標命名空間中已存在同名倉庫"
+    },
+    "error.REQ-ERR-16": {
+        "other": "該倉庫不支持轉移所有權"
+    },
+    "error.REQ-ERR-17": {
+        "other": "目前上游 API 不支援連線測試"
+    },
+    "error.REQ-ERR-18": {
+        "other": "目前上游 API 不支援健康檢查"
+    },
+    "error.REQ-ERR-2": {
+        "other": "請求體不能為空"
+    },
+    "error.REQ-ERR-3": {
+        "other": "請求體過大"
+    },
+    "error.REQ-ERR-5": {
+        "other": "重複的請求參數"
+    },
+    "error.REQ-ERR-6": {
+        "other": "無效的請求參數"
+    },
+    "error.REQ-ERR-9": {
+        "other": "不支持的內容類型"
+    }
+}

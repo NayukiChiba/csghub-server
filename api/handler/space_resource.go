@@ -1,0 +1,328 @@
+package handler
+
+import (
+	"errors"
+	"log/slog"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+	"opencsg.com/csghub-server/api/httpbase"
+	"opencsg.com/csghub-server/common/config"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/types"
+	"opencsg.com/csghub-server/component"
+)
+
+func NewSpaceResourceHandler(config *config.Config) (*SpaceResourceHandler, error) {
+	src, err := component.NewSpaceResourceComponent(config)
+	if err != nil {
+		return nil, err
+	}
+	cluster, err := component.NewClusterComponent(config)
+	if err != nil {
+		return nil, err
+	}
+	return &SpaceResourceHandler{
+		spaceResource: src,
+		cluster:       cluster,
+	}, nil
+}
+
+type SpaceResourceHandler struct {
+	spaceResource component.SpaceResourceComponent
+	cluster       component.ClusterComponent
+}
+
+// GetSpaceResources godoc
+// @Security     ApiKey
+// @Summary      Get space resources
+// @Description  get space resources
+// @Tags         SpaceReource
+// @Accept       json
+// @Produce      json
+// @Param        per query int false "page size" default(50)
+// @Param        page query int false "per page" default(1)
+// @Param        cluster_id query string false "cluster_id"
+// @Param 		 deploy_type query int false "deploy type(0-space,1-inference,2-finetune,3-serverless,4-evaluation)" Enums(0, 1, 2, 3, 4) default(1)
+// @Success      200  {object}  types.ResponseWithTotal{data=[]types.SpaceResource,total=int} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /space_resources [get]
+func (h *SpaceResourceHandler) Index(ctx *gin.Context) {
+	req := &types.SpaceResourceIndexReq{}
+	if err := ctx.ShouldBindQuery(req); err != nil {
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	req.CurrentUser = httpbase.GetCurrentUser(ctx)
+
+	clusters := []string{}
+	for _, c := range req.ClusterIDs {
+		if c != "" {
+			clusters = append(clusters, c)
+		}
+	}
+	req.ClusterIDs = clusters
+
+	if len(req.ClusterIDs) == 0 {
+		clusters, err := h.cluster.Index(ctx.Request.Context(), types.ClusterIndexReq{})
+		if err != nil {
+			httpbase.ServerError(ctx, err)
+			return
+		}
+		req.ClusterIDs = make([]string, len(clusters))
+		for i := range clusters {
+			req.ClusterIDs[i] = clusters[i].ClusterID
+		}
+	}
+
+	if len(req.ClusterIDs) < 1 {
+		httpbase.ServerError(ctx, errors.New("cluster is required"))
+		return
+	}
+
+	spaceResources, total, err := h.spaceResource.Index(ctx.Request.Context(), req)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Failed to get space resources", slog.Any("cluster_id", req.ClusterIDs), slog.Any("deploy_type", req.DeployType), slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+	slog.Info("Get space resources successfully")
+	httpbase.OKWithTotal(ctx, spaceResources, total)
+}
+
+// CreateSpaceResource godoc
+// @Security     ApiKey
+// @Summary      Create space resource
+// @Description  create space resource
+// @Tags         SpaceReource
+// @Accept       json
+// @Produce      json
+// @Param        body body types.CreateSpaceResourceReq true "body"
+// @Success      200  {object}  types.ResponseWithTotal{data=types.SpaceResource,total=int} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /space_resources [post]
+func (h *SpaceResourceHandler) Create(ctx *gin.Context) {
+	var req types.CreateSpaceResourceReq
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	spaceResource, err := h.spaceResource.Create(ctx.Request.Context(), &req)
+	if err != nil {
+		if errors.Is(err, errorx.ErrBadRequest) {
+			httpbase.BadRequestWithExt(ctx, err)
+			return
+		}
+		slog.ErrorContext(ctx.Request.Context(), "Failed to create space resources", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+	slog.Info("Create space resources successfully")
+	httpbase.OK(ctx, spaceResource)
+}
+
+// UpdateSpaceResource godoc
+// @Security     ApiKey
+// @Summary      Update a exist space resource
+// @Description  update a exist space resource
+// @Tags         SpaceReource
+// @Accept       json
+// @Produce      json
+// @Param        id path int true "id"
+// @Param        body body types.UpdateSpaceResourceReq true "body"
+// @Success      200  {object}  types.ResponseWithTotal{data=types.SpaceResource,total=int} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /space_resources/{id} [put]
+func (h *SpaceResourceHandler) Update(ctx *gin.Context) {
+	var (
+		id  int64
+		err error
+	)
+	var req *types.UpdateSpaceResourceReq
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	id, err = strconv.ParseInt(ctx.Param("id"), 10, 64)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+	req.ID = id
+
+	spaceResource, err := h.spaceResource.Update(ctx.Request.Context(), req)
+	if err != nil {
+		if errors.Is(err, errorx.ErrBadRequest) {
+			httpbase.BadRequestWithExt(ctx, err)
+			return
+		}
+		slog.ErrorContext(ctx.Request.Context(), "Failed to update space resource", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+	slog.Info("Update space resources successfully")
+	httpbase.OK(ctx, spaceResource)
+}
+
+// DeleteSpaceResource godoc
+// @Security     ApiKey
+// @Summary      Delete a exist space resource
+// @Description  delete a exist space resource
+// @Tags         SpaceReource
+// @Accept       json
+// @Produce      json
+// @Param        id path int true "id"
+// @Success      200  {object}  types.Response{} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /space_resources/{id} [delete]
+func (h *SpaceResourceHandler) Delete(ctx *gin.Context) {
+	var (
+		id  int64
+		err error
+	)
+	id, err = strconv.ParseInt(ctx.Param("id"), 10, 64)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequest(ctx, err.Error())
+		return
+	}
+
+	err = h.spaceResource.Delete(ctx.Request.Context(), id)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Failed to delete space resource", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+	slog.Info("Delete space resource successfully")
+	httpbase.OK(ctx, nil)
+}
+
+// ListHardwareTypes godoc
+// @Security     ApiKey
+// @Summary      List hardware types in a cluster
+// @Description  list hardware types in a cluster
+// @Tags         SpaceReource
+// @Accept       json
+// @Produce      json
+// @Param        cluster_id query string false "cluster_id"
+// @Success      200  {object}  types.Response{data=[]string} "OK"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /space_resources/hardware_types [get]
+
+func (h *SpaceResourceHandler) ListHardwareTypes(ctx *gin.Context) {
+	clusterId := ctx.Query("cluster_id")
+
+	types, err := h.spaceResource.ListHardwareTypes(ctx.Request.Context(), clusterId)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Failed to list hardware types", slog.String("cluster_id", clusterId), slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+	slog.Info("List hardware types successfully")
+	httpbase.OK(ctx, types)
+}
+
+// ListScenarios godoc
+// @Security     ApiKey
+// @Summary      List all deploy/workflow scenarios
+// @Description  list every known scenario with its code (bit position, passed as deploy_type to the space resources index API) and name
+// @Tags         SpaceReource
+// @Produce      json
+// @Success      200  {object}  types.Response{data=[]types.ScenarioInfo} "OK"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /space_resources/scenarios [get]
+func (h *SpaceResourceHandler) ListScenarios(ctx *gin.Context) {
+	scenarios, err := h.spaceResource.ListScenarios(ctx.Request.Context())
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "failed to list scenarios", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+	httpbase.OK(ctx, scenarios)
+}
+
+// ListAllSpaceResources godoc
+// @Security     ApiKey
+// @Summary      List all space resources for admin
+// @Description  list all space resources from database for admin
+// @Tags         SpaceReource
+// @Accept       json
+// @Produce      json
+// @Success      200  {object}  types.Response{data=[]types.SpaceResource} "OK"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /admin/space_resources [get]
+func (h *SpaceResourceHandler) ListAll(ctx *gin.Context) {
+	resources, err := h.spaceResource.ListAll(ctx.Request.Context())
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Failed to list all space resources", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+	slog.Info("List all space resources successfully")
+	httpbase.OK(ctx, resources)
+}
+
+// UpdateScenarioConstraint godoc
+// @Security     ApiKey
+// @Summary      Update scenario constraint
+// @Description  update scenario constraint
+// @Tags         SpaceReource
+// @Accept       json
+// @Produce      json
+// @Param        id path int true "scenario constraint id"
+// @Param        body body types.UpdateScenarioConstraintReq true "body"
+// @Success      200  {object}  types.Response{data=types.ScenarioInfo} "OK"
+// @Failure      400  {object}  types.APIBadRequest "Bad request"
+// @Failure      404  {object}  types.APINotFound "Not found"
+// @Failure      500  {object}  types.APIInternalServerError "Internal server error"
+// @Router       /admin/scenario_constraints/{id} [put]
+func (h *SpaceResourceHandler) UpdateScenarioConstraint(ctx *gin.Context) {
+	var (
+		id  int64
+		err error
+	)
+	var req *types.UpdateScenarioConstraintReq
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequestWithExt(ctx, err)
+		return
+	}
+	if req.RequiredHardware != nil && *req.RequiredHardware < 0 {
+		httpbase.BadRequest(ctx, "required_hardware must be >= 0")
+		return
+	}
+	if req.ExcludeHardware != nil && *req.ExcludeHardware < 0 {
+		httpbase.BadRequest(ctx, "exclude_hardware must be >= 0")
+		return
+	}
+	if req.MaxReplica != nil && *req.MaxReplica < 0 {
+		httpbase.BadRequest(ctx, "max_replica must be >= 0")
+		return
+	}
+	id, err = strconv.ParseInt(ctx.Param("id"), 10, 64)
+	if err != nil {
+		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
+		httpbase.BadRequestWithExt(ctx, err)
+		return
+	}
+	req.ID = id
+
+	constraint, err := h.spaceResource.UpdateScenarioConstraint(ctx.Request.Context(), req)
+	if err != nil {
+		if errors.Is(err, errorx.ErrNotFound) {
+			httpbase.NotFoundError(ctx, err)
+			return
+		}
+		slog.ErrorContext(ctx.Request.Context(), "Failed to update scenario constraint", slog.Any("error", err))
+		httpbase.ServerError(ctx, err)
+		return
+	}
+	httpbase.OK(ctx, constraint)
+}

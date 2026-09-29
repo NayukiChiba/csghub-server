@@ -1,0 +1,246 @@
+package router
+
+import (
+	"fmt"
+	"log/slog"
+
+	"opencsg.com/csghub-server/builder/instrumentation"
+
+	"github.com/gin-contrib/pprof"
+	"github.com/gin-gonic/gin"
+	"opencsg.com/csghub-server/api/httpbase"
+	"opencsg.com/csghub-server/api/middleware"
+	"opencsg.com/csghub-server/common/config"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/user/handler"
+)
+
+func NewRouter(config *config.Config) (*gin.Engine, error) {
+	r := gin.New()
+	middleware.SetInfraMiddleware(r, config, instrumentation.User)
+	needAPIKey := middleware.NeedAPIKey(config)
+	//add router for golang pprof
+	debugGroup := r.Group("/debug", needAPIKey)
+	pprof.RouteRegister(debugGroup, "pprof")
+
+	r.Use(middleware.Authenticator(config))
+
+	userHandler, err := handler.NewUserHandler(config)
+	if err != nil {
+		return nil, fmt.Errorf("error creating user handler:%w", err)
+	}
+	acHandler, err := handler.NewAccessTokenHandler(config)
+	if err != nil {
+		return nil, fmt.Errorf("error creating token handler:%w", err)
+	}
+	orgHandler, err := handler.NewOrganizationHandler(config, config.IsHierarchicalOrganization())
+	if err != nil {
+		return nil, fmt.Errorf("error creating user controller:%w", err)
+	}
+	// The member handler is also used by the service-to-service role query
+	// endpoint, which remains available when public legacy membership APIs are
+	// disabled in hierarchy mode.
+	memberCtrl, err := handler.NewMemberHandler(config)
+	if err != nil {
+		return nil, fmt.Errorf("error creating user controller:%w", err)
+	}
+	//namespace
+	nsCtrl, err := handler.NewNamespaceHandler(config)
+	if err != nil {
+		return nil, fmt.Errorf("error creating namespace controller:%w", err)
+	}
+
+	apiV1Group := r.Group("/api/v1")
+	jwtGroup := apiV1Group.Group("/jwt")
+	userGroup := apiV1Group.Group("/user")
+	tokenGroup := apiV1Group.Group("/token")
+	internalGroup := apiV1Group.Group("/internal", needAPIKey)
+	internalUserGroup := internalGroup.Group("/user")
+	internalOrganizationGroup := internalGroup.Group("/organization")
+
+	jwtHandler, err := handler.NewJWTHandler(config)
+	if err != nil {
+		return nil, fmt.Errorf("error creating jwt handler:%w", err)
+	}
+
+	//don't need login
+	{
+		//casdoor
+		apiV1Group.GET("/callback/casdoor", userHandler.Casdoor)
+		//user
+		userGroup.GET("/:username", userHandler.Get)
+		userGroup.DELETE("/:username", userHandler.Delete)
+		// find user by uuids
+		apiV1Group.GET("/users/by-uuids", userHandler.FindByUUIDs)
+		userGroup.DELETE("/:username/close_account", userHandler.CloseAccount)
+		// user's organizations
+		// Deprecated: remove this route after all clients migrate away from the user organization list API.
+		userGroup.GET("/:username/organizations", orgHandler.ListUserOrgs)
+		// org and members
+		apiV1Group.GET("/organizations", orgHandler.Index)
+		apiV1Group.GET("/organization/:namespace", orgHandler.Get)
+		apiV1Group.GET("/organization/uuid/:uuid", orgHandler.GetByUUID)
+		if !config.IsHierarchicalOrganization() {
+			apiV1Group.GET("/organization/:namespace/members", memberCtrl.OrgMembers)
+		}
+	}
+
+	//internal only
+	{
+		//organization
+		//namespace
+		apiV1Group.GET("/namespace/:path", needAPIKey, nsCtrl.GetInfo)
+		apiV1Group.GET("/namespace/uuid/:uuid", needAPIKey, nsCtrl.GetInfoByUUID)
+		//jwt
+		jwtGroup.POST("/token", needAPIKey, jwtHandler.Create)
+		jwtGroup.GET("/:token", needAPIKey, jwtHandler.Verify)
+		// check token info
+		tokenGroup.GET("/:token_value", acHandler.Get)
+		tokenGroup.GET("/:token_value/quotas", acHandler.GetAPIKeyQuotas)
+		userGroup.GET("/user_uuids", needAPIKey, userHandler.GetUserUUIDs)
+		userGroup.GET("/admin_uuids", needAPIKey, userHandler.GetAdminUserUUIDs)
+		userGroup.GET("/admin_emails", needAPIKey, userHandler.GetAdminEmails)
+
+		internalUserGroup.GET("/emails", userHandler.GetEmailsInternal)
+		// Role queries are internal facts used by other services for authorization.
+		// Public legacy membership mutations remain edition/config gated below.
+		internalOrganizationGroup.GET("/:namespace/members/:username", memberCtrl.GetMemberRole)
+		internalOrganizationGroup.GET("/uuid/:uuid/members/:username", memberCtrl.GetMemberRoleByUUID)
+	}
+
+	middlewareCollection := middleware.MiddlewareCollection{}
+	middlewareCollection.Auth.NeedAPIKey = needAPIKey
+	middlewareCollection.Auth.NeedLogin = mustLogin()
+	middlewareCollection.Auth.NeedAdmin = needAdmin(userHandler)
+	if err := extendRoutes(apiV1Group, middlewareCollection, config, userHandler); err != nil {
+		return nil, fmt.Errorf("error extending routes:%w", err)
+	}
+	apiV1Group.GET("/namespaces/mine/writable", mustLogin(), orgHandler.ListCurrentUserWritableNamespaces)
+
+	apiV1Group.Use(mustLogin())
+	userMatch := userMatch()
+
+	// routers for users
+	{
+		// userGroup.POST("", userHandler.Create)
+		// user self or admin
+		userGroup.PUT("/:id", mustLogin(), userHandler.Update)
+		//TODO:
+		// userGroup.DELETE("/:username", userMatch, userHandler.Delete)
+		// get user's all tokens
+		userGroup.GET("/:username/tokens", userMatch, acHandler.GetUserTokens)
+		userGroup.GET("/:username/tokens/first", userMatch, acHandler.GetOrCreateFirstAvaiTokens)
+		// get user list
+		apiV1Group.GET("/users", mustLogin(), userHandler.Index)
+		// export user info
+		apiV1Group.GET("/users/stream-export", mustLogin(), userHandler.ExportUserInfo)
+
+		// user labels
+		userGroup.PUT("/labels", mustLogin(), userHandler.UpdateUserLabels)
+		// get user's email addresses
+		userGroup.GET("/emails", mustLogin(), userHandler.GetEmails)
+	}
+	// routers for user verify
+	{
+		userGroup.POST("/verify", mustLogin(), userHandler.CreateVerify)
+		userGroup.PUT("/verify/:id", mustLogin(), userHandler.UpdateVerify)
+		userGroup.GET("/verify/:id", mustLogin(), userHandler.GetVerify)
+	}
+	// Legacy organization mutations and membership APIs are unavailable in hierarchy mode.
+	if !config.IsHierarchicalOrganization() {
+		apiV1Group.POST("/organizations", orgHandler.Create)
+		apiV1Group.PUT("/organization/:namespace", orgHandler.Update)
+		apiV1Group.DELETE("/organization/:namespace", orgHandler.Delete)
+		apiV1Group.GET("/organization/:namespace/members/:username", userMatch, memberCtrl.GetMemberRole)
+		apiV1Group.GET("/organization/uuid/:uuid/members/:username", userMatch, memberCtrl.GetMemberRoleByUUID)
+		apiV1Group.POST("/organization/:namespace/members", memberCtrl.Create)
+		apiV1Group.PUT("/organization/:namespace/members/:username", memberCtrl.Update)
+		apiV1Group.DELETE("/organization/:namespace/members/:username", memberCtrl.Delete)
+	}
+	// routers for organization verify
+	{
+		apiV1Group.POST("/organization/verify", mustLogin(), orgHandler.CreateVerify)
+		apiV1Group.PUT("/organization/verify/:id", mustLogin(), orgHandler.UpdateVerify)
+		apiV1Group.GET("/organization/verify/:namespace", orgHandler.GetVerify)
+	}
+	keysGroup := apiV1Group.Group("/namespaces")
+	// routers for API keys
+	{
+		keysGroup.POST("/:uuid/apikeys", mustLogin(), acHandler.CreateAPIKey)
+		keysGroup.GET("/:uuid/apikeys/builtin", mustLogin(), acHandler.GetBuiltinKeys)
+		keysGroup.PUT("/:uuid/apikeys/builtin/refresh", mustLogin(), acHandler.RefreshBuiltinKey)
+		keysGroup.GET("/:uuid/apikeys", mustLogin(), acHandler.GetAPIKeys)
+		keysGroup.PUT("/:uuid/apikeys/:id", mustLogin(), acHandler.UpdateAPIKey)
+		keysGroup.DELETE("/:uuid/apikeys/:id", mustLogin(), acHandler.DeleteAPIKey)
+	}
+	// routers for access tokens and API keys
+	{
+		tokenGroup.POST("/:app/:token_name", acHandler.CreateAppToken)
+		tokenGroup.PUT("/:app/:token_name", acHandler.Refresh)
+		tokenGroup.DELETE("/:app/:token_name", acHandler.DeleteAppToken)
+	}
+
+	{
+		userGroup.POST("/email-verification-code/:email", mustLogin(), userHandler.GenerateVerificationCodeAndSendEmail)
+	}
+
+	{
+		userGroup.POST("/tags", mustLogin(), userHandler.ResetUserTags)
+	}
+
+	return r, nil
+}
+
+// needAdmin allows only authenticated users with platform administrator privileges.
+func needAdmin(userHandler *handler.UserHandler) gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		currentUser := httpbase.GetCurrentUser(ctx)
+		if currentUser == "" {
+			httpbase.UnauthorizedError(ctx, errorx.ErrUserNotFound)
+			ctx.Abort()
+			return
+		}
+		isAdmin, err := userHandler.CanAdmin(ctx.Request.Context(), currentUser)
+		if err != nil {
+			httpbase.ServerError(ctx, fmt.Errorf("failed to check administrator privileges: %w", err))
+			ctx.Abort()
+			return
+		}
+		if !isAdmin {
+			httpbase.ForbiddenError(ctx, errorx.ErrUserNotAdmin)
+			ctx.Abort()
+			return
+		}
+		ctx.Next()
+	}
+}
+
+func userMatch() gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		currentUser := httpbase.GetCurrentUser(ctx)
+		if currentUser == "" {
+			httpbase.UnauthorizedError(ctx, errorx.ErrUserNotFound)
+			ctx.Abort()
+			return
+		}
+
+		userName := ctx.Param("username")
+		if userName != currentUser {
+			httpbase.UnauthorizedError(ctx, errorx.ErrUserNotMatch)
+			slog.ErrorContext(ctx.Request.Context(), "user not match, try to query user account not owned", "currentUser", currentUser, "userName", userName)
+			ctx.Abort()
+			return
+		}
+	}
+}
+
+func mustLogin() gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		currentUser := httpbase.GetCurrentUser(ctx)
+		if currentUser == "" {
+			httpbase.UnauthorizedError(ctx, errorx.ErrUserNotFound)
+			ctx.Abort()
+			return
+		}
+	}
+}

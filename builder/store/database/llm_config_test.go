@@ -1,0 +1,700 @@
+package database_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	mockdatabase "opencsg.com/csghub-server/_mocks/opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/config"
+	"opencsg.com/csghub-server/common/tests"
+	"opencsg.com/csghub-server/common/types"
+)
+
+func TestLLMConfigStore_GetOptimization(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	config, err := config.LoadConfig()
+	require.Nil(t, err)
+	store := database.NewLLMConfigStoreWithDB(db, config)
+	_, err = db.Core.NewInsert().Model(&database.LLMConfig{
+		Type:         1,
+		Enabled:      true,
+		ModelName:    "c1",
+		Metadata:     map[string]any{"source": "test"},
+	}).Exec(ctx)
+	require.Nil(t, err)
+	_, err = db.Core.NewInsert().Model(&database.LLMConfig{
+		Type:         2,
+		Enabled:      true,
+		ModelName:    "c2",
+	}).Exec(ctx)
+	require.Nil(t, err)
+	_, err = db.Core.NewInsert().Model(&database.LLMConfig{
+		Type:         1,
+		Enabled:      false,
+		ModelName:    "c3",
+	}).Exec(ctx)
+	require.Nil(t, err)
+
+	cfg, err := store.GetOptimization(ctx)
+	require.Nil(t, err)
+	require.Equal(t, "c1", cfg.ModelName)
+	require.Equal(t, map[string]any{"source": "test"}, cfg.Metadata)
+}
+
+func TestLLMConfigStore_GetModelForSummaryReadme(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	config, err := config.LoadConfig()
+	require.Nil(t, err)
+	store := database.NewLLMConfigStoreWithDB(db, config)
+	_, err = db.Core.NewInsert().Model(&database.LLMConfig{
+		Type:         5,
+		Enabled:      true,
+		ModelName:    "summary1",
+		Metadata:     map[string]any{"k": "v"},
+	}).Exec(ctx)
+	require.Nil(t, err)
+
+	_, err = db.Core.NewInsert().Model(&database.LLMConfig{
+		Type:      4,
+		Enabled:   false,
+		ModelName: "summary2",
+	}).Exec(ctx)
+	require.Nil(t, err)
+
+	_, err = db.Core.NewInsert().Model(&database.LLMConfig{
+		Type:      2,
+		Enabled:   true,
+		ModelName: "summary3",
+	}).Exec(ctx)
+	require.Nil(t, err)
+
+	cfg, err := store.GetModelForSummaryReadme(ctx)
+	require.Nil(t, err)
+	require.NotNil(t, cfg)
+	require.Equal(t, "summary1", cfg.ModelName)
+	require.Equal(t, map[string]any{"k": "v"}, cfg.Metadata)
+}
+
+func TestLLMConfigStore_GetByID(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	config, err := config.LoadConfig()
+	require.Nil(t, err)
+	store := database.NewLLMConfigStoreWithDB(db, config)
+
+	dbInput := database.LLMConfig{
+		Type:         5,
+		Enabled:      true,
+		ModelName:    "summary1",
+		Metadata:     map[string]any{"k": "v"},
+	}
+	_, err = db.Core.NewInsert().Model(&dbInput).Exec(ctx)
+	require.Nil(t, err)
+
+	cfg, err := store.GetByID(ctx, dbInput.ID)
+	require.Nil(t, err)
+	require.NotNil(t, cfg)
+	require.Equal(t, "summary1", cfg.ModelName)
+	require.Equal(t, map[string]any{"k": "v"}, cfg.Metadata)
+}
+
+func TestLLMConfigStore_CRUD(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	config, err := config.LoadConfig()
+	require.Nil(t, err)
+	store := database.NewLLMConfigStoreWithDB(db, config)
+	dbInput := database.LLMConfig{
+		Type:     5,
+		Enabled:  true,
+		ModelName: "summary1",
+		RoutingPolicy: types.RoutingPolicy{
+			Strategy:      "session_hash",
+			SessionHeader: "X-Session-ID",
+			HashReplicas:  128,
+		},
+		Metadata: map[string]any{"k": "v", "tasks": []interface{}{"text-generation", "text-to-image"}},
+	}
+	res, err := store.Create(ctx, dbInput)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, "summary1", res.ModelName)
+	// OfficialName, Upstreams are now relational, tested separately
+	require.Equal(t, map[string]any{"k": "v", "tasks": []interface{}{"text-generation", "text-to-image"}}, res.Metadata)
+
+	searchType := 5
+	search := &types.SearchLLMConfig{
+		Types: []int{searchType},
+	}
+	cfgs, total, err := store.Index(ctx, 1, 1, search)
+	require.Nil(t, err)
+	require.Equal(t, len(cfgs), 1)
+	require.Equal(t, cfgs[0].Type, 5)
+	require.Equal(t, total, 1)
+
+	err = store.Delete(ctx, res.ID)
+	require.Nil(t, err)
+}
+
+func TestLLMConfigStore_Index_MultiType(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	config, err := config.LoadConfig()
+	require.Nil(t, err)
+	store := database.NewLLMConfigStoreWithDB(db, config)
+
+	// Create a config that supports both optimization (1) and summary readme (4)
+	_, err = store.Create(ctx, database.LLMConfig{
+		Type:      database.LLMTypeOptimization | database.LLMTypeSummaryReadme,
+		Enabled:   true,
+		ModelName: "multi-type-model",
+	})
+	require.Nil(t, err)
+
+	// Create a config that supports only comparison (2)
+	_, err = store.Create(ctx, database.LLMConfig{
+		Type:      database.LLMTypeComparison,
+		Enabled:   true,
+		ModelName: "comparison-only-model",
+	})
+	require.Nil(t, err)
+
+	// Searching by optimization should find the multi-type config
+	cfgs, total, err := store.Index(ctx, 10, 1, &types.SearchLLMConfig{
+		Types: []int{database.LLMTypeOptimization},
+	})
+	require.Nil(t, err)
+	require.Equal(t, 1, total)
+	require.Len(t, cfgs, 1)
+	require.Equal(t, "multi-type-model", cfgs[0].ModelName)
+
+	// Searching by summary readme should also find the multi-type config
+	cfgs, total, err = store.Index(ctx, 10, 1, &types.SearchLLMConfig{
+		Types: []int{database.LLMTypeSummaryReadme},
+	})
+	require.Nil(t, err)
+	require.Equal(t, 1, total)
+	require.Len(t, cfgs, 1)
+	require.Equal(t, "multi-type-model", cfgs[0].ModelName)
+
+	// Searching by both optimization and comparison should find both configs
+	cfgs, total, err = store.Index(ctx, 10, 1, &types.SearchLLMConfig{
+		Types: []int{database.LLMTypeOptimization, database.LLMTypeComparison},
+	})
+	require.Nil(t, err)
+	require.Equal(t, 2, total)
+	require.Len(t, cfgs, 2)
+}
+
+func TestLLMConfigStore_Search(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	config, err := config.LoadConfig()
+	require.Nil(t, err)
+	store := database.NewLLMConfigStoreWithDB(db, config)
+
+	// Create test data with hyphens and letter-number combinations
+	testModels := []database.LLMConfig{
+		{Type: 1, Enabled: true, ModelName: "deepseek-v3"},
+		{Type: 1, Enabled: true, ModelName: "openai/gpt-4"},
+		{Type: 1, Enabled: true, ModelName: "claude3-opus"},
+		{Type: 1, Enabled: true, ModelName: "llama2-7b"},
+		{Type: 1, Enabled: true, ModelName: "Qwen/Qwen3Guard-Gen-0.6B"},
+	}
+
+	for _, model := range testModels {
+		_, err := store.Create(ctx, model)
+		require.Nil(t, err)
+	}
+
+	// Test case 1: Search for "deepseek" should find "deepseek-v3"
+	search1 := &types.SearchLLMConfig{
+		Keyword: "deepseek",
+	}
+	cfgs1, total1, err := store.Index(ctx, 10, 1, search1)
+	require.Nil(t, err)
+	require.GreaterOrEqual(t, total1, 1)
+	found := false
+	for _, cfg := range cfgs1 {
+		if cfg.ModelName == "deepseek-v3" {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "Should find deepseek-v3 when searching for deepseek")
+
+	// Test case 2: Search for "deepseek-v3" should find "deepseek-v3"
+	search2 := &types.SearchLLMConfig{
+		Keyword: "deepseek-v3",
+	}
+	cfgs2, total2, err := store.Index(ctx, 10, 1, search2)
+	require.Nil(t, err)
+	require.GreaterOrEqual(t, total2, 1)
+	found = false
+	for _, cfg := range cfgs2 {
+		if cfg.ModelName == "deepseek-v3" {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "Should find deepseek-v3 when searching for deepseek-v3")
+
+	// Test case 3: Search for "gpt" should find "gpt-4"
+	search3 := &types.SearchLLMConfig{
+		Keyword: "gpt",
+	}
+	cfgs3, total3, err := store.Index(ctx, 10, 1, search3)
+	require.Nil(t, err)
+	require.GreaterOrEqual(t, total3, 1)
+	found = false
+	for _, cfg := range cfgs3 {
+		if cfg.ModelName == "openai/gpt-4" {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "Should find gpt-4 when searching for gpt")
+
+	// Test case 4: Search for "gpt-4" should find "gpt-4"
+	search4 := &types.SearchLLMConfig{
+		Keyword: "openai/gpt-4",
+	}
+	cfgs4, total4, err := store.Index(ctx, 10, 1, search4)
+	require.Nil(t, err)
+	require.GreaterOrEqual(t, total4, 1)
+	found = false
+	for _, cfg := range cfgs4 {
+		if cfg.ModelName == "openai/gpt-4" {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "Should find gpt-4 when searching for gpt-4")
+}
+
+func TestLLMConfigStore_Index_EnabledFilter(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	config, err := config.LoadConfig()
+	require.Nil(t, err)
+	store := database.NewLLMConfigStoreWithDB(db, config)
+
+	searchType := 16
+	base := database.LLMConfig{
+		Type: searchType,
+	}
+	_, err = store.Create(ctx, database.LLMConfig{
+		ModelName:    "idx-en-on",
+		Enabled:      true,
+		Type:         base.Type,
+	})
+	require.Nil(t, err)
+	_, err = store.Create(ctx, database.LLMConfig{
+		ModelName:    "idx-en-off",
+		Enabled:      false,
+		Type:         base.Type,
+	})
+	require.Nil(t, err)
+
+	enabledTrue := true
+	enabledFalse := false
+
+	cfgsOn, totalOn, err := store.Index(ctx, 20, 1, &types.SearchLLMConfig{
+		Types:   []int{searchType},
+		Enabled: &enabledTrue,
+	})
+	require.Nil(t, err)
+	require.Equal(t, 1, totalOn)
+	require.Len(t, cfgsOn, 1)
+	require.Equal(t, "idx-en-on", cfgsOn[0].ModelName)
+	require.True(t, cfgsOn[0].Enabled)
+
+	cfgsOff, totalOff, err := store.Index(ctx, 20, 1, &types.SearchLLMConfig{
+		Types:   []int{searchType},
+		Enabled: &enabledFalse,
+	})
+	require.Nil(t, err)
+	require.Equal(t, 1, totalOff)
+	require.Len(t, cfgsOff, 1)
+	require.Equal(t, "idx-en-off", cfgsOff[0].ModelName)
+	require.False(t, cfgsOff[0].Enabled)
+
+	cfgsBoth, totalBoth, err := store.Index(ctx, 20, 1, &types.SearchLLMConfig{
+		Types: []int{searchType},
+	})
+	require.Nil(t, err)
+	require.Equal(t, 2, totalBoth)
+	require.Len(t, cfgsBoth, 2)
+
+	cfgsKeyword, totalKeyword, err := store.Index(ctx, 20, 1, &types.SearchLLMConfig{
+		Keyword: "idx-en-",
+		Enabled: &enabledTrue,
+	})
+	require.Nil(t, err)
+	require.Equal(t, 1, totalKeyword)
+	require.Len(t, cfgsKeyword, 1)
+	require.Equal(t, "idx-en-on", cfgsKeyword[0].ModelName)
+}
+
+func TestLLMConfigStore_IndexWithRepo(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	config, err := config.LoadConfig()
+	require.Nil(t, err)
+	store := database.NewLLMConfigStoreWithDB(db, config)
+
+	// Create a namespace and repository first
+	namespace := database.Namespace{
+		Path: "test-ns-indexwithrepo",
+	}
+	_, err = db.Core.NewInsert().Model(&namespace).Exec(ctx)
+	require.Nil(t, err)
+
+	user := database.User{
+		GitID:    12345,
+		Username: "test-user-indexwithrepo",
+		NickName: "Test User",
+		Email:    "test-indexwithrepo@example.com",
+	}
+	_, err = db.Core.NewInsert().Model(&user).Exec(ctx)
+	require.Nil(t, err)
+
+	repo := database.Repository{
+		Path:        "test-ns-indexwithrepo/test-repo",
+		GitPath:     "models/test-ns-indexwithrepo/test-repo",
+		Name:        "test-repo",
+		Nickname:    "Test Repo",
+		Description: "A test repository",
+		UserID:      user.ID,
+	}
+	_, err = db.Core.NewInsert().Model(&repo).Exec(ctx)
+	require.Nil(t, err)
+
+	// Create LLMConfigs with and without repo
+	llmType := 16
+	enabled := true
+
+	_, err = store.Create(ctx, database.LLMConfig{
+		ModelName:    "with-repo-model",
+		Type:         llmType,
+		Enabled:      true,
+		RepoID:       repo.ID,
+	})
+	require.Nil(t, err)
+
+	_, err = store.Create(ctx, database.LLMConfig{
+		ModelName:    "no-repo-model",
+		Type:         llmType,
+		Enabled:      true,
+		RepoID:       0,
+	})
+	require.Nil(t, err)
+
+	// Test IndexWithRepo
+	search := &types.SearchLLMConfig{
+		Types:   []int{llmType},
+		Enabled: &enabled,
+	}
+	cfgs, total, err := store.IndexWithRepo(ctx, 10, 1, search)
+	require.Nil(t, err)
+	require.Equal(t, 2, total)
+	require.Len(t, cfgs, 2)
+
+	var withRepo, withoutRepo *database.LLMConfig
+	for _, cfg := range cfgs {
+		if cfg.ModelName == "with-repo-model" {
+			withRepo = cfg
+		} else if cfg.ModelName == "no-repo-model" {
+			withoutRepo = cfg
+		}
+	}
+
+	require.NotNil(t, withRepo)
+	require.NotNil(t, withRepo.Repo)
+	require.Equal(t, repo.ID, withRepo.Repo.ID)
+	require.Equal(t, "test-repo", withRepo.Repo.Name)
+	require.Equal(t, "test-ns-indexwithrepo/test-repo", withRepo.Repo.Path)
+	require.Equal(t, "models/test-ns-indexwithrepo/test-repo", withRepo.Repo.GitPath)
+	require.Equal(t, "Test Repo", withRepo.Repo.Nickname)
+	require.Equal(t, "A test repository", withRepo.Repo.Description)
+
+	require.NotNil(t, withoutRepo)
+	require.Nil(t, withoutRepo.Repo)
+}
+
+func TestLLMConfigStore_IndexWithRepo_Empty(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	config, err := config.LoadConfig()
+	require.Nil(t, err)
+	store := database.NewLLMConfigStoreWithDB(db, config)
+
+	llmType := 16
+	search := &types.SearchLLMConfig{
+		Types: []int{llmType},
+	}
+	cfgs, total, err := store.IndexWithRepo(ctx, 10, 1, search)
+	require.Nil(t, err)
+	require.Equal(t, 0, total)
+	require.Len(t, cfgs, 0)
+}
+
+func TestLLMConfigStore_Index_SortByModelSizeB(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	config, err := config.LoadConfig()
+	require.Nil(t, err)
+	store := database.NewLLMConfigStoreWithDB(db, config)
+
+	llmType := 16
+	_, err = store.Create(ctx, database.LLMConfig{
+		ModelName:  "size-small",
+		Type:       llmType,
+		Enabled:    true,
+		ModelSizeB: 0.5,
+	})
+	require.Nil(t, err)
+	_, err = store.Create(ctx, database.LLMConfig{
+		ModelName:  "size-large",
+		Type:       llmType,
+		Enabled:    true,
+		ModelSizeB: 70,
+	})
+	require.Nil(t, err)
+	_, err = store.Create(ctx, database.LLMConfig{
+		ModelName:  "size-medium",
+		Type:       llmType,
+		Enabled:    true,
+		ModelSizeB: 7,
+	})
+	require.Nil(t, err)
+
+	cfgsAsc, _, err := store.Index(ctx, 10, 1, &types.SearchLLMConfig{
+		Types:     []int{llmType},
+		SortBy:    "model_size_b",
+		SortOrder: "ASC",
+	})
+	require.Nil(t, err)
+	require.Len(t, cfgsAsc, 3)
+	require.Equal(t, "size-small", cfgsAsc[0].ModelName)
+	require.Equal(t, "size-medium", cfgsAsc[1].ModelName)
+	require.Equal(t, "size-large", cfgsAsc[2].ModelName)
+
+	cfgsDesc, _, err := store.Index(ctx, 10, 1, &types.SearchLLMConfig{
+		Types:     []int{llmType},
+		SortBy:    "model_size_b",
+		SortOrder: "DESC",
+	})
+	require.Nil(t, err)
+	require.Len(t, cfgsDesc, 3)
+	require.Equal(t, "size-large", cfgsDesc[0].ModelName)
+	require.Equal(t, "size-medium", cfgsDesc[1].ModelName)
+	require.Equal(t, "size-small", cfgsDesc[2].ModelName)
+}
+
+func TestLLMConfig_PopulateDerivedFields_NoUpstreams(t *testing.T) {
+	cfg := &database.LLMConfig{
+		ModelName:   "original-model",
+		ApiEndpoint: "original-endpoint",
+		AuthHeader:  "original-auth",
+		Provider:    "original-provider",
+	}
+	cfg.PopulateDerivedFields()
+	require.Equal(t, "original-model", cfg.ModelName)
+	require.Equal(t, "original-endpoint", cfg.ApiEndpoint)
+	require.Equal(t, "original-auth", cfg.AuthHeader)
+	require.Equal(t, "original-provider", cfg.Provider)
+}
+
+func TestLLMConfig_PopulateDerivedFields_HealthyUpstream(t *testing.T) {
+	cfg := &database.LLMConfig{
+		ModelName:   "original-model",
+		ApiEndpoint: "original-endpoint",
+		AuthHeader:  "original-auth",
+		Provider:    "original-provider",
+		Upstreams: []database.Upstream{
+			{
+				URL:      "http://disabled-upstream",
+				Enabled:  false,
+				ModelName: "disabled-model",
+				AuthHeader: `{"Authorization":"disabled"}`,
+				Provider: "disabled-provider",
+			},
+			{
+				URL:      "http://healthy-upstream",
+				Enabled:  true,
+				ModelName: "healthy-model",
+				AuthHeader: `{"Authorization":"healthy"}`,
+				Provider: "healthy-provider",
+				HealthState: &database.AIGatewayUpstreamHealthState{
+					HealthState: "healthy",
+				},
+			},
+		},
+	}
+	cfg.PopulateDerivedFields()
+	require.Equal(t, "http://healthy-upstream", cfg.ApiEndpoint)
+	require.Equal(t, `{"Authorization":"healthy"}`, cfg.AuthHeader)
+	require.Equal(t, "healthy-provider", cfg.Provider)
+	require.Equal(t, "healthy-model", cfg.ModelName)
+}
+
+func TestLLMConfig_PopulateDerivedFields_UnhealthyUpstream(t *testing.T) {
+	cfg := &database.LLMConfig{
+		ModelName:   "original-model",
+		ApiEndpoint: "original-endpoint",
+		Upstreams: []database.Upstream{
+			{
+				URL:      "http://unhealthy-upstream",
+				Enabled:  true,
+				ModelName: "unhealthy-model",
+				AuthHeader: `{"Authorization":"unhealthy"}`,
+				Provider: "unhealthy-provider",
+				HealthState: &database.AIGatewayUpstreamHealthState{
+					HealthState: "unhealthy",
+				},
+			},
+			{
+				URL:      "http://fallback-upstream",
+				Enabled:  true,
+				ModelName: "fallback-model",
+				AuthHeader: `{"Authorization":"fallback"}`,
+				Provider: "fallback-provider",
+			},
+		},
+	}
+	cfg.PopulateDerivedFields()
+	// Should skip unhealthy upstream and use the fallback (no health state = healthy)
+	require.Equal(t, "http://fallback-upstream", cfg.ApiEndpoint)
+	require.Equal(t, "fallback-model", cfg.ModelName)
+	require.Equal(t, "fallback-provider", cfg.Provider)
+}
+
+func TestLLMConfig_PopulateDerivedFields_DegradedIsHealthy(t *testing.T) {
+	cfg := &database.LLMConfig{
+		ModelName: "original-model",
+		Upstreams: []database.Upstream{
+			{
+				URL:      "http://degraded-upstream",
+				Enabled:  true,
+				ModelName: "degraded-model",
+				AuthHeader: `{"Authorization":"degraded"}`,
+				Provider: "degraded-provider",
+				HealthState: &database.AIGatewayUpstreamHealthState{
+					HealthState: "degraded",
+				},
+			},
+		},
+	}
+	cfg.PopulateDerivedFields()
+	// "degraded" is not "unhealthy", so it should be considered healthy
+	require.Equal(t, "http://degraded-upstream", cfg.ApiEndpoint)
+	require.Equal(t, "degraded-model", cfg.ModelName)
+}
+
+func TestLLMConfig_PopulateDerivedFields_OverridesModelName(t *testing.T) {
+	cfg := &database.LLMConfig{
+		ModelName: "config-model",
+		Upstreams: []database.Upstream{
+			{
+				URL:       "http://upstream",
+				Enabled:   true,
+				ModelName: "upstream-model",
+				AuthHeader: "{}",
+				Provider:  "upstream-provider",
+			},
+		},
+	}
+	cfg.PopulateDerivedFields()
+	require.Equal(t, "upstream-model", cfg.ModelName)
+}
+
+func TestLLMConfig_PopulateDerivedFields_EmptyUpstreamModelName(t *testing.T) {
+	cfg := &database.LLMConfig{
+		ModelName: "config-model",
+		Upstreams: []database.Upstream{
+			{
+				URL:       "http://upstream",
+				Enabled:   true,
+				ModelName: "",
+				AuthHeader: "{}",
+				Provider:  "upstream-provider",
+			},
+		},
+	}
+	cfg.PopulateDerivedFields()
+	// Should keep original ModelName when upstream ModelName is empty
+	require.Equal(t, "config-model", cfg.ModelName)
+}
+
+func TestLLMConfig_Tasks(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *database.LLMConfig
+		want   []string
+	}{
+		{name: "nil config", config: nil, want: nil},
+		{name: "nil metadata", config: &database.LLMConfig{}, want: nil},
+		{name: "no tasks key", config: &database.LLMConfig{Metadata: map[string]any{"other": "value"}}, want: nil},
+		{
+			name:   "jsonb round trip []any",
+			config: &database.LLMConfig{Metadata: map[string]any{"tasks": []any{"text-generation", "auto-speech-recognition"}}},
+			want:   []string{"text-generation", "auto-speech-recognition"},
+		},
+		{
+			name:   "programmatic []string",
+			config: &database.LLMConfig{Metadata: map[string]any{"tasks": []string{"text-to-image"}}},
+			want:   []string{"text-to-image"},
+		},
+		{name: "non slice value", config: &database.LLMConfig{Metadata: map[string]any{"tasks": "text-generation"}}, want: nil},
+		{name: "slice with non string entries", config: &database.LLMConfig{Metadata: map[string]any{"tasks": []any{"text-generation", 42}}}, want: []string{"text-generation"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want, test.config.Tasks())
+		})
+	}
+}
+
+func TestResolveLLMTasks(t *testing.T) {
+	ctx := context.TODO()
+
+	t.Run("nil store", func(t *testing.T) {
+		require.Nil(t, database.ResolveLLMTasks(ctx, nil, 7))
+	})
+
+	t.Run("store error", func(t *testing.T) {
+		store := mockdatabase.NewMockLLMConfigStore(t)
+		store.EXPECT().GetByID(ctx, int64(7)).Return(nil, errors.New("boom")).Once()
+		require.Nil(t, database.ResolveLLMTasks(ctx, store, 7))
+	})
+
+	t.Run("config not found", func(t *testing.T) {
+		store := mockdatabase.NewMockLLMConfigStore(t)
+		store.EXPECT().GetByID(ctx, int64(7)).Return(nil, nil).Once()
+		require.Nil(t, database.ResolveLLMTasks(ctx, store, 7))
+	})
+
+	t.Run("resolves tasks", func(t *testing.T) {
+		store := mockdatabase.NewMockLLMConfigStore(t)
+		store.EXPECT().GetByID(ctx, int64(7)).Return(&database.LLMConfig{
+			Metadata: map[string]any{"tasks": []any{"auto-speech-recognition"}},
+		}, nil).Once()
+		require.Equal(t, []string{"auto-speech-recognition"}, database.ResolveLLMTasks(ctx, store, 7))
+	})
+}

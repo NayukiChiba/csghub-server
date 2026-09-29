@@ -1,93 +1,90 @@
-# csghub-server
+*[English](README_en.md) ∙ [简体中文](README_cn.md) ∙ [日本語](README_ja.md)*
 
+`CSGHub Server` is a part of the open source and reliable large model assets management platform - [CSGHub](https://github.com/OpenCSGs/CSGHub/). It focuses on management of models、datasets and other LLM assets through REST API。
 
+## Key Features：
+- Creation and Management of users and orgnizations
+- Auto-tagging of model and dataset labels
+- Search for users, organizations, models, and data
+- Online preview of dataset files, like `.parquet` file
+- Content moderation for both text and image 
+- Download of individual files, including LFS files
+- Tracking of model and dataset activity data, such as downloads and likes volume
 
-## Getting started
+## Demo
+In order to help users to quickly understand the features and usage of CSGHub, we have recorded a demo video. You can watch this video to get a quick understanding of the main features and operation procedures of this program.
+- CSGHub Demo video is as blew，you can also check it at [YouTube](https://www.youtube.com/watch?v=SFDISpqowXs) or [Bilibili](https://www.bilibili.com/video/BV12T4y187bv/)
+<video width="658" height="432" src="https://github-production-user-asset-6210df.s3.amazonaws.com/3232817/296556812-205d07f2-de9d-4a7f-b3f5-83514a71453e.mp4"></video>
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+Please visit the [OpenCSG website](https://portal.opencsg.com/models) to experience the powerful management features. 
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## Quick Start
+> System resource requirements: 4c CPU/8GB memory
 
-## Add your files
+Please install Docker yourself. This project has been tested in Ubuntu22 environment.
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+You can quickly deploy the localized `CSGHub Server` service through docker-compose:
+```shell
+# The API token should be at least 128 characters long, and HTTP requests to csghub-server require the API token to be sent as a Bearer token for authentication.
+export STARHUB_SERVER_API_TOKEN=<API token>
+mkdir -m 777 gitea minio_data
+curl -L https://raw.githubusercontent.com/OpenCSGs/csghub-server/main/docker-compose.yml -o docker-compose.yml
+docker-compose -f docker-compose.yml up -d
+```
+
+## Start CSGHub Server Services Locally
+
+CSGHub supports TOML format for config files. When starting any service from the command line, you can specify the config file with the `--config` option:
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.inone.nsfocus.com/tianshulab/csghub-server.git
-git branch -M main
-git push -uf origin main
+go run cmd/csghub-server/main.go start server --config local.toml
+go run cmd/csghub-server/main.go deploy runner --config local.toml
+...
 ```
 
-## Integrate with your tools
+We provide an [example config file](common/config/config.toml.example), you can rename it, modify as needed and use. All available configurations are defined in [this Go file](common/config/config.go). The TOML configuration uses snake_case naming convention, and names automatically map to corresponding struct field names.
 
-* [Set up project integrations](https://gitlab.inone.nsfocus.com/tianshulab/csghub-server/-/settings/integrations)
+## Technical Architecture
+<div align=center>
+  <img src="docs/csghub_server-arch.png" alt="csghub-server architecture" width="800px">
+</div>
 
-## Collaborate with your team
+### Extensible and customizable
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+- Supports different git servers, such as Gitea, GitLab, etc.
+- Supports flexible configuration of the LFS storage system, and you can choose to use local or any third-party cloud storage service that is compatible with the S3 protocol.
+- Enable content moderation on demand, and choose any third-party content moderation service.
 
 ## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+- [x] Support more Git Servers: Currently supports Gitea, and plans to support mainstream Git repositories in the future.
+- [x] Git LFS: Git LFS supports large files, and supports Git command operations and online download through the Web UI. 
+- [x] DataSet online viewer: Data set preview, supports the Top20/TopN loading preview of LFS format data sets. 
+- [x] Model/Dataset AutoTag: Supports custom metadata and automatic extraction of model/dataset tags. 
+- [x] S3 Protocol Support: Supports S3 (MinIO) storage protocol, providing higher reliability and storage cost-effectiveness.
+- [ ] Model format convert: Conversion of mainstream model formats.
+- [x] Model oneclick deploy: Supports integration with OpenCSG llm-inference, one-click to start model inference.
 
 ## License
-For open source projects, say how it is licensed.
+We use the Apache 2.0 license, the content of which is detailed in the `LICENSE` file.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+## Contributing
+If you wish to contribute, please follow the [Contribution Guidelines](docs/en/contributing.md). We are very excited about your contributions!
+
+Before you begin development, we highly recommend checking out our [Backend Developer Guides](contribute/), which provide helpful information to ensure a smooth development process.
+
+## Acknowledgments
+This project is based on open source projects such as Gin, DuckDB, minio, and Gitea. We would like to express our sincere gratitude to them for their open source contributions!
+
+### CONTACT WITH US
+If you meet any problem during usage, you can contact with us by any following way:
+1. initiate an issue in github
+2. join our WeChat group by scaning wechat helper qrcode
+3. join our offical discord channel: [OpenCSG Discord Channel](https://discord.gg/bXnu4C9BkR)
+4. join our slack workspace:[OpenCSG Slack Channel](https://join.slack.com/t/opencsghq/shared_invite/zt-2fmtem7hs-s_RmMeoOIoF1qzslql2q~A)
+<div style="display:inline-block">
+<img src="https://github.com/OpenCSGs/csghub/blob/main/docs/images/wechat-assistant-new.png" width='200'>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="https://github.com/OpenCSGs/csghub/blob/main/docs/images/discord-qrcode.png" width='200'>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+<img src="https://github.com/OpenCSGs/csghub/blob/main/docs/images/slack-qrcode.png" width='200'>
+</div>

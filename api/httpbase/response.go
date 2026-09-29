@@ -1,0 +1,381 @@
+package httpbase
+
+import (
+	"errors"
+	"net/http"
+	"reflect"
+
+	"github.com/gin-gonic/gin"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/i18n"
+)
+
+// normalizeEmptySlice converts nil slices to empty slices to ensure JSON serialization returns [] instead of null
+func normalizeEmptySlice(data interface{}) interface{} {
+	if data == nil {
+		return data
+	}
+	v := reflect.ValueOf(data)
+	if v.Kind() == reflect.Pointer && v.Type().Elem().Kind() == reflect.Slice {
+		if v.IsNil() {
+			return reflect.MakeSlice(v.Type().Elem(), 0, 0).Interface()
+		}
+		elem := v.Elem()
+		if elem.IsNil() {
+			return reflect.MakeSlice(elem.Type(), 0, 0).Interface()
+		}
+		return data
+	}
+	if v.Kind() == reflect.Slice && v.IsNil() {
+		return reflect.MakeSlice(v.Type(), 0, 0).Interface()
+	}
+	return data
+}
+
+// OK responds the client with standard JSON.
+//
+// Example:
+// * ok(c, something)
+// * ok(c, nil)
+func OK(c *gin.Context, data interface{}) {
+	respData := R{
+		Msg:  "OK",
+		Data: data,
+	}
+	if c.Request == nil || c.Request.Header == nil {
+		c.PureJSON(http.StatusOK, respData)
+		return
+	}
+	lang := c.GetHeader("Accept-Language")
+	modifiedData := i18n.TranslateInterface(data, lang)
+	respData.Data = modifiedData
+	c.PureJSON(http.StatusOK, respData)
+}
+
+// Created responds the client with standard JSON (HTTP 201).
+//
+// Example:
+// * Created(c, createdResource)
+// * Created(c, nil)
+func Created(c *gin.Context, data interface{}) {
+	respData := R{
+		Msg:  "Created",
+		Data: data,
+	}
+	if c.Request == nil || c.Request.Header == nil {
+		c.PureJSON(http.StatusCreated, respData)
+		return
+	}
+	lang := c.GetHeader("Accept-Language")
+	modifiedData := i18n.TranslateInterface(data, lang)
+	respData.Data = modifiedData
+	c.PureJSON(http.StatusCreated, respData)
+}
+
+// Accepted responds with standard JSON for work accepted for asynchronous processing.
+func Accepted(c *gin.Context, data any) {
+	respData := R{
+		Msg:  "Accepted",
+		Data: data,
+	}
+	if c.Request == nil || c.Request.Header == nil {
+		c.PureJSON(http.StatusAccepted, respData)
+		return
+	}
+	lang := c.GetHeader("Accept-Language")
+	respData.Data = i18n.TranslateInterface(data, lang)
+	c.PureJSON(http.StatusAccepted, respData)
+}
+
+// AcceptedWithExt responds with an HTTP 202 custom error envelope and optional asynchronous result data.
+func AcceptedWithExt(c *gin.Context, err error, data any) {
+	resp := R{Data: data}
+	if custom, ok := errorx.GetFirstCustomError(err); ok {
+		var customErr errorx.CustomError
+		errors.As(custom, &customErr)
+		resp.Code = customErr.Code()
+		resp.Msg = customErr.Error()
+		resp.Context = customErr.Context()
+	} else {
+		resp.Msg = err.Error()
+	}
+	c.PureJSON(http.StatusAccepted, resp)
+}
+
+// OK responds the client with standard JSON.
+//
+// Example:
+// * ok(c, something)
+// * ok(c, nil)
+func OKWithTotal(c *gin.Context, data interface{}, total int) {
+	normalizedData := normalizeEmptySlice(data)
+	respData := R{
+		Msg:   "OK",
+		Data:  normalizedData,
+		Total: total,
+	}
+	if c.Request == nil || c.Request.Header == nil {
+		c.PureJSON(http.StatusOK, respData)
+		return
+	}
+	lang := c.GetHeader("Accept-Language")
+	modifiedData := i18n.TranslateInterface(normalizedData, lang)
+	respData.Data = modifiedData
+	c.PureJSON(http.StatusOK, respData)
+}
+
+// BadRequest responds with a JSON-formatted error message.
+//
+// Example:
+//
+//	BadRequest(c, "Invalid request parameters")
+func BadRequest(c *gin.Context, errMsg string) {
+	c.PureJSON(http.StatusBadRequest, R{
+		Msg: errMsg,
+	})
+}
+
+// BadRequest responds with a JSON-formatted error message.
+//
+// Example:
+//
+//	BadRequest(c, "Invalid request parameters")
+func BadRequestWithExt(c *gin.Context, err error) {
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		c.PureJSON(http.StatusBadRequest, R{
+			Code:    customErr.Code(),
+			Msg:     customErr.Error(),
+			Context: customErr.Context(),
+		})
+		return
+	}
+	c.PureJSON(http.StatusBadRequest, R{
+		Msg: err.Error(),
+	})
+}
+
+func UnprocessableEntityWithExt(c *gin.Context, err error) {
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		c.PureJSON(http.StatusUnprocessableEntity, R{
+			Code:    customErr.Code(),
+			Msg:     customErr.Error(),
+			Context: customErr.Context(),
+		})
+		return
+	}
+	c.PureJSON(http.StatusUnprocessableEntity, R{
+		Msg: err.Error(),
+	})
+}
+
+// ServerError responds with a JSON-formatted error message.
+//
+// Example:
+//
+//	ServerError(c, errors.New("internal server error"))
+func ServerError(c *gin.Context, err error) {
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		c.PureJSON(http.StatusInternalServerError, R{
+			Code:    customErr.Code(),
+			Msg:     customErr.Error(),
+			Context: customErr.Context(),
+		})
+		return
+	}
+	c.PureJSON(http.StatusInternalServerError, R{
+		Msg: err.Error(),
+	})
+}
+
+// UnauthorizedError if the client is not authenticated or the authentication is invalid.
+// Like user not login, for example.
+//
+// Response Example:
+//
+//	UnauthorizedError(c, errors.New("permission denied"))
+func UnauthorizedError(c *gin.Context, err error) {
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		c.PureJSON(http.StatusUnauthorized, R{
+			Code:    customErr.Code(),
+			Msg:     customErr.Error(),
+			Context: customErr.Context(),
+		})
+		return
+	}
+	c.PureJSON(http.StatusUnauthorized, R{
+		Msg: err.Error(),
+	})
+}
+
+// ForbiddenError if the client is authenticated but does not have enough permissions.
+func ForbiddenError(c *gin.Context, err error) {
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		c.PureJSON(http.StatusForbidden, R{
+			Code:    customErr.Code(),
+			Msg:     customErr.Error(),
+			Context: customErr.Context(),
+		})
+		return
+	}
+	c.PureJSON(http.StatusForbidden, R{
+		Msg: err.Error(),
+	})
+}
+
+// PaymentRequiredError if the user's account balance is insufficient for the operation.
+func PaymentRequiredError(c *gin.Context, err error) {
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		c.PureJSON(http.StatusPaymentRequired, R{
+			Code:    customErr.Code(),
+			Msg:     customErr.Error(),
+			Context: customErr.Context(),
+		})
+		return
+	}
+	c.PureJSON(http.StatusPaymentRequired, R{
+		Msg: err.Error(),
+	})
+}
+
+// NotFoundError responds with a JSON-formatted error message.
+//
+// Example:
+//
+//	NotFoundError(c, errors.New("permission denied"))
+func NotFoundError(c *gin.Context, err error) {
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		c.PureJSON(http.StatusNotFound, R{
+			Code:    customErr.Code(),
+			Msg:     customErr.Error(),
+			Context: customErr.Context(),
+		})
+		return
+	}
+	c.PureJSON(http.StatusNotFound, R{
+		Msg: err.Error(),
+	})
+}
+
+// ServiceUnavailableError responds with a JSON-formatted error message and HTTP 503 status code.
+// Used when a dependent downstream service is unavailable.
+func ServiceUnavailableError(c *gin.Context, err error) {
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		c.PureJSON(http.StatusServiceUnavailable, R{
+			Code:    customErr.Code(),
+			Msg:     customErr.Error(),
+			Context: customErr.Context(),
+		})
+		return
+	}
+	c.PureJSON(http.StatusServiceUnavailable, R{
+		Msg: err.Error(),
+	})
+}
+
+// ConflictError responds with a JSON-formatted error message and HTTP 409 status code.
+// Used when the request conflicts with the current state of the server.
+//
+// Example:
+//
+//	ConflictError(c, errorx.ErrCannotRemoveLastAdmin)
+func ConflictError(c *gin.Context, err error) {
+	resp := R{}
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		resp.Code = customErr.Code()
+		resp.Msg = customErr.Error()
+		resp.Context = customErr.Context()
+	} else {
+		resp.Msg = err.Error()
+	}
+	c.PureJSON(http.StatusConflict, resp)
+}
+
+func TooManyReqError(c *gin.Context, err error) {
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		c.PureJSON(http.StatusTooManyRequests, R{
+			Code:    customErr.Code(),
+			Msg:     customErr.Error(),
+			Context: customErr.Context(),
+		})
+		return
+	}
+	c.PureJSON(http.StatusTooManyRequests, R{
+		Msg: err.Error(),
+	})
+}
+
+// 410 GoneError responds with a JSON-formatted error message.
+// Used when the requested resource is no longer available.
+//
+// Example:
+//
+//	GoneError(c, errors.New("token expired"))
+func GoneError(c *gin.Context, err error) {
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		c.PureJSON(http.StatusGone, R{
+			Code:    customErr.Code(),
+			Msg:     customErr.Error(),
+			Context: customErr.Context(),
+		})
+		return
+	}
+	c.PureJSON(http.StatusGone, R{
+		Msg: err.Error(),
+	})
+}
+
+// R is the response envelope
+type R struct {
+	Code    string `json:"code,omitempty"`
+	Msg     string `json:"msg"`
+	Data    any    `json:"data,omitempty"`
+	Total   int    `json:"total,omitempty"` // Total number of items, used in paginated responses
+	TraceID string `json:"trace_id,omitempty"`
+	// error context msg
+	Context map[string]interface{} `json:"context,omitempty"`
+}
+
+type I18nOptionsMap map[i18n.I18nOptionsKey]string
+
+// Conflict responds with a JSON-formatted error message.
+//
+// Example:
+//
+//	Conflict(c, errors.New("internal server error"))
+func Conflict(c *gin.Context, err error) {
+	err, ok := errorx.GetFirstCustomError(err)
+	if ok {
+		customErr := err.(errorx.CustomError)
+		c.PureJSON(http.StatusConflict, R{
+			Code:    customErr.Code(),
+			Msg:     customErr.Error(),
+			Context: customErr.Context(),
+		})
+		return
+	}
+	c.PureJSON(http.StatusConflict, R{
+		Msg: err.Error(),
+	})
+}

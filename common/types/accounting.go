@@ -1,0 +1,1029 @@
+package types
+
+import (
+	"errors"
+	"time"
+
+	"opencsg.com/csghub-server/common/utils/money"
+	"opencsg.com/csghub-server/common/utils/payment/consts"
+
+	"github.com/google/uuid"
+)
+
+var (
+	ErrDuplicatedEvent         = errors.New("duplicated fee event uuid")
+	ErrDuplicatedMeterByUUID   = errors.New("duplicated metering event by event uuid")
+	ErrDuplicatedMeterInMinute = errors.New("duplicated metering event in minute level")
+	ErrDuplicatedAcademyOrder  = errors.New("duplicated academy order by user_uuid, scene and customer_id")
+)
+
+const (
+	OrderDetailID        = "order_detail_id"
+	MeterFromSource      = "from_source"
+	PromptTokenNum       = "prompt_token_num"
+	PromptTokenCacheNum  = "prompt_token_cache_num"
+	CompletionTokenNum   = "completion_token_num"
+	ReasoningTokenNum    = "reasoning_token_num"
+	OwnerType            = "owner_type"
+	ConsumeApiKey        = "api_key"
+	CompletionDataType   = "completion_data_type"
+	CompletionResolution = "completion_resolution"
+	CompletionDuration   = "completion_duration"
+	// MeterUpstreamID is the ai_gateway_upstreams.id that served the request;
+	// it keys the upstream procurement-cost lookup at charge time.
+	MeterUpstreamID = "upstream_id"
+	// MeterProvider is the serving upstream's provider (服务商) display string.
+	MeterProvider = "provider"
+)
+
+type DataType string
+
+const (
+	DataTypeImage DataType = "image"
+	DataTypeAudio DataType = "audio"
+	DataTypeVideo DataType = "video"
+	DataTypeOCR   DataType = "ocr"
+)
+
+func (d DataType) IsMultiModal() bool {
+	switch d {
+	case DataTypeImage, DataTypeAudio, DataTypeVideo, DataTypeOCR:
+		return true
+	default:
+		return false
+	}
+}
+
+type OrderStatus int
+
+var (
+	OrderCreated    OrderStatus = 1 // created and unpaid
+	OrderPayTimeour OrderStatus = 2 // payment timeout
+	OrderPaid       OrderStatus = 3 // paid and valid
+	OrderCancelled  OrderStatus = 4 // cancelled by user
+	OrderExpired    OrderStatus = 5 // Expired
+	OrderClosed     OrderStatus = 6 // closed by admin or system
+)
+
+type SkuUnitType string
+
+var (
+	UnitSecond SkuUnitType = "second" // audio/video duration
+	UnitMinute SkuUnitType = "minute"
+	UnitDay    SkuUnitType = "day"
+	UnitWeek   SkuUnitType = "week"
+	UnitMonth  SkuUnitType = "month"
+	UnitYear   SkuUnitType = "year"
+	UnitToken  SkuUnitType = "token"
+	UnitRepo   SkuUnitType = "repository"
+	UnitByte   SkuUnitType = "byte"
+	UnitCount  SkuUnitType = "count" // count of image/audio/video
+)
+
+type ACCTStatus int
+
+var (
+	ACCTSuccess       ACCTStatus = 0 // charge success
+	ACCTInvalidFormat ACCTStatus = 1 // invalid event data format
+	ACCTChargeFail    ACCTStatus = 2 // fail to charge user fee
+	ACCTLackBalance   ACCTStatus = 3 // balance <= 0
+	ACCTDuplicated    ACCTStatus = 4 // duplicated charge by event uuid
+	ACCTSubscription  ACCTStatus = 5 // subscription change
+	ACCTStopDeploy    ACCTStatus = 6 // stop deploy service
+)
+
+type SKUType int
+
+var (
+	SKUReserve      SKUType = 0 // system reserve
+	SKUCSGHub       SKUType = 1 // csghub server
+	SKUStarship     SKUType = 2 // starship is deprecated
+	SKUUpstreamCost SKUType = 3 // upstream procurement cost; never used to charge users
+)
+
+type SKUKind int
+
+var (
+	SKUPayAsYouGo           SKUKind = 1 // Time-based billing Pay-as-you-go
+	SKUTimeSpan             SKUKind = 2 // monthly or yearly billing
+	SKUPackageAddon         SKUKind = 3 // Package addon time-based billing
+	SKUPromptToken          SKUKind = 4 // Token-based billing of prompt
+	SKUCompletionToken      SKUKind = 5 // Token-based billing of completion
+	SKUPromptMultiModal     SKUKind = 6 // Multi Model LLM Prompt for image/audio/video
+	SKUCompletionMultiModal SKUKind = 7 // Multi Model LLM completion for image/audio/video
+)
+
+type SkuStatus int
+
+var (
+	SkuStatusEnabled  SkuStatus = 1 // price is enabled and active
+	SkuStatusDisabled SkuStatus = 9 // price is disabled/deprecated, 2~8 are reserved for future use
+)
+
+var (
+	ChargeBalance     string = "balance"
+	ChargeCashBalance string = "cash_balance"
+	ChargeVoucher     string = "voucher"
+)
+
+type SceneType int
+
+var (
+	SceneReserve         SceneType = 0 // system reserve
+	ScenePortalCharge    SceneType = 1 // portal charge fee
+	ScenePayOrder        SceneType = 2 // create order to reduce fee
+	SceneCashCharge      SceneType = 3 // cash charge from user payment
+	ScenePaySubscription SceneType = 4 // pay subscription and reduce fee
+	// csghub
+	SceneModelInference       SceneType = 10 // model inference endpoint
+	SceneSpace                SceneType = 11 // csghub space
+	SceneModelFinetune        SceneType = 12 // model finetune
+	SceneMultiSync            SceneType = 13 // multi source sync
+	SceneEvaluation           SceneType = 14 // model evaluation
+	SceneModelServerless      SceneType = 15 // serverless and external model text from aigateway
+	SceneMultiModalServerless SceneType = 16 // Multi modal model from aigateway for image/audio/video/ocr
+	// starship
+	SceneStarship SceneType = 20 // starship is deprecated
+	SceneGuiAgent SceneType = 22 // gui agent is deprecated
+	// academy
+	SceneAcademyPurchase SceneType = 30 // AI Academy course purchase
+	// dataset
+	SceneDatasetPurchase   SceneType = 40 // dataset purchase
+	SceneDatasetSaleIncome SceneType = 41 // dataset sale income for seller
+
+	// unknow
+	SceneUnknow SceneType = 99 // unknow
+)
+
+type RechargePurpose string
+
+const (
+	RechargePurposeMarket       RechargePurpose = "market"
+	RechargePurposeEmployeeCost RechargePurpose = "employee_cost"
+	RechargePurposeCustomerPOC  RechargePurpose = "customer_poc"
+	RechargePurposeOther        RechargePurpose = "other"
+)
+
+func (p RechargePurpose) IsValid() bool {
+	switch p {
+	case RechargePurposeMarket, RechargePurposeEmployeeCost, RechargePurposeCustomerPOC, RechargePurposeOther:
+		return true
+	default:
+		return false
+	}
+}
+
+type TokenUsageType string
+
+var (
+	ExternalInference                  TokenUsageType = "0"
+	CSGHubUserDeployedInference        TokenUsageType = "1"
+	CSGHubOtherDeployedInference       TokenUsageType = "2"
+	CSGHubServerlessInference          TokenUsageType = "3"
+	CSGHubOrganFellowDeployedInference TokenUsageType = "4"
+)
+
+type ChargeValueType int
+
+var (
+	TimeDurationMinType ChargeValueType = 0
+	TokenNumberType     ChargeValueType = 1
+	QuotaNumberType     ChargeValueType = 2
+	CountNumberType     ChargeValueType = 3
+)
+
+type AcctEventReq struct {
+	EventUUID         uuid.UUID       `json:"event_uuid"`
+	UserUUID          string          `json:"user_uuid"`
+	Value             float64         `json:"value"`
+	Scene             SceneType       `json:"scene"`
+	OpUID             string          `json:"op_uid"`
+	CustomerID        string          `json:"customer_id"`
+	EventDate         time.Time       `json:"event_date"`
+	Price             float64         `json:"price"`
+	PriceUnit         string          `json:"price_unit"`
+	Consumption       float64         `json:"consumption"`
+	ValueType         ChargeValueType `json:"value_type"`
+	ResourceID        string          `json:"resource_id"`
+	ResourceName      string          `json:"resource_name"`
+	SkuID             int64           `json:"sku_id"`
+	RecordedAt        time.Time       `json:"recorded_at"`
+	SkuUnit           int64           `json:"sku_unit"`
+	SkuUnitType       SkuUnitType     `json:"sku_unit_type"`
+	SkuPriceCurrency  string          `json:"sku_price_currency"`
+	Quota             float64         `json:"quota"`
+	SubBillID         int64           `json:"sub_bill_id"`
+	Discount          float64         `json:"discount"`
+	RegularValue      float64         `json:"regular_value"`
+	PromptToken       float64         `json:"prompt_token"`
+	PromptCachedToken float64         `json:"prompt_cached_token"`
+	CompletionToken   float64         `json:"completion_token"`
+	// ReasoningToken is display-only: already included in CompletionToken, never billed separately.
+	ReasoningToken float64         `json:"reasoning_token"`
+	ApiKey         string          `json:"api_key"`
+	Purpose        RechargePurpose `json:"purpose"`
+	PurposeDesc    string          `json:"purpose_desc"`
+	DataType       string          `json:"data_type"`
+	Resolution     string          `json:"resolution"`
+	Duration       float64         `json:"duration"`
+	// Cost/procurement snapshot for aigateway token usage (scenes 15/16),
+	// computed at charge time from SKUUpstreamCost prices; cents, >= 0.
+	CostAmount          float64 `json:"cost_amount"`
+	CostPromptSkuID     *int64  `json:"cost_prompt_sku_id"`
+	CostCompletionSkuID *int64  `json:"cost_completion_sku_id"`
+	Provider            string  `json:"provider"`
+	UpstreamID          int64   `json:"upstream_id"`
+}
+
+// generate charge event from client
+type AcctEvent struct {
+	Uuid         uuid.UUID       `json:"uuid"`       // event uuid
+	UserUUID     string          `json:"user_uuid"`  // user uuid
+	Value        int64           `json:"value"`      // time duration in minutes or token number
+	ValueType    ChargeValueType `json:"value_type"` // 0: credit, 1: token
+	Scene        int             `json:"scene"`
+	OpUID        string          `json:"op_uid"`        // operator uuid
+	ResourceID   string          `json:"resource_id"`   // resource id
+	ResourceName string          `json:"resource_name"` // resource name
+	CustomerID   string          `json:"customer_id"`   // customer_id will be shown in bill
+	CreatedAt    time.Time       `json:"created_at"`    // time of event happen
+	Extra        string          `json:"extra"`
+}
+
+// notify response to client
+type AcctNotify struct {
+	Uuid       uuid.UUID  `json:"uuid"`
+	UserUUID   string     `json:"user_id"`
+	CreatedAt  time.Time  `json:"created_at"`
+	ReasonCode ACCTStatus `json:"reason_code"` // ACCTStatus
+	ReasonMsg  string     `json:"reason_msg"`
+}
+
+type SubscriptionNotify struct {
+	PreResourceID string `json:"pre_resource_id"`
+	ResourceID    string `json:"resource_id"`
+	PeriodStart   int64  `json:"period_start"`
+	PeriodEnd     int64  `json:"period_end"`
+}
+
+type AcctSubscriptionNotify struct {
+	AcctNotify
+	Subscription *SubscriptionNotify `json:"subscription"`
+}
+
+type ActStatementsReq struct {
+	CurrentUser  string    `json:"current_user"`
+	UserUUID     string    `json:"user_uuid"`
+	Scene        SceneType `json:"scene"`
+	InstanceName string    `json:"instance_name"`
+	StartTime    string    `json:"start_time"`
+	EndTime      string    `json:"end_time"`
+	Per          int       `json:"per"`
+	Page         int       `json:"page"`
+	UserName     string    `json:"user_name"`
+}
+
+type AcctBillsReq struct {
+	CurrentUser  string    `json:"current_user"`
+	TargetUUID   string    `json:"target_uuid"`
+	Scene        SceneType `json:"scene"`
+	StartDate    string    `json:"start_date"`
+	EndDate      string    `json:"end_date"`
+	Per          int       `json:"per"`
+	Page         int       `json:"page"`
+	InstanceName string    `json:"instance_name"`
+}
+
+type AcctBillsDetailReq struct {
+	CurrentUser  string      `json:"current_user"`
+	TargetUUID   string      `json:"target_uuid"`
+	Scene        int         `json:"scene"`
+	StartDate    string      `json:"start_date"`
+	EndDate      string      `json:"end_date"`
+	InstanceName string      `json:"instance_name"`
+	Per          int         `json:"per"`
+	Page         int         `json:"page"`
+	UnitType     SkuUnitType `json:"unit_type"`
+}
+
+type AcctStatementsRes struct {
+	ID               int64       `json:"id"`
+	EventUUID        uuid.UUID   `json:"event_uuid"`
+	UserUUID         string      `json:"user_id"`
+	Value            float64     `json:"value"`
+	Scene            int         `json:"scene"`
+	OpUID            string      `json:"op_uid"`
+	CreatedAt        time.Time   `json:"created_at"`
+	CustomerID       string      `json:"instance_name"`
+	EventDate        time.Time   `json:"event_date"`
+	Price            float64     `json:"price"`
+	PriceUnit        string      `json:"price_unit"`
+	Consumption      float64     `json:"consumption"`
+	SkuUnit          int64       `json:"sku_unit"`
+	SkuUnitType      SkuUnitType `json:"sku_unit_type"`
+	SkuPriceCurrency string      `json:"sku_price_currency"`
+	UserName         string      `json:"user_name"`
+	SkuID            int64       `json:"sku_id"`
+	SkuType          int         `json:"sku_type"`
+	SkuKind          int         `json:"sku_kind"`
+	SkuDesc          string      `json:"sku_desc"`
+}
+
+// AcctStatementsResFiltered is a filtered version of AcctStatementsRes that excludes certain fields
+type AcctStatementsResFiltered struct {
+	ID           int64     `json:"id"`
+	UserUUID     string    `json:"user_id"`
+	Value        float64   `json:"value"`
+	Scene        int       `json:"scene"`
+	InstanceName string    `json:"instance_name"`
+	CreatedAt    time.Time `json:"created_at"`
+	Consumption  float64   `json:"consumption"`
+	UserName     string    `json:"user_name"`
+	SkuID        int64     `json:"sku_id"`
+	SkuType      int       `json:"sku_type"`
+	SkuKind      int       `json:"sku_kind"`
+	SkuDesc      string    `json:"sku_desc"`
+}
+
+type RechargeReq struct {
+	Value       float64         `json:"value" binding:"min=1"`
+	OpUID       string          `json:"op_uid"`
+	Scene       SceneType       `json:"scene"`
+	Purpose     RechargePurpose `json:"purpose"`
+	PurposeDesc string          `json:"purpose_desc"`
+}
+
+type AcctQuotaReq struct {
+	RepoCountLimit int64 `json:"repo_count_limit" binding:"required,min=0"`
+	SpeedLimit     int64 `json:"speed_limit" binding:"required,min=0"`
+	TrafficLimit   int64 `json:"traffic_limit" binding:"required,min=0"`
+}
+
+type AcctQuotaStatementReq struct {
+	RepoPath string `json:"repo_path"`
+	RepoType string `json:"repo_type"`
+}
+
+type AcctSummary struct {
+	Total                  int     `json:"total"`
+	TotalValue             float64 `json:"total_value"`
+	TotalConsumption       float64 `json:"total_consumption"`
+	TotalPromptToken       float64 `json:"total_prompt_token"`
+	TotalPromptCachedToken float64 `json:"total_prompt_cached_token"`
+	TotalCompletionToken   float64 `json:"total_completion_token"`
+	TotalReasoningToken    float64 `json:"total_reasoning_token"`
+	TotalVoucherValue      float64 `json:"total_voucher_value"`
+	TotalCashValue         float64 `json:"total_cash_value"`
+	TotalDuration          float64 `json:"total_duration"`
+	TotalCount             float64 `json:"total_count"`
+}
+
+type ITEM struct {
+	Consumption       float64     `json:"consumption"`
+	InstanceName      string      `json:"instance_name"`
+	Value             float64     `json:"value"`
+	CreatedAt         time.Time   `json:"created_at"`
+	Status            string      `json:"status"`
+	RepoPath          string      `json:"repo_path"`
+	DeployID          int64       `json:"deploy_id"`
+	DeployName        string      `json:"deploy_name"`
+	DeployUser        string      `json:"deploy_user"`
+	PromptToken       float64     `json:"prompt_token"`
+	PromptCachedToken float64     `json:"prompt_cached_token"`
+	CompletionToken   float64     `json:"completion_token"`
+	ReasoningToken    float64     `json:"reasoning_token"`
+	VoucherValue      float64     `json:"voucher_value"`
+	CashValue         float64     `json:"cash_value"`
+	Duration          float64     `json:"duration"`
+	Count             float64     `json:"count"`
+	DataType          string      `json:"data_type"`
+	Resolution        string      `json:"resolution"`
+	UnitType          SkuUnitType `json:"unit_type"`
+}
+
+type BILLS struct {
+	Data []ITEM `json:"data"`
+	AcctSummary
+}
+
+type AcctStatementsResult struct {
+	Data []AcctStatementsRes `json:"data"`
+	AcctSummary
+}
+
+type MeteringEvent struct {
+	Uuid         uuid.UUID       `json:"uuid"`       // event uuid
+	UserUUID     string          `json:"user_uuid"`  // user uuid
+	Value        int64           `json:"value"`      // time duration in minutes or token number
+	ValueType    ChargeValueType `json:"value_type"` // 0: duration, 1: token
+	Scene        SceneType       `json:"scene"`
+	OpUID        string          `json:"op_uid"`        // operator uuid
+	ResourceID   string          `json:"resource_id"`   // resource id
+	ResourceName string          `json:"resource_name"` // resource name
+	CustomerID   string          `json:"customer_id"`   // customer_id will be shown in bill
+	CreatedAt    time.Time       `json:"created_at"`    // time of event happen
+	Extra        string          `json:"extra"`
+}
+
+type MeteringExtra struct {
+	EventDate         time.Time   `json:"event_date"`
+	PromptToken       float64     `json:"prompt_token"`
+	PromptCachedToken float64     `json:"prompt_cached_token"`
+	CompletionToken   float64     `json:"completion_token"`
+	ReasoningToken    float64     `json:"reasoning_token"`
+	TokenID           int64       `bun:",notnull,default:0" json:"token_id"`
+	DataType          string      `bun:",notnull,default:''" json:"data_type"`
+	Resolution        string      `bun:",notnull,default:''" json:"resolution"`
+	Duration          float64     `bun:",notnull,default:0" json:"duration"`
+	SkuUnitType       SkuUnitType `json:"sku_unit_type"`
+	APIKey            string      `json:"api_key"`
+}
+
+type AcctPriceCreateReq struct {
+	SkuType          SKUType     `json:"sku_type" binding:"required,oneof=1 2 3"`
+	SkuPrice         int64       `json:"sku_price"`
+	SkuUnit          int64       `json:"sku_unit" binding:"required,min=1"`
+	SkuDesc          string      `json:"sku_desc" binding:"required"`
+	ResourceID       string      `json:"resource_id" binding:"required"`
+	SkuUnitType      SkuUnitType `json:"sku_unit_type" binding:"required"`
+	SkuPriceCurrency string      `json:"sku_price_currency"`
+	SkuKind          SKUKind     `json:"sku_kind" binding:"required"`
+	Quota            string      `json:"quota"`
+	SkuPriceID       int64       `json:"sku_price_id"`
+	Discount         float64     `json:"discount" binding:"omitempty,min=0,max=1"`
+	UseLimitPrice    int64       `json:"use_limit_price"`
+	Resolution       string      `json:"resolution"`
+	SkuStatus        SkuStatus   `json:"sku_status" binding:"required,oneof=1 9"`
+	SkuCachedPrice   *int64      `json:"sku_cached_price"`
+}
+
+type AcctPriceBatchCreateReq struct {
+	Prices []AcctPriceCreateReq `json:"prices" binding:"required,dive"`
+}
+
+type AcctPriceUpdateReq struct {
+	SkuType          *SKUType     `json:"sku_type"`
+	SkuPrice         *int64       `json:"sku_price"`
+	SkuUnit          *int64       `json:"sku_unit"`
+	SkuDesc          *string      `json:"sku_desc"`
+	ResourceID       *string      `json:"resource_id"`
+	SkuUnitType      *SkuUnitType `json:"sku_unit_type"`
+	SkuPriceCurrency *string      `json:"sku_price_currency"`
+	SkuKind          *SKUKind     `json:"sku_kind"`
+	Quota            *string      `json:"quota"`
+	SkuPriceID       *int64       `json:"sku_price_id"`
+	Discount         *float64     `json:"discount"`
+	UseLimitPrice    *int64       `json:"use_limit_price"`
+	Resolution       *string      `json:"resolution"`
+	SkuStatus        *SkuStatus   `json:"sku_status"`
+	SkuCachedPrice   *int64       `json:"sku_cached_price"`
+}
+
+// TokenReportReq is the admin token report query (issue #3404): a date range
+// ([start_time, end_time), YYYY-MM-DD) over the daily rollup, filtered by
+// namespace, API key, model (selling resource id) and provider.
+type TokenReportReq struct {
+	StartTime  string `json:"start_time" form:"start_time"`
+	EndTime    string `json:"end_time" form:"end_time"`
+	NsUUID     string `json:"ns_uuid" form:"ns_uuid"`
+	UserName   string `json:"user_name" form:"user_name"`
+	ResourceID string `json:"resource_id" form:"resource_id"`
+	Provider   string `json:"provider" form:"provider"`
+	TokenID    int64  `json:"token_id" form:"token_id"`
+	Page       int    `json:"page" form:"page"`
+	Per        int    `json:"per" form:"per"`
+}
+
+// TokenReportItem is one report row (date × namespace × API key × model ×
+// provider). Money is yuan; rates are 0 when the denominator is 0.
+type TokenReportItem struct {
+	Date            string  `json:"date"`
+	UserName        string  `json:"user_name"`
+	NsUUID          string  `json:"ns_uuid"`
+	TokenID         int64   `json:"token_id"`
+	APIKeyName      string  `json:"api_key_name"`
+	Model           string  `json:"model"`
+	Provider        string  `json:"provider"`
+	CallCount       int64   `json:"call_count"`
+	PromptToken     float64 `json:"prompt_token"`
+	CompletionToken float64 `json:"completion_token"`
+	CachedToken     float64 `json:"cached_token"`
+	CacheHitRate    float64 `json:"cache_hit_rate"`
+	Revenue         float64 `json:"revenue"`
+	Cost            float64 `json:"cost"`
+	Margin          float64 `json:"margin"`
+	MarginRate      float64 `json:"margin_rate"`
+}
+
+// TokenReportResp is the paged report plus the 合计 (totals) row.
+type TokenReportResp struct {
+	Data    []TokenReportItem `json:"data"`
+	Total   int               `json:"total"`
+	Summary TokenReportItem   `json:"summary"`
+}
+
+type AcctPriceResp struct {
+	Id               int64     `json:"id"`
+	SkuType          SKUType   `json:"sku_type"`
+	SkuPrice         int64     `json:"sku_price"`
+	SkuUnit          int64     `json:"sku_unit"`
+	SkuDesc          string    `json:"sku_desc"`
+	ResourceID       string    `json:"resource_id"`
+	SkuUnitType      string    `json:"sku_unit_type"`
+	SkuPriceCurrency string    `json:"sku_price_currency"`
+	SkuKind          SKUKind   `json:"sku_kind"`
+	Quota            string    `json:"quota"`
+	SkuPriceID       int64     `json:"sku_price_id"`
+	SkuStatus        SkuStatus `json:"sku_status"`
+	SkuCachedPrice   int64     `json:"sku_cached_price"`
+}
+
+type AcctPriceQueryReq struct {
+	SkuType     SKUType   `json:"sku_type"`
+	ResourceID  string    `json:"resource_id"`
+	PriceTime   time.Time `json:"price_time"`
+	SkuKind     SKUKind   `json:"sku_kind"`
+	SkuUnitType []string  `json:"sku_unit_type"`
+}
+
+type AcctOrderDetailReq struct {
+	ResourceID  string  `json:"resource_id" binding:"required"`
+	SkuType     SKUType `json:"sku_type" binding:"required"`
+	SkuUnitType string  `json:"sku_unit_type" binding:"required"`
+	OrderCount  int     `json:"order_count" binding:"required,min=1"`
+	BeginTime   string  `json:"begin_time" binding:"optional_date_format"`
+}
+
+type AcctOrderCreateReq struct {
+	OrderUUID    uuid.UUID            `json:"order_uuid" binding:"required"`
+	UserUUID     string               `json:"user_uuid" binding:"required"`
+	OrderDetails []AcctOrderDetailReq `json:"order_details" binding:"required,dive"`
+}
+
+type AcctOrderExpiredEvent struct {
+	OrderUUID  string    `json:"order_uuid"`
+	UserUUID   string    `json:"user_uuid"`
+	DetailID   int64     `json:"detail_id"`
+	ResourceID string    `json:"resource_id"`
+	BeginTime  time.Time `json:"begin_time"`
+	EndTime    time.Time `json:"end_time"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// used for listing prices with pagination
+//
+// in accounting price DB
+type AcctPriceListDBReq struct {
+	SkuType    SKUType   `json:"sku_type"`
+	SkuKind    SKUKind   `json:"sku_kind"`
+	ResourceID []string  `json:"resource_id"`
+	SkuStatus  SkuStatus `json:"sku_status"`
+	SortBy     string    `json:"sort_by"`
+	SortOrder  string    `json:"sort_order"`
+	Per        int       `json:"per"`
+	Page       int       `json:"page"`
+}
+
+type AcctPriceListByKindsReq struct {
+	SkuType    SKUType   `json:"sku_type"`
+	SkuKinds   []SKUKind `json:"sku_kinds"`
+	ResourceID string    `json:"resource_id"`
+}
+
+type AcctPriceListReq struct {
+	SkuType    SKUType             `json:"sku_type" form:"sku_type"`
+	SkuKind    SKUKind             `json:"sku_kind" form:"sku_kind"`
+	ResourceID []string            `json:"resource_id" form:"resource_id"`
+	SkuStatus  SkuStatus           `json:"sku_status" form:"sku_status,default=1"`
+	Filter     AcctPriceListFilter `json:"-"`
+	SortBy     string              `json:"sort_by" form:"sort_by" binding:"omitempty,oneof=resource_id"`
+	SortOrder  string              `json:"sort_order" form:"sort_order" binding:"omitempty,oneof=ASC DESC asc desc"`
+	Per        int                 `json:"per" form:"per,default=50" binding:"min=1"`
+	Page       int                 `json:"page" form:"page,default=1" binding:"min=1"`
+}
+
+type AcctPriceListFilter struct {
+	HardwareType string `json:"hardware_type" form:"hardware_type"`
+}
+
+type AcctPriceDistinctListReq struct {
+	SkuType    SKUType   `json:"sku_type" form:"sku_type" binding:"required"`
+	SkuKind    SKUKind   `json:"sku_kind" form:"sku_kind"`
+	ResourceID []string  `json:"resource_id" form:"resource_id"`
+	SkuStatus  SkuStatus `json:"sku_status" form:"sku_status"`
+	Per        int       `json:"per" form:"per,default=50" binding:"min=1"`
+	Page       int       `json:"page" form:"page,default=1" binding:"min=1"`
+}
+
+type AcctPriceDistinctItem struct {
+	SkuType    SKUType           `json:"sku_type"`
+	SkuKind    SKUKind           `json:"sku_kind"`
+	ResourceID string            `json:"resource_id"`
+	SkuStatus  SkuStatus         `json:"sku_status"`
+	Details    []AcctPriceDetail `json:"details"`
+}
+
+type AcctPriceGroupKeyReq struct {
+	SkuType    SKUType   `json:"sku_type"`
+	SkuKind    SKUKind   `json:"sku_kind"`
+	ResourceID string    `json:"resource_id"`
+	SkuStatus  SkuStatus `json:"sku_status"`
+}
+
+type AcctPriceDetail struct {
+	Id               int64       `json:"id"`
+	SkuPrice         int64       `json:"sku_price"`
+	SkuUnit          int64       `json:"sku_unit"`
+	SkuDesc          string      `json:"sku_desc"`
+	SkuUnitType      SkuUnitType `json:"sku_unit_type"`
+	SkuPriceCurrency string      `json:"sku_price_currency"`
+	Quota            string      `json:"quota"`
+	SkuPriceID       int64       `json:"sku_price_id"`
+	Discount         float64     `json:"discount"`
+	UseLimitPrice    int64       `json:"use_limit_price"`
+	Resolution       string      `json:"resolution"`
+	CreatedAt        time.Time   `json:"created_at"`
+	SkuCachedPrice   int64       `json:"sku_cached_price"`
+}
+
+type AcctRechargeReq struct {
+	ChannelCode    consts.PaymentChannel `json:"channelCode"`
+	RechargeAmount float64               `json:"rechargeAmount"` //unit yuan
+	OrgName        string                `json:"orgName"`
+}
+
+type AcctRechargeResp struct {
+	Content         string                `json:"content"`
+	RechargeUUID    string                `json:"rechargeUUID"`
+	RechargeOrderNo string                `json:"orderNo"`
+	Channel         consts.PaymentChannel `json:"channel"`
+	CreateTime      time.Time             `json:"createTime"` //2024-11-18 15:50:47
+}
+
+type AcctRechargeItem struct {
+	TargetUUID  string
+	OpUserUUID  string
+	Description string
+	Amount      *money.Money
+	Channel     consts.PaymentChannel
+	OrgName     string
+	UserName    string
+}
+
+type RechargeStatusResp struct {
+	RechargeUUID      string `json:"rechargeUUID"`
+	RechargeSucceeded bool   `json:"rechargeSucceeded"`
+}
+
+type RechargeResp struct {
+	RechargeUUID   string    `json:"uuid"`
+	OrderNo        string    `json:"order_no"`
+	UserUUID       string    `json:"user_uuid"`
+	FromUserUUID   string    `json:"from_user_uuid"`
+	Amount         int64     `json:"amount"`
+	Currency       string    `json:"currency"`
+	PaymentUUID    string    `json:"payment_uuid"`
+	PaymentChannel string    `json:"recharge_payment_type"`
+	Succeeded      bool      `json:"succeeded"`
+	Closed         bool      `json:"closed"`
+	TimeSucceeded  time.Time `json:"time_succeeded"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Description    string    `json:"description"`
+	UserName       string    `json:"user_name"`
+	EntityType     string    `json:"entity_type"`
+	OrgName        string    `json:"org_name"`
+}
+
+const RechargeExtraType = "recharge"
+
+type ComposedBalance struct {
+	Cash  float64 `json:"cash"`
+	Bonus float64 `json:"bonus"`
+}
+
+type UserBalanceResp struct {
+	UserUUID       string          `json:"userUUID"`
+	Balance        float64         `json:"balance"`
+	Composition    ComposedBalance `json:"composition"`
+	LowBalanceWarn float64         `json:"low_balance_warn"`
+	LastWarnAt     time.Time       `json:"low_balance_warnat"`
+	NegativeWarnAt time.Time       `json:"negative_balance_warnat"`
+}
+
+type AcctRechargeListReq struct {
+	TargetUUID  string `json:"target_uuid"`
+	Scene       int    `json:"scene"`
+	ActivityID  int64  `json:"activity_id"`
+	StartTime   string `json:"start_time"`
+	EndTime     string `json:"end_time"`
+	Per         int    `json:"per"`
+	Page        int    `json:"page"`
+	CurrentUser string `json:"-"`
+	OrgName     string `json:"org_name"`
+}
+
+type AcctRecharge struct {
+	ID          int64     `json:"id"`
+	EventUUID   string    `json:"event_uuid"`
+	UserUUID    string    `json:"user_id"`
+	Value       float64   `json:"value"`
+	Scene       int       `json:"scene"`
+	OpUID       string    `json:"op_uid"`
+	CreatedAt   time.Time `json:"created_at"`
+	EventDate   time.Time `json:"event_date"`
+	ActivityID  int64     `json:"activity_id"`
+	OpDesc      string    `json:"op_desc"`
+	Purpose     string    `json:"purpose"`
+	PurposeDesc string    `json:"purpose_desc"`
+}
+
+type NonCashRechargeListResp struct {
+	Data       []NonCashRechargeResp `json:"data"`
+	Total      int                   `json:"total"`
+	TotalValue float64               `json:"total_value"`
+}
+
+type NonCashRechargeResp struct {
+	ID          int64     `json:"id"`
+	EventUUID   string    `json:"event_uuid"`
+	UserUUID    string    `json:"user_id"`
+	Value       float64   `json:"value"`
+	OpUID       string    `json:"op_uid"`
+	CreatedAt   time.Time `json:"created_at"`
+	EventDate   time.Time `json:"event_date"`
+	ActivityID  int64     `json:"activity_id"`
+	OpDesc      string    `json:"op_desc"`
+	OpUserName  string    `json:"op_user_name"`
+	UserName    string    `json:"user_name"`
+	Purpose     string    `json:"purpose"`
+	PurposeDesc string    `json:"purpose_desc"`
+}
+
+type AcctRechargeListResp struct {
+	Data       []AcctRecharge `json:"data"`
+	Total      int            `json:"total"`
+	TotalValue float64        `json:"total_value"`
+}
+
+type RechargesIndexReq struct {
+	UserName    string `json:"user_name"`
+	OrgName     string `json:"org_name"`
+	UserUUID    string `json:"user_uuid"`
+	OrderNo     string `json:"order_no"`
+	StartDate   string `json:"start_date"`
+	EndDate     string `json:"end_date"`
+	Status      string `json:"recharge_status"`
+	PaymentType string `json:"recharge_payment_type"`
+	Per         int    `json:"per"`
+	Page        int    `json:"page"`
+}
+
+type PresentsIndexReq struct {
+	UserUUID  string `json:"user_uuid"`
+	UserName  string `json:"user_name"`
+	StartDate string `json:"start_date"`
+	EndDate   string `json:"end_date"`
+	Per       int    `json:"per"`
+	Page      int    `json:"page"`
+}
+
+type RechargeIndexResp struct {
+	RechargeResp
+	Amount float64 `json:"amount"`
+}
+
+type RechargesIndexResp struct {
+	Data  []*RechargeIndexResp `json:"data"`
+	Total int                  `json:"total"`
+	Sum   int64                `json:"sum"` // Total recharge amount
+}
+
+type WeeklyRechargesReq struct {
+	Emails []string `json:"emails" binding:"required,min=1,dive,email"`
+}
+
+type PresentIndexResp struct {
+	ID              int64                `json:"id"`
+	EventUUID       string               `json:"event_uuid"`
+	UserUUID        string               `json:"user_uuid"`
+	UserName        string               `json:"user_name"`
+	ActivityID      int64                `json:"activity_id"`
+	Value           float64              `json:"value"`
+	OpUID           string               `json:"op_uid"`
+	OpDesc          string               `json:"op_desc"`
+	ParticipantUUID string               `json:"participant_uuid"`
+	ExpireAt        time.Time            `json:"expire_at"`
+	Status          AccountPresentStatus `json:"status"`
+	CreatedAt       time.Time            `json:"created_at"`
+}
+
+type PresentsIndexResp struct {
+	Data  []*PresentIndexResp `json:"data"`
+	Total int                 `json:"total"`
+	Sum   int64               `json:"sum"` // Total present amount
+}
+
+type SetLowBalanceWarnReq struct {
+	LowBalanceWarn float64 `json:"low_balance_warn" binding:"required,gt=0"`
+	UserUUID       string  `json:"user_uuid"`
+}
+
+type AccInvoiceTitleReq struct {
+	TargetUUID  string `json:"-"` // target user or org uuid
+	CurrentUser string `json:"-"` // current user for permission check
+	UserUUID    string `json:"-"`
+	UserName    string `json:"-"`
+
+	Title        string `json:"title" binding:"required"`      // Invoice title name
+	TitleType    string `json:"title_type" binding:"required"` // Invoice title type
+	InvoiceType  string `json:"invoice_type" binding:"required"`
+	TaxID        string `json:"tax_id" binding:"required"`        // Taxpayer identification number
+	Address      string `json:"address"`                          // Registered address
+	BankName     string `json:"bank_name"`                        // Bank name
+	BankAccount  string `json:"bank_account"`                     // Bank account number
+	ContactPhone string `json:"contact_phone" binding:"required"` // Contact phone number
+	Email        string `json:"email" binding:"required,email"`   // Email address
+	IsDefault    bool   `json:"is_default"`
+}
+
+type AccInvoiceTitleResp struct {
+	ID           int64     `json:"id"`
+	UserUUID     string    `json:"user_uuid"` // User
+	UserName     string    `json:"user_name"`
+	Title        string    `json:"title"`         // Invoice title name
+	TitleType    string    `json:"title_type"`    // Invoice title type
+	TaxID        string    `json:"tax_id"`        // Taxpayer identification number
+	Address      string    `json:"address"`       // Registered address
+	BankName     string    `json:"bank_name"`     // Bank name
+	BankAccount  string    `json:"bank_account"`  // Bank account number
+	ContactPhone string    `json:"contact_phone"` // Contact phone number
+	Email        string    `json:"email"`         // Email address
+	IsDefault    bool      `json:"is_default"`    // Whether it is the default title
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type AccInvoiceTitleListReq struct {
+	TargetUUID  string `json:"-"`
+	CurrentUser string `json:"-"` // current user for permission check
+	UserUUID    string `json:"-"`
+
+	Page     int    `json:"page" binding:"min=1"`              // Current page number
+	PageSize int    `json:"page_size" binding:"min=1,max=100"` // Number of items per page
+	Search   string `json:"search"`                            // Search field
+}
+
+type AccInvoiceTitleListResp struct {
+	Data  []AccInvoiceTitleResp `json:"data"`
+	Total int                   `json:"total"`
+}
+
+type AccInvoiceListReq struct {
+	TargetUUID  string `json:"-"`
+	CurrentUser string `json:"-"` // current user for permission check
+
+	Page     int    `json:"page" binding:"min=1"`              // Current page number
+	PageSize int    `json:"page_size" binding:"min=1,max=100"` // Number of items per page
+	Search   string `json:"search"`                            // Search field
+
+	Status string `json:"status"` // Invoice status eq processing,issued,failed
+}
+
+type AccInvoiceListResp struct {
+	Data  []AccInvoiceResp `json:"data"`
+	Total int              `json:"total"`
+}
+
+type AccInvoiceResp struct {
+	ID             int       `json:"id"`
+	UserUUID       string    `json:"user_uuid"`
+	UserName       string    `json:"user_name"`       // User name
+	TitleType      string    `json:"title_type"`      // Invoice title type
+	InvoiceType    string    `json:"invoice_type"`    // Invoice type
+	BillCycle      string    `json:"bill_cycle"`      // Billing cycle
+	InvoiceTitle   string    `json:"invoice_title"`   // Invoice title
+	ApplyTime      time.Time `json:"apply_time"`      // Invoice application time
+	InvoiceAmount  float64   `json:"invoice_amount"`  // Invoice amount
+	Status         string    `json:"status"`          // Invoice status eq processing,issued,failed
+	Reason         string    `json:"reason"`          // Reason
+	InvoiceDate    time.Time `json:"invoice_date"`    // Invoice issuance date
+	InvoiceURL     string    `json:"invoice_url"`     // Invoice URL
+	TaxpayerID     string    `json:"taxpayer_id"`     // Taxpayer identification number
+	BankName       string    `json:"bank_name"`       // Bank name
+	BankAccount    string    `json:"bank_account"`    // Bank account number
+	RegisteredAddr string    `json:"registered_addr"` // Registered address
+	ContactPhone   string    `json:"contact_phone"`   // Contact phone number
+	Email          string    `json:"email"`           // Email address
+	CreatedAt      time.Time `json:"created_at"`      // Creation time
+	UpdatedAt      time.Time `json:"updated_at"`      // Update time
+
+	// Recharge orders invoiced together. Empty for legacy bill-cycle invoices
+	// (bill_cycle is non-empty there) and populated for recharge-based invoices.
+	RechargeOrders []AccInvoiceRechargeOrder `json:"recharge_orders"`
+}
+
+type AccInvoiceDashboardResp struct {
+	CurrentMonthNonInvoicable float64 `json:"current_month_non_invoicable"`
+	InvoicedAmount            float64 `json:"invoiced_amount"`
+	UninvoicedAmount          float64 `json:"uninvoiced_amount"`
+}
+
+type AccInvoiceDashboardReq struct {
+	TargetUUID  string `json:"-"`
+	CurrentUser string `json:"-"` // current user for permission check
+
+	StartMonth string `json:"start_month" binding:"required"`
+	EndMonth   string `json:"end_month" binding:"required"`
+}
+
+type AccInvoiceCreateReq struct {
+	TargetUUID       string   `json:"-"`
+	CurrentUser      string   `json:"-"` // current user for permission check
+	TitleID          int64    `json:"title_id" binding:"required"`
+	RechargeOrderNos []string `json:"recharge_order_nos" binding:"required,min=1"`
+}
+
+type AccInvoicableReq struct {
+	TargetUUID  string `json:"-"`
+	CurrentUser string `json:"-"`                                 // current user for permission check
+	Page        int    `json:"page" binding:"min=1"`              // Current page number
+	PageSize    int    `json:"page_size" binding:"min=1,max=100"` // Number of items per page
+	StartMonth  string `json:"start_month"`
+	EndMonth    string `json:"end_month"`
+}
+type AccInvoicableResp struct {
+	Data  []AccInvoicable `json:"data"`
+	Total int             `json:"total"`
+}
+
+type AccInvoicable struct {
+	OrderNo      string    `json:"order_no"`
+	RechargeTime time.Time `json:"recharge_time"`
+	Amount       float64   `json:"amount"` // Actual paid amount in yuan
+}
+
+// AccInvoiceRechargeOrder is a recharge order included in an invoice.
+type AccInvoiceRechargeOrder struct {
+	OrderNo      string    `json:"order_no"`
+	RechargeTime time.Time `json:"recharge_time"`
+	PaymentType  string    `json:"payment_type"`
+	Amount       float64   `json:"amount"` // Actual paid amount in yuan
+}
+
+type AdminUpdateInvoiceReq struct {
+	ID         int64  `json:"-"`
+	Status     string `json:"status" binding:"required"` //Invoice status eq processing,issued,failed
+	Reason     string `json:"reason"`
+	InvoiceURL string `json:"invoice_url"`
+}
+
+type RechargeStats struct {
+	Count int   `bun:"count"`
+	Sum   int64 `bun:"sum"`
+}
+
+type AccountPresentStatus int
+
+const (
+	AccountPresentStatusInit     AccountPresentStatus = 0
+	AccountPresentStatusUsed     AccountPresentStatus = 1
+	AccountPresentStatusCanceled AccountPresentStatus = 2
+)
+
+type AcctPriceOffLineReq struct {
+	CurrentUser string  `json:"-"`
+	SkuType     SKUType `json:"sku_type" binding:"required"`
+	ResourceID  string  `json:"resource_id" binding:"required"`
+}
+
+type SyncDeductReq struct {
+	CurrentUser  string    `json:"-"`
+	EventUUID    uuid.UUID `json:"-"`
+	TargetUUID   string    `json:"-"`
+	Value        float64   `json:"value" binding:"required,lt=0"`
+	Scene        SceneType `json:"scene" binding:"required"`
+	ResourceID   string    `json:"resource_id"`
+	ResourceName string    `json:"resource_name"`
+	CustomerID   string    `json:"customer_id" binding:"required"`
+}
+
+type SyncDeductResp struct {
+	EventUUID  uuid.UUID `json:"event_uuid"`
+	TargetUUID string    `json:"target_uuid"`
+	Value      float64   `json:"value"`
+	Scene      SceneType `json:"scene"`
+	CustomerID string    `json:"customer_id"`
+}
+
+type DeductionSummary struct {
+	UserUUID   string    `json:"user_uuid"`
+	Scene      SceneType `json:"scene"`
+	CustomerID string    `json:"customer_id"`
+	TotalValue float64   `json:"total_value"`
+	EventUUID  uuid.UUID `json:"event_uuid"`
+}
+
+type AcctStatementExtra struct {
+	CheckBalance bool
+}

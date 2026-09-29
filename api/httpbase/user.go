@@ -1,0 +1,119 @@
+package httpbase
+
+import (
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	CurrentUserCtxVar         = "currentUser"
+	CurrentUserUUIDCtxVar     = "currentUserUUID"
+	CurrentNamespaceUUIDVar   = "currentNamespaceUUID"
+	AccessTokenCtxVar         = "accessToken"
+	AuthTypeCtxVar            = "authType"
+	CurrentUserQueryVar       = "current_user"
+	CurrentUserUUIDQueryVar   = "current_user_uuid"
+	HeaderLanguageKey         = "Accept-Language"
+	AccessTokenNameCtxVar     = "accessTokenName"
+	IPctxVar                  = "ip_address"
+	APIKeyModelScopeCtxVar    = "ApiKeyModelScope"
+	APIKeyPriorityScopeCtxVar = "ApiKeyPriorityScope"
+	AccessTokenIDCtxVar       = "accessTokenID"
+)
+
+type AuthType string
+
+const (
+	AuthTypeSystemApiKey   AuthType = "ApiKey"
+	AuthTypeJwt            AuthType = "JWT"
+	AuthTypeAccessToken    AuthType = "AccessToken"
+	AuthTypeMultiSyncToken AuthType = "MultiSyncToken"
+	AuthTypeUserOrgApiKey  AuthType = "UserOrgApiKey"
+	AuthTypeGitAccessToken AuthType = "GitAccessToken"
+)
+
+// GetCurrentUser returns the current user name from the context.
+//
+// user name could be previously set by parsing query string or jwt token
+func GetCurrentUser(ctx *gin.Context) string {
+	return ctx.GetString(CurrentUserCtxVar)
+}
+
+func SetCurrentUser(ctx *gin.Context, user string) {
+	ctx.Set(CurrentUserCtxVar, user)
+}
+
+func GetAccessToken(ctx *gin.Context) string {
+	return ctx.GetString(AccessTokenCtxVar)
+}
+
+func SetAccessToken(ctx *gin.Context, user string) {
+	ctx.Set(AccessTokenCtxVar, user)
+}
+
+func GetAuthType(ctx *gin.Context) AuthType {
+	return AuthType(ctx.GetString(AuthTypeCtxVar))
+}
+
+func SetAuthType(ctx *gin.Context, t AuthType) {
+	ctx.Set(AuthTypeCtxVar, string(t))
+}
+
+func GetCurrentUserUUID(ctx *gin.Context) string {
+	return ctx.GetString(CurrentUserUUIDCtxVar)
+}
+
+func SetCurrentUserUUID(ctx *gin.Context, userUUID string) {
+	ctx.Set(CurrentUserUUIDCtxVar, userUUID)
+}
+
+func GetCurrentNamespaceUUID(ctx *gin.Context) string {
+	return ctx.GetString(CurrentNamespaceUUIDVar)
+}
+
+func SetCurrentNamespaceUUID(ctx *gin.Context, namespaceUUID string) {
+	ctx.Set(CurrentNamespaceUUIDVar, namespaceUUID)
+}
+
+func GetCurrentUserLanguage(ctx *gin.Context) string {
+	return ctx.GetHeader(HeaderLanguageKey)
+}
+
+func GetCurrentTokenName(ctx *gin.Context) string {
+	return ctx.GetString(AccessTokenNameCtxVar)
+}
+
+func SetCurrentTokenName(ctx *gin.Context, name string) {
+	ctx.Set(AccessTokenNameCtxVar, name)
+}
+
+func SetIPAddress(ctx *gin.Context, ip string) {
+	ctx.Set(IPctxVar, ip)
+}
+
+func GetIPAddress(ctx *gin.Context) string {
+	return ctx.GetString(IPctxVar)
+}
+
+func SetAPIKeyModelScope(ctx *gin.Context, scope string) {
+	ctx.Set(APIKeyModelScopeCtxVar, scope)
+}
+
+func GetAPIKeyModelScope(ctx *gin.Context) string {
+	return ctx.GetString(APIKeyModelScopeCtxVar)
+}
+
+func SetAPIKeyPriorityScope(ctx *gin.Context, scope string) {
+	ctx.Set(APIKeyPriorityScopeCtxVar, scope)
+}
+
+func GetAPIKeyPriorityScope(ctx *gin.Context) string {
+	return ctx.GetString(APIKeyPriorityScopeCtxVar)
+}
+
+func GetCurrentTokenID(ctx *gin.Context) int64 {
+	return ctx.GetInt64(AccessTokenIDCtxVar)
+}
+
+func SetCurrentTokenID(ctx *gin.Context, id int64) {
+	ctx.Set(AccessTokenIDCtxVar, id)
+}

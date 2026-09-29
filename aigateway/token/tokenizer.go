@@ -1,0 +1,81 @@
+package token
+
+import (
+	"errors"
+	"strings"
+
+	"opencsg.com/csghub-server/aigateway/types"
+)
+
+// unsupported tokenizer error
+var errUnsupportedTokenizer = errors.New("unsupported tokenizer")
+
+// use Message, compatible with text and images
+type Tokenizer interface {
+	Encode(types.Message) (int64, error)
+	EmbeddingEncode(string) (int64, error)
+}
+
+func NewTokenizerImpl(endpoint, host, model, imageID, provider string) Tokenizer {
+	// Internal models: use imageID to determine the inference engine
+	switch {
+	case strings.Contains(imageID, "vllm-local"):
+		return newVllmTokenizerImpl(endpoint, host, model)
+	case strings.Contains(imageID, "llama.cpp"):
+		return newLlamacppTokenizerImpl(endpoint, host, model)
+	case strings.Contains(imageID, "tgi"):
+		return newTGITokenizerImpl(endpoint, host, model)
+	case strings.Contains(imageID, "sglang"):
+		return newSGLangTokenizerImpl(endpoint, host, model)
+	case strings.Contains(imageID, "tei"):
+		return newTEITokenizerImpl(endpoint, host, model)
+	}
+
+	// External models: when stream is interrupted (sensitive content), use provider-specific tokenizer to count tokens:
+	// 1. Usage chunk never arrives
+	// 2. Accumulate content from all chunks
+	// 3. Use provider-specific tokenizer to count
+	if provider != "" {
+		switch {
+		case strings.Contains(model, "gpt"), strings.Contains(model, "deepseek"): // PBE based tokenizer
+			return newTiktokenTokenizerImpl()
+		}
+		// TODO: add gemini tokenizer later, SentencePiece based tokenizer is not supported yet
+	}
+
+	return nil
+}
+
+var _ Tokenizer = (*DumyTokenizer)(nil)
+
+// dumyy tokenizer for testing only
+type DumyTokenizer struct{}
+
+// Encode implements Tokenizer.
+func (d *DumyTokenizer) Encode(s types.Message) (int64, error) {
+	return int64(len(s.Content.(string))), nil
+}
+
+func (d *DumyTokenizer) EmbeddingEncode(content string) (int64, error) {
+	return int64(len(content)), nil
+}
+
+func parseTextMessage(message types.Message) string {
+	// prompt
+	if message.Role != "" {
+		if message.Content != "" {
+			// prompt content
+			return "<|im_start|>" + message.Role + "\n" + message.Content.(string) + "<|im_end|>\n"
+		} else {
+			// prompt end, before response
+			return "<|im_start|>" + message.Role + "\n"
+		}
+	} else {
+		// response completion
+		if message.Content != "" {
+			return message.Content.(string) + "<|im_end|>"
+		} else {
+			return ""
+		}
+	}
+}

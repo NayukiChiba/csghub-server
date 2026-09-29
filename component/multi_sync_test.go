@@ -1,0 +1,328 @@
+package component
+
+import (
+	"context"
+	"database/sql"
+	"testing"
+
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	multisync_mock "opencsg.com/csghub-server/_mocks/opencsg.com/csghub-server/builder/multisync"
+	mockrebac "opencsg.com/csghub-server/_mocks/opencsg.com/csghub-server/builder/rebac"
+	"opencsg.com/csghub-server/builder/rebac"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/types"
+)
+
+func TestMultiSyncComponent_More(t *testing.T) {
+	ctx := context.TODO()
+	mc := initializeTestMultiSyncComponent(ctx, t)
+
+	mc.mocks.stores.MultiSyncMock().EXPECT().GetAfter(ctx, int64(1), int64(10)).Return(
+		[]database.SyncVersion{{Version: 2}}, nil,
+	)
+
+	data, err := mc.More(ctx, 1, 10)
+	require.Nil(t, err)
+	require.Equal(t, []types.SyncVersion{
+		{Version: 2},
+	}, data)
+}
+
+func TestMultiSyncComponent_SyncAsClient(t *testing.T) {
+	ctx := mock.Anything
+	mc := initializeTestMultiSyncComponent(context.TODO(), t)
+	authorizer := mc.rebac.(*mockrebac.MockAuthorizer)
+	authorizer.EXPECT().Check(mock.Anything, mock.Anything).Return(rebac.Decision{Allowed: false}, nil).Times(5)
+	var userObjectOwnerTupleWritten bool
+	authorizer.EXPECT().Write(mock.Anything, mock.Anything).Run(func(_ context.Context, relationships []rebac.Relationship) {
+		for _, relationship := range relationships {
+			if relationship.Subject == rebac.UserSubject("sync-user-uuid") &&
+				relationship.Relation == rebac.RelationOwner &&
+				relationship.Object == rebac.UserObject("sync-user-uuid") {
+				userObjectOwnerTupleWritten = true
+			}
+		}
+	}).Return(nil).Times(5)
+	mc.mocks.stores.MultiSyncMock().EXPECT().GetLatest(ctx).Return(database.SyncVersion{
+		Version: 1,
+	}, nil)
+	mockedClient := multisync_mock.NewMockClient(t)
+	mockedClient.EXPECT().Latest(ctx, int64(1)).Return(types.SyncVersionResponse{
+		Data: struct {
+			Versions []types.SyncVersion "json:\"versions\""
+			HasMore  bool                "json:\"has_more\""
+		}{
+			Versions: []types.SyncVersion{
+				{Version: 2, RepoPath: " team/repo "},
+			},
+			HasMore: true,
+		},
+	}, nil)
+	mockedClient.EXPECT().Latest(ctx, int64(2)).Return(types.SyncVersionResponse{
+		Data: struct {
+			Versions []types.SyncVersion "json:\"versions\""
+			HasMore  bool                "json:\"has_more\""
+		}{
+			Versions: []types.SyncVersion{
+				{Version: 3},
+			},
+			HasMore: true,
+		},
+	}, nil)
+	mockedClient.EXPECT().Latest(ctx, int64(3)).Return(types.SyncVersionResponse{
+		Data: struct {
+			Versions []types.SyncVersion "json:\"versions\""
+			HasMore  bool                "json:\"has_more\""
+		}{
+			Versions: []types.SyncVersion{
+				{Version: 4},
+			},
+			HasMore: false,
+		},
+	}, nil)
+	mc.mocks.stores.SyncVersionMock().EXPECT().Create(ctx, &database.SyncVersion{
+		Version:  2,
+		RepoPath: "team/repo",
+	}).Return(nil)
+	mc.mocks.stores.SyncVersionMock().EXPECT().Create(ctx, &database.SyncVersion{
+		Version: 3,
+	}).Return(nil)
+	mc.mocks.stores.SyncVersionMock().EXPECT().Create(ctx, &database.SyncVersion{
+		Version: 4,
+	}).Return(nil)
+	dsvs := []database.SyncVersion{
+		{RepoType: types.ModelRepo, Version: 2},
+		{RepoType: types.DatasetRepo, Version: 3},
+		{RepoType: types.SkillRepo, Version: 4},
+	}
+	mc.mocks.stores.MultiSyncMock().EXPECT().GetNotCompletedDistinct(ctx).Return(
+		dsvs, nil,
+	)
+
+	svs := []types.SyncVersion{
+		{RepoType: types.ModelRepo, Version: 2},
+		{RepoType: types.DatasetRepo, Version: 3},
+		{RepoType: types.SkillRepo, Version: 4},
+	}
+	// new model mock
+	mockedClient.EXPECT().ModelInfo(ctx, svs[0]).Return(&types.Model{
+		User: &types.User{Nickname: "nn"},
+		Path: "Ns/User",
+		Tags: []types.RepoTag{{Name: "t1"}},
+		Scores: []types.WeightScore{{
+			WeightName: string(database.RecomWeightOp),
+			Score:      40,
+		}, {
+			WeightName: string(database.RecomWeightQuality),
+			Score:      50,
+		}, {
+			WeightName: string(database.RecomWeightDownloads),
+			Score:      60,
+		}, {
+			WeightName: string(database.RecomWeightFreshness),
+			Score:      70,
+		}, {
+			WeightName: string(database.RecomWeightTotal),
+			Score:      100,
+		}},
+	}, nil)
+	mockedClient.EXPECT().ReadMeData(ctx, svs[0]).Return("readme", nil)
+	mc.mocks.stores.UserMock().EXPECT().FindByUsername(ctx, "csg_ns").Return(database.User{}, sql.ErrNoRows).Once()
+	mc.mocks.stores.UserMock().EXPECT().Create(ctx, mock.Anything, mock.Anything).RunAndReturn(
+		func(ctx context.Context, u *database.User, n *database.Namespace) error {
+			require.Equal(t, u.NickName, "csg_ns")
+			require.Equal(t, u.Username, "csg_ns")
+			require.Equal(t, u.Email, "3073880722f93f34064c9adea9cbeea2")
+			require.Equal(t, n.Path, "csg_ns")
+			require.Equal(t, n.Mirrored, true)
+			u.ID = 1
+			u.UUID = "sync-user-uuid"
+			return nil
+		},
+	)
+	mc.mocks.stores.UserMock().EXPECT().FindByUsername(ctx, "csg_ns").Return(database.User{
+		ID: 1, Username: "csg_ns", UUID: "sync-user-uuid",
+	}, nil).Twice()
+	dbrepo := &database.Repository{
+		UserID:         1,
+		Path:           "csg_ns/user",
+		GitPath:        "models_csg_ns/user",
+		Name:           "user",
+		Readme:         "readme",
+		Source:         types.OpenCSGSource,
+		SyncStatus:     types.SyncStatusPending,
+		RepositoryType: types.ModelRepo,
+		Hashed:         true,
+	}
+	mc.mocks.stores.RepoMock().EXPECT().UpdateOrCreateRepo(ctx, *dbrepo).Return(dbrepo, nil)
+	dbrepo.ID = 1
+	mc.mocks.stores.TagMock().EXPECT().FindOrCreate(ctx, database.Tag{
+		Name: "t1", Scope: types.ModelTagScope,
+	}).Return(
+		&database.Tag{Name: "t1", ID: 11}, nil,
+	)
+	mc.mocks.stores.RepoMock().EXPECT().DeleteAllTags(ctx, int64(1)).Return(nil)
+	mc.mocks.stores.RepoMock().EXPECT().BatchCreateRepoTags(ctx, []database.RepositoryTag{
+		{RepositoryID: 1, TagID: 11},
+	}).Return(nil)
+	mc.mocks.stores.RepoMock().EXPECT().DeleteAllFiles(ctx, int64(1)).Return(nil)
+	mockedClient.EXPECT().FileList(ctx, svs[0]).Return([]types.File{
+		{Name: "foo.go"},
+	}, nil)
+	mc.mocks.stores.FileMock().EXPECT().BatchCreate(ctx, []database.File{
+		{Name: "foo.go", ParentPath: "/", RepositoryID: 1},
+	}).Return(nil)
+	mc.mocks.stores.ModelMock().EXPECT().CreateIfNotExist(ctx, database.Model{
+		RepositoryID: 1,
+		Repository:   dbrepo,
+	}).Return(nil, nil)
+	mc.mocks.stores.MetadataMock().EXPECT().Upsert(ctx, &database.Metadata{
+		RepositoryID: 1,
+	}).Return(nil)
+	mc.mocks.stores.RecomMock().EXPECT().UpsertScore(ctx, []*database.RecomRepoScore{
+		{RepositoryID: 1, WeightName: database.RecomWeightOp, Score: 40},
+		{RepositoryID: 1, WeightName: database.RecomWeightQuality, Score: 50},
+		{RepositoryID: 1, WeightName: database.RecomWeightDownloads, Score: 60},
+		{RepositoryID: 1, WeightName: database.RecomWeightFreshness, Score: 70},
+		{RepositoryID: 1, WeightName: database.RecomWeightTotal, Score: 100},
+	}).Return(nil)
+
+	// new dataset mock
+	dbrepo = &database.Repository{
+		UserID:         1,
+		Path:           "csg_ns/user",
+		GitPath:        "datasets_csg_ns/user",
+		Name:           "user",
+		Readme:         "readme",
+		Source:         types.OpenCSGSource,
+		SyncStatus:     types.SyncStatusPending,
+		RepositoryType: types.DatasetRepo,
+		Hashed:         true,
+	}
+	mockedClient.EXPECT().DatasetInfo(ctx, svs[1]).Return(&types.Dataset{
+		User: types.User{Nickname: "nn"},
+		Path: "Ns/User",
+		Tags: []types.RepoTag{{Name: "t2"}},
+		Scores: []types.WeightScore{{
+			WeightName: string(database.RecomWeightOp),
+			Score:      40,
+		}, {
+			WeightName: string(database.RecomWeightQuality),
+			Score:      50,
+		}, {
+			WeightName: string(database.RecomWeightDownloads),
+			Score:      60,
+		}, {
+			WeightName: string(database.RecomWeightFreshness),
+			Score:      70,
+		}, {
+			WeightName: string(database.RecomWeightTotal),
+			Score:      100,
+		}},
+	}, nil)
+	mockedClient.EXPECT().ReadMeData(ctx, svs[1]).Return("readme", nil)
+	mc.mocks.stores.RepoMock().EXPECT().UpdateOrCreateRepo(ctx, *dbrepo).Return(dbrepo, nil)
+	dbrepo.ID = 2
+	mc.mocks.stores.TagMock().EXPECT().FindOrCreate(ctx, database.Tag{
+		Name: "t2", Scope: types.DatasetTagScope,
+	}).Return(
+		&database.Tag{Name: "t2", ID: 12}, nil,
+	)
+	mc.mocks.stores.RepoMock().EXPECT().DeleteAllTags(ctx, int64(2)).Return(nil)
+	mc.mocks.stores.RepoMock().EXPECT().BatchCreateRepoTags(ctx, []database.RepositoryTag{
+		{RepositoryID: 2, TagID: 12},
+	}).Return(nil)
+	mc.mocks.stores.RepoMock().EXPECT().DeleteAllFiles(ctx, int64(2)).Return(nil)
+	mockedClient.EXPECT().FileList(ctx, svs[1]).Return([]types.File{
+		{Name: "foo.go"},
+	}, nil)
+	mc.mocks.stores.FileMock().EXPECT().BatchCreate(ctx, []database.File{
+		{Name: "foo.go", ParentPath: "/", RepositoryID: 2},
+	}).Return(nil)
+	mc.mocks.stores.DatasetMock().EXPECT().CreateIfNotExist(ctx, database.Dataset{
+		RepositoryID: 2,
+		Repository:   dbrepo,
+	}).Return(nil, nil)
+	mc.mocks.stores.RecomMock().EXPECT().UpsertScore(ctx, []*database.RecomRepoScore{
+		{RepositoryID: 2, WeightName: database.RecomWeightOp, Score: 40},
+		{RepositoryID: 2, WeightName: database.RecomWeightQuality, Score: 50},
+		{RepositoryID: 2, WeightName: database.RecomWeightDownloads, Score: 60},
+		{RepositoryID: 2, WeightName: database.RecomWeightFreshness, Score: 70},
+		{RepositoryID: 2, WeightName: database.RecomWeightTotal, Score: 100},
+	}).Return(nil)
+
+	// new skill mock
+	dbrepo = &database.Repository{
+		UserID:         1,
+		Path:           "csg_ns/user",
+		GitPath:        "skills_csg_ns/user",
+		Name:           "user",
+		Readme:         "readme",
+		Source:         types.OpenCSGSource,
+		SyncStatus:     types.SyncStatusPending,
+		RepositoryType: types.SkillRepo,
+		Hashed:         true,
+	}
+	mockedClient.EXPECT().SkillInfo(ctx, svs[2]).Return(&types.Skill{
+		User: types.User{Nickname: "nn"},
+		Path: "Ns/User",
+		Tags: []types.RepoTag{{Name: "t3"}},
+		Scores: []types.WeightScore{{
+			WeightName: string(database.RecomWeightOp),
+			Score:      40,
+		}, {
+			WeightName: string(database.RecomWeightQuality),
+			Score:      50,
+		}, {
+			WeightName: string(database.RecomWeightDownloads),
+			Score:      60,
+		}, {
+			WeightName: string(database.RecomWeightFreshness),
+			Score:      70,
+		}, {
+			WeightName: string(database.RecomWeightTotal),
+			Score:      100,
+		}},
+	}, nil)
+	mockedClient.EXPECT().ReadMeData(ctx, svs[2]).Return("readme", nil)
+	mc.mocks.stores.RepoMock().EXPECT().UpdateOrCreateRepo(ctx, *dbrepo).Return(dbrepo, nil)
+	dbrepo.ID = 3
+	mc.mocks.stores.TagMock().EXPECT().FindOrCreate(ctx, database.Tag{
+		Name: "t3", Scope: types.SkillTagScope,
+	}).Return(
+		&database.Tag{Name: "t3", ID: 13}, nil,
+	)
+	mc.mocks.stores.RepoMock().EXPECT().DeleteAllTags(ctx, int64(3)).Return(nil)
+	mc.mocks.stores.RepoMock().EXPECT().BatchCreateRepoTags(ctx, []database.RepositoryTag{
+		{RepositoryID: 3, TagID: 13},
+	}).Return(nil)
+	mc.mocks.stores.RepoMock().EXPECT().DeleteAllFiles(ctx, int64(3)).Return(nil)
+	mockedClient.EXPECT().FileList(ctx, svs[2]).Return([]types.File{
+		{Name: "foo.go"},
+	}, nil)
+	mc.mocks.stores.FileMock().EXPECT().BatchCreate(ctx, []database.File{
+		{Name: "foo.go", ParentPath: "/", RepositoryID: 3},
+	}).Return(nil)
+	mc.mocks.stores.SkillMock().EXPECT().CreateIfNotExist(ctx, database.Skill{
+		RepositoryID: 3,
+		Repository:   dbrepo,
+	}).Return(nil, nil)
+	mc.mocks.stores.RecomMock().EXPECT().UpsertScore(ctx, []*database.RecomRepoScore{
+		{RepositoryID: 3, WeightName: database.RecomWeightOp, Score: 40},
+		{RepositoryID: 3, WeightName: database.RecomWeightQuality, Score: 50},
+		{RepositoryID: 3, WeightName: database.RecomWeightDownloads, Score: 60},
+		{RepositoryID: 3, WeightName: database.RecomWeightFreshness, Score: 70},
+		{RepositoryID: 3, WeightName: database.RecomWeightTotal, Score: 100},
+	}).Return(nil)
+
+	// Expect syncVersionStore.Complete to be called for each successful sync version
+	mc.mocks.stores.SyncVersionMock().EXPECT().Complete(ctx, dsvs[0]).Return(nil)
+	mc.mocks.stores.SyncVersionMock().EXPECT().Complete(ctx, dsvs[1]).Return(nil)
+	mc.mocks.stores.SyncVersionMock().EXPECT().Complete(ctx, dsvs[2]).Return(nil)
+
+	err := mc.SyncAsClient(context.TODO(), mockedClient)
+	require.Nil(t, err)
+	require.True(t, userObjectOwnerTupleWritten)
+
+}

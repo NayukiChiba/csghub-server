@@ -1,0 +1,1096 @@
+package activity
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/log"
+	"opencsg.com/csghub-server/builder/deploy/common"
+	"opencsg.com/csghub-server/builder/deploy/imagebuilder"
+	"opencsg.com/csghub-server/builder/deploy/imagerunner"
+	"opencsg.com/csghub-server/builder/git/gitserver"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/types"
+	utilcommon "opencsg.com/csghub-server/common/utils/common"
+	"opencsg.com/csghub-server/component/reporter"
+)
+
+const (
+	TaskTypeBuild  = 0
+	TaskTypeDeploy = 1
+)
+
+const (
+	DeployStatusPending      = common.TaskStatusDeployPending
+	DeployStatusDeploying    = common.TaskStatusDeploying
+	DeployStatusFailed       = common.TaskStatusDeployFailed
+	DeployStatusStartUp      = common.TaskStatusDeployStartUp
+	DeployStatusRunning      = common.TaskStatusDeployRunning
+	DeployStatusRunTimeError = common.TaskStatusDeployRunTimeError
+)
+
+type DeployActivity struct {
+	cfg common.DeployConfig
+	lr  reporter.LogCollector
+	ib  imagebuilder.Builder
+	ir  imagerunner.Runner
+	gs  gitserver.GitServer
+
+	ds  database.DeployTaskStore
+	ts  database.AccessTokenStore
+	ss  database.SpaceStore
+	ms  database.ModelStore
+	rfs database.RuntimeFrameworksStore
+	urs database.UserResourcesStore
+	mds database.MetadataStore
+	cls database.ClusterInfoStore
+}
+
+func NewDeployActivity(
+	cfg common.DeployConfig,
+	lr reporter.LogCollector,
+	ib imagebuilder.Builder,
+	ir imagerunner.Runner,
+	gs gitserver.GitServer,
+	ds database.DeployTaskStore,
+	ts database.AccessTokenStore,
+	ss database.SpaceStore,
+	ms database.ModelStore,
+	rfs database.RuntimeFrameworksStore,
+	urs database.UserResourcesStore,
+	mds database.MetadataStore,
+	cls database.ClusterInfoStore,
+) *DeployActivity {
+	return &DeployActivity{
+		cfg: cfg,
+		lr:  lr,
+		ib:  ib,
+		ir:  ir,
+		gs:  gs,
+		ds:  ds,
+		ts:  ts,
+		ss:  ss,
+		ms:  ms,
+		rfs: rfs,
+		urs: urs,
+		mds: mds,
+		cls: cls,
+	}
+}
+
+func (a *DeployActivity) Deploy(ctx context.Context, taskId int64) error {
+	task, err := a.ds.GetDeployTask(ctx, taskId)
+	if err != nil {
+		return fmt.Errorf("failed to get deploy task %d in Deploy activity error: %w", taskId, err)
+	}
+	a.reportLog(types.DeployInProgress.String(), types.StepDeploying, task)
+
+	// Sandboxes skip the build phase (image already exists) and repo lookup; they create the
+	// sandbox directly via the runner. deploySandboxV2 is implemented for ee/saas and returns
+	// "not supported" in CE.
+	if types.IsSandboxType(task.Deploy.Type) {
+		return a.deploySandboxV2(ctx, task)
+	}
+
+	repoInfo, err := a.getRepositoryInfo(ctx, task)
+	if err != nil {
+		if herr := a.handleRepoInfoError(ctx, task, err); herr != nil {
+			return herr
+		}
+		return fmt.Errorf("deploy failed because of get repository info: %w", err)
+	}
+
+	deployRequest, err := a.createDeployRequest(ctx, task, repoInfo)
+	if err != nil {
+		return fmt.Errorf("failed to create deploy task id %d request: %w", task.ID, err)
+	}
+
+	if deployRequest.ImageID == "" {
+		return fmt.Errorf("failed to deploy task id %d: image id is empty", task.ID)
+	}
+
+	if deployRequest.OrderDetailID != 0 {
+		if err = a.updateUserResourceDeployID(ctx, deployRequest); err != nil {
+			return err
+		}
+	}
+
+	updatedTask, err := a.ds.GetDeployTask(ctx, task.ID)
+	if err != nil {
+		return fmt.Errorf("failed to get deploy by task id %d error: %w", task.ID, err)
+	}
+
+	if updatedTask.Status == common.Pending {
+		runResponse, err := a.ir.Run(ctx, deployRequest)
+		if err != nil {
+			a.reportLog(types.DeployFailed.String()+": \n"+err.Error(), types.StepDeploying, task)
+			if herr := a.handleDeployError(task, err); herr != nil {
+				return herr
+			}
+			return fmt.Errorf("failed to call image runner by deploy task id %d error: %w", task.ID, err)
+		}
+		serviceName := runResponse.Message
+		if err := a.updateDeployTaskStatus(task, serviceName); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (a *DeployActivity) Build(ctx context.Context, taskId int64) error {
+	task, err := a.ds.GetDeployTask(ctx, taskId)
+	if err != nil {
+		return fmt.Errorf("failed to get build task %d error: %w", taskId, err)
+	}
+	if task.Status == common.TaskStatusBuildSkip {
+		return nil
+	}
+	repoInfo, err := a.getRepositoryInfo(ctx, task)
+	if err != nil {
+		if herr := a.handleRepoInfoError(ctx, task, err); herr != nil {
+			return herr
+		}
+		return fmt.Errorf("failed to get repository info for build task %d error: %w", taskId, err)
+	}
+
+	buildRequest, err := a.createBuildRequest(ctx, task, repoInfo)
+	if err != nil {
+		return fmt.Errorf("failed to create build request for build task %d error: %w", taskId, err)
+	}
+
+	return a.pollBuildStatus(ctx, task, repoInfo, buildRequest)
+}
+
+func (a *DeployActivity) getLogger(ctx context.Context) log.Logger {
+	if ctx.Value("test") == "test" {
+		return slog.Default()
+	}
+	return activity.GetLogger(ctx)
+}
+
+// pollBuildStatus
+func (a *DeployActivity) pollBuildStatus(ctx context.Context, task *database.DeployTask, repoInfo common.RepoInfo, buildRequest *types.ImageBuilderRequest) error {
+	continueLoop, err := a.checkBuildTaskStatus(ctx, task, buildRequest)
+	if err != nil {
+		return err
+	}
+	if !continueLoop {
+		return nil
+	}
+
+	heartbeatTicker := time.NewTicker(1 * time.Second)
+	defer heartbeatTicker.Stop()
+
+	statusCheckTicker := time.NewTicker(5 * time.Second)
+	defer statusCheckTicker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			a.getLogger(ctx).Info("Build activity cancelled before core logic", "task_id", task.ID)
+			// stop build task by call runner
+			go a.stopBuild(task, repoInfo)
+			// update deploy task status to cancelled
+			return a.handleBuildTaskCancelled(task)
+
+		case <-heartbeatTicker.C:
+			// probe if build task is cancelled
+			activity.RecordHeartbeat(ctx, task.ID)
+			if ctx.Err() != nil {
+				a.getLogger(ctx).Info("Build activity cancelled during heartbeat", "task_id", task.ID)
+				return a.handleBuildError(task, fmt.Errorf("build activity cancelled: %w", ctx.Err()))
+			}
+		case <-statusCheckTicker.C:
+			continueLoop, err := a.checkBuildTaskStatus(ctx, task, buildRequest)
+			if err != nil {
+				return err
+			}
+			if !continueLoop {
+				return nil
+			}
+		}
+	}
+}
+
+func (a *DeployActivity) checkBuildTaskStatus(ctx context.Context, task *database.DeployTask, buildRequest *types.ImageBuilderRequest) (bool, error) {
+	updatedTask, err := a.ds.GetDeployTask(ctx, task.ID)
+	if err != nil {
+		return false, fmt.Errorf("failed to get deploy task %d error: %w", task.ID, err)
+	}
+
+	switch {
+	case updatedTask.Status == common.TaskStatusBuildPending:
+		if err := a.ib.Build(ctx, buildRequest); err != nil {
+			if herr := a.handleBuildError(task, err); herr != nil {
+				a.getLogger(ctx).Error("handle error status for failed to start pending build task", "task_id", task.ID, "error", err)
+				return false, herr
+			}
+
+			a.getLogger(ctx).Error("start pending build task failed", "task_id", task.ID, "error", err)
+			a.reportLog(types.BuildFailed.String()+": \n"+err.Error(), types.StepBuildFailed, task)
+			return false, fmt.Errorf("start pending build task %d failed: %w", updatedTask.ID, err)
+		}
+		if err := a.handleBuildTaskToBuildInQueue(task); err != nil {
+			a.getLogger(ctx).Error("Failed to handle build task to build in queue status", "task_id", task.ID, "error", err)
+			return false, err
+		}
+		a.reportLog(types.BuildInProgress.String(), types.StepBuildInProgress, task)
+		return true, nil
+	case updatedTask.Status == common.TaskStatusBuildFailed:
+		a.getLogger(ctx).Info("Build task failed", "task_id", task.ID, "status", updatedTask.Status)
+		return false, fmt.Errorf("build task failed: %s", updatedTask.Message)
+	case updatedTask.Status == common.TaskStatusBuildSucceed:
+		a.getLogger(ctx).Info("Build task succeed", "task_id", task.ID, "status", updatedTask.Status)
+		return false, nil
+	case a.isTaskTimedOut(updatedTask):
+		a.reportLog("build task timeout", types.StepBuildFailed, task)
+		return false, a.handleBuildTaskTimeout(updatedTask)
+	default:
+		return true, nil
+	}
+}
+
+// IsTaskTimedOut
+func (a *DeployActivity) isTaskTimedOut(task *database.DeployTask) bool {
+	var timeoutMinutes int
+
+	if task.TaskType == 0 {
+		timeoutMinutes = a.cfg.BuildTimeoutInMin // build task
+	} else {
+		timeoutMinutes = a.cfg.SpaceDeployTimeoutInMin // deploy task
+		if task.Deploy.SpaceID == 0 && task.Deploy.ModelID > 0 {
+			timeoutMinutes = a.cfg.ModelDeployTimeoutInMin
+		}
+	}
+
+	timeoutDuration := time.Duration(timeoutMinutes) * time.Minute
+	deadline := task.CreatedAt.Add(timeoutDuration)
+	return time.Now().After(deadline)
+}
+
+// getRepositoryInfo
+func (a *DeployActivity) getRepositoryInfo(ctx context.Context, task *database.DeployTask) (common.RepoInfo, error) {
+	var repoInfo common.RepoInfo
+
+	if task.Deploy.SpaceID > 0 {
+		space, err := a.ss.ByID(ctx, task.Deploy.SpaceID)
+		if err != nil {
+			return repoInfo, fmt.Errorf("failed to get repo space by space ID %d: %w", task.Deploy.SpaceID, err)
+		}
+		return a.createSpaceRepoInfo(space, task.Deploy.ID), nil
+	}
+
+	if task.Deploy.ModelID > 0 {
+		model, err := a.ms.ByID(ctx, task.Deploy.ModelID)
+		if err != nil {
+			return repoInfo, fmt.Errorf("failed to get repo model by deploy ID %d: %w", task.Deploy.ID, err)
+		}
+		return a.createModelRepoInfo(model, task.Deploy.ID), nil
+	}
+
+	repoInfo.Path = "/"
+	return repoInfo, nil
+}
+
+// createSpaceRepoInfo
+func (a *DeployActivity) createSpaceRepoInfo(space *database.Space, deployID int64) common.RepoInfo {
+	cloneInfo := utilcommon.BuildCloneInfoByDomain(a.cfg.PublicDomain, a.cfg.SSHDomain, space.Repository)
+
+	return common.RepoInfo{
+		Path:          space.Repository.Path,
+		Name:          space.Repository.Name,
+		Sdk:           space.Sdk,
+		SdkVersion:    space.SdkVersion,
+		DriverVersion: space.DriverVersion,
+		HTTPCloneURL:  cloneInfo.HTTPCloneURL,
+		SpaceID:       space.ID,
+		RepoID:        space.Repository.ID,
+		UserName:      space.Repository.User.Username,
+		DeployID:      deployID,
+		ModelID:       0,
+		RepoType:      string(types.SpaceRepo),
+	}
+}
+
+// createModelRepoInfo
+func (a *DeployActivity) createModelRepoInfo(model *database.Model, deployID int64) common.RepoInfo {
+	return common.RepoInfo{
+		Path:     model.Repository.Path,
+		Name:     model.Repository.Name,
+		ModelID:  model.ID,
+		RepoID:   model.Repository.ID,
+		UserName: model.Repository.User.Username,
+		DeployID: deployID,
+		SpaceID:  0,
+		RepoType: string(types.ModelRepo),
+	}
+}
+
+func (a *DeployActivity) handleRepoInfoError(ctx context.Context, task *database.DeployTask, err error) error {
+	if errors.Is(err, sql.ErrNoRows) {
+		return a.handleRepositoryNotFound(task)
+	}
+	return fmt.Errorf("failed to get repository for deploy id %d task id %d error: %w", task.Deploy.ID, task.ID, err)
+}
+
+func (a *DeployActivity) updateDeployTaskStatus(task *database.DeployTask, serviceName string) error {
+	task.Status = DeployStatusDeploying
+	task.Message = "deploy in progress"
+	task.Deploy.Status = common.Deploying
+	task.Deploy.StatusUpdateAt = time.Now()
+
+	if len(serviceName) > 0 {
+		task.Deploy.SvcName = serviceName
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(5))
+	defer cancel()
+
+	lastTask, err := a.ds.GetLastTaskByType(ctx, task.Deploy.ID, task.TaskType)
+	if err != nil {
+		return fmt.Errorf("failed to get last task by id %d and type %d: %w", task.ID, task.TaskType, err)
+	}
+	if lastTask.ID != task.ID {
+		// only update task
+		if err := a.ds.UpdateInTx(ctx, []string{"status", "svc_name"}, []string{"status", "message"}, nil, task); err != nil {
+			return err
+		}
+	} else {
+		if err := a.ds.UpdateInTx(ctx, []string{"status", "svc_name"}, []string{"status", "message"}, task.Deploy, task); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *DeployActivity) updateTaskStatus(task *database.DeployTask) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(5))
+	defer cancel()
+	lastTask, err := a.ds.GetLastTaskByType(ctx, task.Deploy.ID, task.TaskType)
+	if err != nil {
+		return fmt.Errorf("failed to get last task by deploy id %d by type %d: %w", task.Deploy.ID, task.TaskType, err)
+	}
+
+	if lastTask.ID != task.ID {
+		// only update task
+		if err := a.ds.UpdateInTx(ctx, []string{"status"}, []string{"status", "message"}, nil, task); err != nil {
+			return err
+		}
+	} else {
+		// update task and deploy status
+		if err := a.ds.UpdateInTx(ctx, []string{"status"}, []string{"status", "message"}, task.Deploy, task); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// handleRepositoryNotFound
+func (a *DeployActivity) handleRepositoryNotFound(task *database.DeployTask) error {
+	task.Status = common.TaskStatusBuildFailed
+	task.Message = "repository not found, please check the repository path"
+	task.Deploy.Status = common.BuildFailed
+	task.Deploy.StatusUpdateAt = time.Now()
+	if err := a.updateTaskStatus(task); err != nil {
+		return fmt.Errorf("handleRepositoryNotFound failed to update deploy task %d status: %w", task.ID, err)
+	}
+	return nil
+}
+
+func (a *DeployActivity) handleBuildTaskCancelled(task *database.DeployTask) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(5))
+	defer cancel()
+	task.Status = common.TaskStatusCancelled
+	task.Message = "Cancelled"
+	if err := a.ds.UpdateDeployTask(ctx, task); err != nil {
+		return fmt.Errorf("handleBuildCancelled failed to update deploy task status: %w", err)
+	}
+
+	return nil
+}
+
+func (a *DeployActivity) handleBuildTaskTimeout(task *database.DeployTask) error {
+	task.Status = common.TaskStatusBuildFailed
+	task.Message = "build task timeout"
+	task.Deploy.Status = common.BuildFailed
+
+	if err := a.updateTaskStatus(task); err != nil {
+		return fmt.Errorf("handleBuildTaskTimeout failed to update deploy task status: %w", err)
+	}
+
+	return nil
+}
+
+// handleBuildError
+func (a *DeployActivity) handleBuildError(task *database.DeployTask, err error) error {
+	task.Status = common.TaskStatusBuildFailed
+	task.Message = fmt.Sprintf("build task failed: %s", err.Error())
+	task.Deploy.Status = common.BuildFailed
+
+	if err := a.updateTaskStatus(task); err != nil {
+		return fmt.Errorf("handleBuildError failed to update deploy task status: %w", err)
+	}
+	return nil
+}
+
+// updateTaskStatusToBuildInQueue
+func (a *DeployActivity) handleBuildTaskToBuildInQueue(task *database.DeployTask) error {
+	task.Status = common.TaskStatusBuildInQueue
+	task.Message = "build in queue"
+	task.Deploy.Status = common.BuildInQueue
+
+	if err := a.updateTaskStatus(task); err != nil {
+		return fmt.Errorf("handleBuildTaskToBuildInQueue failed to update build task %d status: %w", task.ID, err)
+	}
+
+	return nil
+}
+
+// handleImageRunnerError
+func (a *DeployActivity) handleDeployError(task *database.DeployTask, err error) error {
+	task.Status = DeployStatusFailed
+	task.Message = err.Error()
+	task.Deploy.Status = common.DeployFailed
+
+	if err := a.updateTaskStatus(task); err != nil {
+		return fmt.Errorf("handleDeployError failed to update deploy task %d status: %w", task.ID, err)
+	}
+	return nil
+}
+
+func (a *DeployActivity) reportLog(message string, step types.Step, task *database.DeployTask) {
+	stage := types.StageBuild
+	logkey := types.LogLabelImageBuilder
+	if task.TaskType == TaskTypeDeploy {
+		stage = types.StageDeploy
+		logkey = types.LogLabelDeploy
+	}
+	logEntry := types.LogEntry{
+		Message:  message,
+		Stage:    stage,
+		Step:     step,
+		DeployID: strconv.FormatInt(task.DeployID, 10),
+		Labels: map[string]string{
+			types.LogLabelTypeKey: logkey,
+		},
+	}
+
+	if task.Deploy != nil {
+		logEntry.Labels[types.StreamKeyDeployType] = strconv.Itoa(task.Deploy.Type)
+		logEntry.Labels[types.StreamKeyDeployTypeID] = strconv.FormatInt(task.DeployID, 10)
+		logEntry.Labels[types.StreamKeyDeployTaskID] = strconv.FormatInt(task.ID, 10)
+	}
+
+	a.lr.Report(logEntry)
+}
+
+// createBuildRequest
+func (a *DeployActivity) createBuildRequest(ctx context.Context, task *database.DeployTask, repoInfo common.RepoInfo) (*types.ImageBuilderRequest, error) {
+	cluster, err := a.cls.ByClusterID(ctx, task.Deploy.ClusterID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster %s for build deploy task %d, error: %w", task.Deploy.ClusterID, task.ID, err)
+	}
+
+	accessToken, err := a.ts.FindByUID(ctx, task.Deploy.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get git access for user id %d error: %w", task.Deploy.UserID, err)
+	}
+
+	pathParts := strings.Split(repoInfo.Path, "/")
+	if len(pathParts) < 2 {
+		return nil, fmt.Errorf("invalid repository path format: %s", repoInfo.Path)
+	}
+
+	lastCommitReq := gitserver.GetRepoLastCommitReq{
+		RepoType:  types.RepositoryType(repoInfo.RepoType),
+		Namespace: pathParts[0],
+		Name:      pathParts[1],
+		Ref:       task.Deploy.GitBranch,
+	}
+	lastCommit, err := a.gs.GetRepoLastCommit(ctx, lastCommitReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get repository %s last commit: %w", repoInfo.Path, err)
+	}
+
+	return &types.ImageBuilderRequest{
+		OrgName:        pathParts[0],
+		SpaceName:      pathParts[1],
+		Hardware:       a.parseHardware(task.Deploy.Hardware),
+		PythonVersion:  "3.10",
+		Sdk:            repoInfo.Sdk,
+		DriverVersion:  repoInfo.DriverVersion,
+		Sdk_version:    repoInfo.SdkVersion,
+		SpaceURL:       repoInfo.HTTPCloneURL,
+		GitRef:         task.Deploy.GitBranch,
+		UserId:         accessToken.User.Username,
+		GitAccessToken: accessToken.Token,
+		DeployId:       strconv.FormatInt(task.DeployID, 10),
+		FactoryBuild:   false,
+		ClusterID:      task.Deploy.ClusterID,
+		LastCommitID:   lastCommit.ID,
+		TaskId:         task.ID,
+		RepoId:         repoInfo.RepoID,
+		Scheduler:      common.GenerateScheduler(cluster.VXPUConfig),
+	}, nil
+}
+
+// createDeployRequest
+func (a *DeployActivity) createDeployRequest(ctx context.Context, task *database.DeployTask, repoInfo common.RepoInfo) (*types.RunRequest, error) {
+	logger := a.getLogger(ctx)
+
+	cluster, err := a.cls.ByClusterID(ctx, task.Deploy.ClusterID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster %s for deploy task %d, error: %w", task.Deploy.ClusterID, task.ID, err)
+	}
+
+	accessToken, err := a.ts.FindByUID(ctx, task.Deploy.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get git access token for user id %d error: %w", task.Deploy.UserID, err)
+	}
+
+	deployInfo, err := a.ds.GetDeployByID(ctx, task.DeployID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get deploy info for deploy id %d error: %w", task.DeployID, err)
+	}
+
+	pathParts := strings.Split(repoInfo.Path, "/")
+	orgName, repoName := "", ""
+	if deployInfo.Type == types.NotebookType {
+		//just a placeholder value
+		orgName = "notebook"
+		repoName = deployInfo.SvcName
+	} else if len(pathParts) >= 2 {
+		orgName = pathParts[0]
+		repoName = pathParts[1]
+	}
+
+	var engineArgsTemplates []types.EngineArg
+	var toolCallParsers map[string]string
+	var engineVersion string
+	if len(deployInfo.RuntimeFramework) > 0 {
+		framework, err := a.rfs.FindByImageID(ctx, deployInfo.ImageID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get runtime framework by name %s for deploy task id %d error: %w", deployInfo.RuntimeFramework, task.ID, err)
+		}
+		if framework == nil {
+			return nil, fmt.Errorf("runtime framework not found for image %s, deploy task id %d", deployInfo.ImageID, task.ID)
+		}
+		engineVersion = framework.FrameVersion
+		trimmedEngineArgs := strings.TrimSpace(framework.EngineArgs)
+		if len(trimmedEngineArgs) > 0 {
+			if err := json.Unmarshal([]byte(trimmedEngineArgs), &engineArgsTemplates); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal engine args for deploy task id %d : %w", task.ID, err)
+			}
+		}
+		trimmedToolCallParsers := strings.TrimSpace(framework.ToolCallParsers)
+		if len(trimmedToolCallParsers) > 0 {
+			if err := json.Unmarshal([]byte(trimmedToolCallParsers), &toolCallParsers); err != nil {
+				logger.Error("Failed to unmarshal tool call parsers", slog.Any("taskid", task.ID), slog.Any("err", err))
+			}
+		}
+	}
+
+	annotationMap, err := utilcommon.JsonStrToMap(deployInfo.Annotation)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse deploy annotation for deploy id %d error: %w", deployInfo.ID, err)
+	}
+	annotationMap[types.ResDeployID] = fmt.Sprintf("%v", deployInfo.ID)
+
+	var hardware types.HardWare
+	if err := json.Unmarshal([]byte(deployInfo.Hardware), &hardware); err != nil {
+		logger.Error("Deploy hardware is invalid format", slog.Any("hardware", deployInfo.Hardware),
+			slog.Any("task_id", task.ID))
+		return nil, fmt.Errorf("failed to parse deploy hardware for deploy task id %d error: %w", task.ID, err)
+	}
+
+	envMap, err := a.makeDeployEnv(ctx, makeDeployEnvRequest{
+		Hardware:    hardware,
+		AccessToken: accessToken,
+		DeployInfo:  deployInfo,
+		Runtime: runtimeConfig{
+			EngineArgsTemplates: engineArgsTemplates,
+			ToolCallParsers:     toolCallParsers,
+			EngineVersion:       engineVersion,
+		},
+		RepoInfo: repoInfo,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to make deploy env for deploy id %d task id %d error: %w", deployInfo.ID, task.ID, err)
+	}
+	targetID := deployInfo.SpaceID
+
+	if deployInfo.SpaceID == 0 && deployInfo.ModelID > 0 {
+		targetID = deployInfo.ID
+	}
+
+	clusterNodes, err := a.cls.FindNodeByClusterID(ctx, deployInfo.ClusterID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get cluster %s nodes for deploy id %d task id %d, error: %w",
+			deployInfo.ClusterID, deployInfo.ID, task.ID, err)
+	}
+
+	requestNodes := []types.Node{}
+	for _, node := range clusterNodes {
+		requestNodes = append(requestNodes, types.Node{
+			Name:       node.Name,
+			EnableVXPU: node.EnableVXPU,
+			HasXPU:     node.Hardware.HasXPU() || node.EnableVXPU,
+		})
+	}
+
+	return &types.RunRequest{
+		ID:            targetID,
+		OrgName:       orgName,
+		RepoName:      repoName,
+		RepoType:      repoInfo.RepoType,
+		UserName:      repoInfo.UserName,
+		Annotation:    annotationMap,
+		Hardware:      hardware,
+		Env:           envMap,
+		GitPath:       deployInfo.GitPath,
+		GitRef:        deployInfo.GitBranch,
+		ImageID:       deployInfo.ImageID,
+		DeployID:      deployInfo.ID,
+		MinReplica:    deployInfo.MinReplica,
+		MaxReplica:    deployInfo.MaxReplica,
+		Accesstoken:   accessToken.Token,
+		ClusterID:     deployInfo.ClusterID,
+		SvcName:       deployInfo.SvcName,
+		DeployType:    deployInfo.Type,
+		UserID:        deployInfo.UserUUID,
+		Sku:           deployInfo.SKU,
+		OrderDetailID: deployInfo.OrderDetailID,
+		TaskId:        task.ID,
+		Nodes:         requestNodes,
+		Scheduler:     common.GenerateScheduler(cluster.VXPUConfig),
+		DeployExtend: types.DeployExtend{
+			NodeAffinity:  deployInfo.NodeAffinity,
+			Tolerations:   deployInfo.Tolerations,
+			PD:            deployInfo.PD,
+			EngineVersion: engineVersion,
+		},
+	}, nil
+}
+
+func (a *DeployActivity) parseHardware(input string) string {
+	if strings.Contains(input, "GPU") || strings.Contains(input, "NVIDIA") {
+		return "gpu"
+	}
+	return "cpu"
+}
+
+func (a *DeployActivity) stopBuild(buildTask *database.DeployTask, repoInfo common.RepoInfo) {
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	paths := strings.Split(repoInfo.Path, "/")
+	err := a.ib.Stop(stopCtx, types.ImageBuildStopReq{
+		OrgName:   paths[0],
+		SpaceName: repoInfo.Name,
+		DeployId:  fmt.Sprintf("%d", buildTask.DeployID),
+		TaskId:    fmt.Sprintf("%d", buildTask.ID),
+		ClusterID: buildTask.Deploy.ClusterID,
+	})
+	if err != nil {
+		slog.ErrorContext(stopCtx, "Failed to stop repo build", slog.Any("Path", repoInfo.Path), slog.Any("error", err))
+		// Ignore the error of stopping the build, as it may be because the build has already been completed or does not exist
+	}
+}
+
+// runtimeConfig aggregates engine metadata resolved from the runtime framework lookup.
+type runtimeConfig struct {
+	EngineArgsTemplates []types.EngineArg
+	ToolCallParsers     map[string]string
+	EngineVersion       string
+}
+
+// makeDeployEnvRequest consolidates all inputs to makeDeployEnv except context.
+type makeDeployEnvRequest struct {
+	Hardware    types.HardWare
+	AccessToken *database.AccessToken
+	DeployInfo  *database.Deploy
+	Runtime     runtimeConfig
+	RepoInfo    common.RepoInfo
+}
+
+func (a *DeployActivity) makeDeployEnv(ctx context.Context, req makeDeployEnvRequest) (map[string]string, error) {
+	logger := a.getLogger(ctx)
+
+	envMap, err := utilcommon.JsonStrToMap(req.DeployInfo.Env)
+	if err != nil {
+		logger.Error("Deploy env is invalid json data", "deploy", req.DeployInfo, "error", err)
+		envMap = make(map[string]string)
+	}
+
+	varMap, err := utilcommon.JsonStrToMap(req.DeployInfo.Variables)
+	if err != nil {
+		logger.Error("Deploy variables is invalid json data", "deploy", req.DeployInfo, "error", err)
+	} else {
+		for key, value := range varMap {
+			envMap[key] = value
+		}
+	}
+
+	envMap["S3_INTERNAL"] = fmt.Sprintf("%v", a.cfg.S3Internal)
+	envMap["ACCESS_TOKEN"] = req.AccessToken.Token
+	addLongCatVideoRuntimeEnv(envMap, req.DeployInfo.RuntimeFramework, req.DeployInfo.SvcName, a.cfg)
+
+	if err := a.setGitEnv(ctx, envMap, gitEnvInput{
+		DeployInfo:  req.DeployInfo,
+		RepoInfo:    req.RepoInfo,
+		AccessToken: req.AccessToken,
+		VarMap:      varMap,
+	}); err != nil {
+		return nil, err
+	}
+
+	a.setEngineArgs(ctx, logger, envMap, req.DeployInfo, req.Runtime)
+
+	common.UpdateEvaluationEnvHardware(envMap, req.Hardware)
+
+	a.setSpaceEnv(envMap, req.DeployInfo, req.RepoInfo)
+	a.setInferenceEnv(envMap, req.DeployInfo, req.Hardware, req.Runtime.EngineVersion)
+	a.setFinetuneEnv(envMap, req.DeployInfo, req.AccessToken)
+	a.setNotebookEnv(envMap, req.DeployInfo)
+	a.setContextPathEnv(envMap, req.DeployInfo)
+
+	return envMap, nil
+}
+
+// gitEnvInput aggregates the inputs needed for git environment preparation.
+type gitEnvInput struct {
+	DeployInfo  *database.Deploy
+	RepoInfo    common.RepoInfo
+	AccessToken *database.AccessToken
+	VarMap      map[string]string
+}
+
+func (a *DeployActivity) setGitEnv(ctx context.Context, envMap map[string]string, in gitEnvInput) error {
+	deployInfo := in.DeployInfo
+	// Notebook has no git repo; skip GetRepoLastCommit and use empty git-related env
+	if deployInfo.Type == types.NotebookType {
+		envMap["HTTPCloneURL"] = ""
+		envMap["REPO_ID"] = ""
+		envMap["REVISION"] = ""
+		return nil
+	}
+
+	pathParts := strings.Split(in.RepoInfo.Path, "/")
+	commit, err := a.gs.GetRepoLastCommit(ctx, gitserver.GetRepoLastCommitReq{
+		Namespace: pathParts[0],
+		Name:      pathParts[1],
+		Ref:       deployInfo.GitBranch,
+		RepoType:  types.RepositoryType(in.RepoInfo.RepoType),
+	})
+	if err != nil {
+		return err
+	}
+
+	revision := strings.TrimSpace(in.VarMap["REVISION"])
+	if revision == "" {
+		revision, err = utilcommon.ShortenCommitID7(commit.ID)
+		if err != nil {
+			return errorx.ErrInvalidCommitID
+		}
+	}
+
+	envMap["HTTPCloneURL"] = a.getHttpCloneURLWithToken(in.RepoInfo.HTTPCloneURL, in.AccessToken.User.Username, in.AccessToken.Token)
+	envMap["REPO_ID"] = in.RepoInfo.Path // "namespace/name"
+	envMap["REVISION"] = revision        // branch
+	return nil
+}
+
+func (a *DeployActivity) setEngineArgs(ctx context.Context, logger log.Logger, envMap map[string]string, deployInfo *database.Deploy, rc runtimeConfig) {
+	if len(rc.EngineArgsTemplates) == 0 {
+		return
+	}
+
+	var engineArgs strings.Builder
+	argValuesMap, err := utilcommon.JsonStrToMap(deployInfo.EngineArgs)
+	if err != nil {
+		logger.Error("Deploy engine args is invalid json data", "deploy", *deployInfo, "error", err)
+	} else {
+		for _, arg := range rc.EngineArgsTemplates {
+			if value, ok := argValuesMap[arg.Name]; ok {
+				if arg.Value != "" && value == arg.Value {
+					continue
+				}
+				// handle boolean value
+				if !strings.Contains(arg.Format, "%") {
+					if value == "false" || value == "0" || value == "" || value == "disable" {
+						continue
+					}
+					engineArgs.WriteString(" ")
+					engineArgs.WriteString(arg.Format)
+				} else {
+					engineArgs.WriteString(" ")
+					fmt.Fprintf(&engineArgs, arg.Format, value)
+				}
+			}
+		}
+	}
+
+	// Process tool-calling arguments
+	engineArgsStr := engineArgs.String()
+	if len(rc.ToolCallParsers) > 0 &&
+		(strings.Contains(engineArgsStr, vllmToolChoiceFlag) || strings.Contains(engineArgsStr, sglangToolParserAuto)) {
+		modelArch := a.getModelArchitecture(ctx, deployInfo.RepoID)
+		engineArgsStr = applyToolCallParser(logger, engineArgsStr, modelArch, rc.ToolCallParsers)
+	}
+
+	logger.Debug("makeDeployEnv", "ENGINE_ARGS", engineArgsStr)
+	envMap["ENGINE_ARGS"] = engineArgsStr
+}
+
+func (a *DeployActivity) setSpaceEnv(envMap map[string]string, deployInfo *database.Deploy, repoInfo common.RepoInfo) {
+	if deployInfo.SpaceID <= 0 {
+		return
+	}
+
+	// SDK port for space
+	switch repoInfo.Sdk {
+	case types.GRADIO.Name:
+		envMap["port"] = strconv.Itoa(types.GRADIO.Port)
+		envMap["SDK"] = types.GRADIO.Name
+		envMap["HF_ENDPOINT"] = a.cfg.ModelDownloadEndpoint
+	case types.STREAMLIT.Name:
+		envMap["port"] = strconv.Itoa(types.STREAMLIT.Port)
+		envMap["SDK"] = types.STREAMLIT.Name
+		envMap["HF_ENDPOINT"] = a.cfg.ModelDownloadEndpoint
+	case types.NGINX.Name:
+		envMap["port"] = strconv.Itoa(types.NGINX.Port)
+		envMap["SDK"] = types.NGINX.Name
+		envMap["HF_ENDPOINT"] = a.cfg.ModelDownloadEndpoint
+	case types.DOCKER.Name:
+		envMap["SDK"] = types.DOCKER.Name
+		envMap["port"] = strconv.Itoa(deployInfo.ContainerPort)
+		envMap["HF_ENDPOINT"] = a.cfg.ModelDownloadEndpoint
+	case types.MCPSERVER.Name:
+		envMap["port"] = strconv.Itoa(types.MCPSERVER.Port)
+		envMap["SDK"] = types.MCPSERVER.Name
+		envMap["HF_ENDPOINT"] = a.cfg.ModelDownloadEndpoint
+	default:
+		envMap["port"] = strconv.Itoa(types.DefaultContainerPort)
+	}
+}
+
+func (a *DeployActivity) setInferenceEnv(envMap map[string]string, deployInfo *database.Deploy, hardware types.HardWare, engineVersion string) {
+	if deployInfo.Type != types.InferenceType && deployInfo.Type != types.ServerlessType {
+		return
+	}
+
+	// Runtime framework port for model
+	envMap["port"] = strconv.Itoa(deployInfo.ContainerPort)
+	envMap["HF_ENDPOINT"] = a.cfg.ModelDownloadEndpoint // "https://hub.opencsg-stg.com/"
+	envMap["HF_HUB_OFFLINE"] = "1"
+	envMap["HF_TASK"] = string(deployInfo.Task)
+	if vllmEnforceEagerEnabled(deployInfo.EngineArgs) {
+		envMap["VLLM_ENFORCE_EAGER"] = "1"
+	}
+	if asyncSchedulingDisabled(deployInfo.EngineArgs) {
+		envMap["ASYNC_SCHEDULING_DISABLED"] = "true"
+	}
+	if model := hardware.GetResXPUMode(); model != "" {
+		envMap["XPU_MODEL"] = model
+	}
+	if engineVersion != "" {
+		envMap["ENGINE_VERSION"] = engineVersion
+	}
+}
+
+func (a *DeployActivity) setFinetuneEnv(envMap map[string]string, deployInfo *database.Deploy, accessToken *database.AccessToken) {
+	if deployInfo.Type != types.FinetuneType {
+		return
+	}
+
+	envMap["port"] = strconv.Itoa(deployInfo.ContainerPort)
+	envMap["HF_ENDPOINT"], _ = url.JoinPath(a.cfg.ModelDownloadEndpoint, "csg")
+	envMap["HF_TOKEN"] = accessToken.Token
+	envMap["USE_CSGHUB_MODEL"] = "1"
+	envMap["USE_CSGHUB_DATASET"] = "1"
+	envMap["JUPYTER_ENABLE_LAB"] = "yes"
+	envMap["TERM"] = "xterm-256color"
+}
+
+func (a *DeployActivity) setNotebookEnv(envMap map[string]string, deployInfo *database.Deploy) {
+	if deployInfo.Type != types.NotebookType {
+		return
+	}
+
+	envMap["port"] = strconv.Itoa(deployInfo.ContainerPort)
+}
+
+func (a *DeployActivity) setContextPathEnv(envMap map[string]string, deployInfo *database.Deploy) {
+	if a.cfg.PublicRootDomain != "" {
+		return
+	}
+
+	if deployInfo.Type == types.FinetuneType || deployInfo.Type == types.NotebookType {
+		envMap["CONTEXT_PATH"] = "/endpoint/" + deployInfo.SvcName
+	}
+	if deployInfo.Type == types.SpaceType {
+		envMap["GRADIO_ROOT_PATH"] = "/endpoint/" + deployInfo.SvcName
+		envMap["STREAMLIT_SERVER_BASE_URL_PATH"] = "/endpoint/" + deployInfo.SvcName
+	}
+}
+
+func isLongCatVideoRuntime(runtimeFramework string) bool {
+	switch strings.ToLower(strings.TrimSpace(runtimeFramework)) {
+	case "longcat-video", "amd-longcat-video":
+		return true
+	default:
+		return false
+	}
+}
+
+func addLongCatVideoRuntimeEnv(envMap map[string]string, runtimeFramework, taskNamespace string, cfg common.DeployConfig) {
+	if !isLongCatVideoRuntime(runtimeFramework) {
+		return
+	}
+	if taskNamespace != "" {
+		envMap["LONGCAT_TASK_NAMESPACE"] = taskNamespace
+	}
+	if cfg.S3PublicBucket == "" {
+		return
+	}
+	envMap["S3_ACCESS_ID"] = cfg.S3AccessID
+	envMap["S3_ACCESS_SECRET"] = cfg.S3AccessSecret
+	envMap["S3_BUCKET"] = cfg.S3PublicBucket
+	envMap["S3_ENDPOINT"] = cfg.S3Endpoint
+	envMap["S3_SSL_ENABLED"] = strconv.FormatBool(cfg.S3SSLEnabled)
+}
+
+// vllmEnforceEagerEnabled reports whether single-node vLLM should run with --enforce-eager.
+// Disabled by default; intended for debugging only — enabling increases decode latency 20-40%.
+// Set engine_args "enforce-eager" to enable/true/1 to turn it on.
+func vllmEnforceEagerEnabled(engineArgs string) bool {
+	if engineArgs == "" {
+		return false
+	}
+	argValuesMap, err := utilcommon.JsonStrToMap(engineArgs)
+	if err != nil {
+		return false
+	}
+	value, ok := argValuesMap["enforce-eager"]
+	if !ok {
+		return false
+	}
+	switch value {
+	case "enable", "true", "1":
+		return true
+	default:
+		return false
+	}
+}
+
+// asyncSchedulingDisabled reports whether the user explicitly set async-scheduling to disable.
+// When true, shell scripts must not auto-inject --async-scheduling even if the flag is absent
+// from ENGINE_ARGS (the Go boolean-arg path skips disable values, so the flag won't be present).
+func asyncSchedulingDisabled(engineArgs string) bool {
+	if engineArgs == "" {
+		return false
+	}
+	argValuesMap, err := utilcommon.JsonStrToMap(engineArgs)
+	if err != nil {
+		return false
+	}
+	value, ok := argValuesMap["async-scheduling"]
+	if !ok {
+		return false
+	}
+	switch value {
+	case "disable", "false", "0":
+		return true
+	default:
+		return false
+	}
+}
+
+const (
+	// vLLM enables tool calling with --enable-auto-tool-choice plus a companion --tool-call-parser.
+	vllmToolChoiceFlag = "--enable-auto-tool-choice"
+	// SGLang enables tool calling with --tool-call-parser alone; "auto" lets the
+	// engine detect the parser from the model's chat template.
+	sglangToolParserAuto = "--tool-call-parser auto"
+)
+
+// applyToolCallParser rewrites tool-calling flags in engine args based on the model architecture.
+func applyToolCallParser(logger log.Logger, engineArgsStr, modelArch string, toolCallParsers map[string]string) string {
+	switch {
+	case strings.Contains(engineArgsStr, vllmToolChoiceFlag):
+		if modelArch == "" {
+			logger.Warn("Model architecture not found, removing --enable-auto-tool-choice")
+			return strings.ReplaceAll(engineArgsStr, vllmToolChoiceFlag, "")
+		}
+		parser, ok := toolCallParsers[modelArch]
+		if !ok {
+			logger.Warn("No tool-call-parser found for architecture, using default openai parser", "architecture", modelArch)
+			parser = "openai"
+		} else {
+			logger.Info("Added tool-call-parser", "architecture", modelArch, "parser", parser)
+		}
+		return strings.Replace(engineArgsStr, vllmToolChoiceFlag, vllmToolChoiceFlag+" --tool-call-parser "+parser, 1)
+	case strings.Contains(engineArgsStr, sglangToolParserAuto):
+		if parser, ok := toolCallParsers[modelArch]; ok && modelArch != "" {
+			logger.Info("Added tool-call-parser", "architecture", modelArch, "parser", parser)
+			return strings.Replace(engineArgsStr, sglangToolParserAuto, "--tool-call-parser "+parser, 1)
+		}
+		// Keep "auto": the engine detects the parser from the chat template and
+		// gracefully disables tool calling when detection fails.
+		logger.Info("No tool-call-parser mapping for architecture, keeping auto detection", "architecture", modelArch)
+		return engineArgsStr
+	}
+	return engineArgsStr
+}
+
+// getModelArchitecture reads the model architecture from metadata
+func (a *DeployActivity) getModelArchitecture(ctx context.Context, repoID int64) string {
+	logger := a.getLogger(ctx)
+
+	// Get metadata from database
+	metadata, err := a.mds.FindByRepoID(ctx, repoID)
+	if err != nil {
+		logger.Warn("Failed to get metadata from database", "error", err, "repo_id", repoID)
+		return ""
+	}
+
+	if metadata.Architecture != "" {
+		return metadata.Architecture
+	}
+
+	logger.Warn("Model architecture not found in metadata", "repo_id", repoID)
+	return ""
+}
+
+// getHttpCloneURLWithToken
+func (a *DeployActivity) getHttpCloneURLWithToken(httpCloneURL, username, token string) string {
+	protocolIndex := strings.Index(httpCloneURL, "://")
+	if protocolIndex > -1 {
+		return fmt.Sprintf("%s%s:%s@%s", httpCloneURL[0:protocolIndex+3], username, token, httpCloneURL[protocolIndex+3:])
+	}
+	return httpCloneURL
+}
+
+// updateUserResourceDeployID
+func (a *DeployActivity) updateUserResourceDeployID(ctx context.Context, req *types.RunRequest) error {
+	userResource, err := a.urs.FindUserResourcesByOrderDetailId(ctx, req.UserID, req.OrderDetailID)
+	if err != nil {
+		return fmt.Errorf("failed to find user resource by order detail id: %w", err)
+	}
+
+	userResource.DeployId = req.DeployID
+	if err := a.urs.UpdateDeployId(ctx, userResource); err != nil {
+		return fmt.Errorf("failed to update deploy id for user resource: %w", err)
+	}
+	return nil
+}

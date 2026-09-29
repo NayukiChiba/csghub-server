@@ -1,0 +1,328 @@
+package database
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/types"
+)
+
+type accountBillStoreImpl struct {
+	db *DB
+}
+
+type AccountBillStore interface {
+	ListByUserIDAndDate(ctx context.Context, req types.AcctBillsReq) (AccountBillRes, error)
+	ListBillsDetailByUserID(ctx context.Context, req types.AcctBillsDetailReq) (AccountBillDetailRes, error)
+	SumValueByAPIKey(ctx context.Context, tokenID int64) (float64, error)
+	SumValueByAPIKeyBetween(ctx context.Context, tokenID int64, start, end time.Time) (float64, error)
+	SumConsumptionByAPIKey(ctx context.Context, tokenID int64) (float64, error)
+	SumConsumptionByAPIKeyBetween(ctx context.Context, tokenID int64, start, end time.Time) (float64, error)
+	GetVoucherBills(ctx context.Context, req types.VoucherBillReq) ([]VoucherBillGroupedResult, error)
+}
+
+func NewAccountBillStore() AccountBillStore {
+	return &accountBillStoreImpl{
+		db: defaultDB,
+	}
+}
+
+func NewAccountBillStoreWithDB(db *DB) AccountBillStore {
+	return &accountBillStoreImpl{
+		db: db,
+	}
+}
+
+type AccountBill struct {
+	ID                int64             `bun:",pk,autoincrement" json:"id"`
+	BillDate          time.Time         `bun:"type:date" json:"bill_date"`
+	UserUUID          string            `bun:",notnull" json:"user_uuid"`
+	Scene             types.SceneType   `bun:",notnull" json:"scene"`
+	CustomerID        string            `bun:",notnull" json:"customer_id"`
+	Value             float64           `bun:",notnull" json:"value"`
+	Consumption       float64           `bun:",notnull" json:"consumption"`
+	PromptToken       float64           `bun:",notnull" json:"prompt_token"`
+	PromptCachedToken float64           `bun:",notnull" json:"prompt_cached_token"`
+	CompletionToken   float64           `bun:",notnull" json:"completion_token"`
+	ReasoningToken    float64           `bun:",notnull" json:"reasoning_token"`
+	APIKey            string            `bun:",notnull,default:''" json:"api_key"`
+	Count             float64           `bun:",notnull,default:0" json:"count"`
+	TokenID           int64             `bun:",notnull,default:0" json:"token_id"`
+	DataType          string            `bun:",notnull,default:''" json:"data_type"`
+	Resolution        string            `bun:",notnull,default:''" json:"resolution"`
+	Duration          float64           `bun:",notnull,default:0" json:"duration"`
+	VoucherNo         string            `bun:",notnull,default:''" json:"voucher_no"`
+	VoucherValue      float64           `bun:",notnull,default:0" json:"voucher_value"`
+	CashValue         float64           `bun:",notnull,default:0" json:"cash_value"`
+	UnitType          types.SkuUnitType `bun:",notnull,default:''" json:"unit_type"`
+	ClusterID         string            `bun:",notnull,default:''" json:"cluster_id"`
+	HardwareType      string            `bun:",notnull,default:''" json:"hardware_type"`
+	times
+}
+
+type BillValues struct {
+	TotalValue   float64 `bun:"total_value"`
+	VoucherValue float64 `bun:"voucher_value"`
+	CashValue    float64 `bun:"cash_value"`
+	Consumption  float64 `bun:"consumption"`
+}
+
+type BillResource struct {
+	ClusterID    string `bun:"cluster_id"`
+	HardwareType string `bun:"hardware_type"`
+}
+
+type TotalResult struct {
+	TotalValue             float64 `bun:"total_value"`
+	TotalConsumption       float64 `bun:"total_consumption"`
+	TotalPromptToken       float64 `bun:"total_prompt_token"`
+	TotalPromptCachedToken float64 `bun:"total_prompt_cached_token"`
+	TotalCompletionToken   float64 `bun:"total_completion_token"`
+	TotalReasoningToken    float64 `bun:"total_reasoning_token"`
+	TotalVoucherValue      float64 `bun:"total_voucher_value"`
+	TotalCashValue         float64 `bun:"total_cash_value"`
+	TotalDuration          float64 `bun:"total_duration"`
+	TotalCount             float64 `bun:"total_count"`
+}
+
+type AccountBillRes struct {
+	Data []types.ITEM `json:"data"`
+	types.AcctSummary
+}
+
+type AccountBillDetailRes struct {
+	Data  []AccountBill `json:"data"`
+	Total int           `json:"total"`
+}
+
+func (s *accountBillStoreImpl) ListByUserIDAndDate(ctx context.Context, req types.AcctBillsReq) (AccountBillRes, error) {
+	var bill []AccountBill
+	var res []types.ITEM
+	q := s.db.Operator.Core.NewSelect().Model(&bill).
+		ColumnExpr("customer_id as instance_name").
+		ColumnExpr("data_type").
+		ColumnExpr("resolution").
+		ColumnExpr("unit_type").
+		ColumnExpr("sum(value) as value").
+		ColumnExpr("sum(consumption) as consumption").
+		ColumnExpr("sum(prompt_token) as prompt_token").
+		ColumnExpr("sum(prompt_cached_token) as prompt_cached_token").
+		ColumnExpr("sum(completion_token) as completion_token").
+		ColumnExpr("sum(reasoning_token) as reasoning_token").
+		ColumnExpr("sum(voucher_value) as voucher_value").
+		ColumnExpr("sum(cash_value) as cash_value").
+		ColumnExpr("sum(duration) as duration").
+		ColumnExpr("sum(count) as count")
+
+	switch req.Scene {
+	case types.SceneEvaluation:
+		q = q.ColumnExpr("d.submit_time as created_at")
+		q = q.Join("LEFT JOIN argo_workflows d ON customer_id = d.task_id")
+	case types.SceneSpace, types.SceneModelInference, types.SceneModelFinetune:
+		q = q.ColumnExpr("d.created_at as created_at")
+		q = q.Join("LEFT JOIN deploys d ON customer_id = d.svc_name")
+	default:
+		q = q.ColumnExpr("min(created_at) as created_at")
+	}
+
+	q = q.Where("account_bill.bill_date >= ? and account_bill.bill_date <= ?", req.StartDate, req.EndDate).
+		Where("account_bill.user_uuid = ?", req.TargetUUID).
+		Where("account_bill.scene = ?", req.Scene)
+
+	if len(req.InstanceName) > 0 {
+		q = q.Where("LOWER(customer_id) LIKE ?", "%"+strings.ToLower(req.InstanceName)+"%")
+	}
+	switch req.Scene {
+	case types.SceneEvaluation:
+		q = q.Group("customer_id", "data_type", "resolution", "unit_type", "d.submit_time")
+	case types.SceneSpace, types.SceneModelInference, types.SceneModelFinetune:
+		q = q.Group("customer_id", "data_type", "resolution", "unit_type", "d.created_at")
+	default:
+		q = q.Group("customer_id", "data_type", "resolution", "unit_type")
+	}
+
+	count, err := q.Count(ctx)
+	if err != nil {
+		return AccountBillRes{}, errorx.HandleDBError(err, nil)
+	}
+
+	var totalResult TotalResult
+
+	err = s.db.Operator.Core.NewSelect().With("grouped_items", q).TableExpr("grouped_items").
+		ColumnExpr("SUM(value) AS total_value").
+		ColumnExpr("SUM(consumption) as total_consumption").
+		ColumnExpr("SUM(prompt_token) as total_prompt_token").
+		ColumnExpr("SUM(prompt_cached_token) as total_prompt_cached_token").
+		ColumnExpr("SUM(completion_token) as total_completion_token").
+		ColumnExpr("SUM(reasoning_token) as total_reasoning_token").
+		ColumnExpr("SUM(voucher_value) as total_voucher_value").
+		ColumnExpr("SUM(cash_value) as total_cash_value").
+		ColumnExpr("SUM(duration) as total_duration").
+		ColumnExpr("SUM(count) as total_count").
+		Scan(ctx, &totalResult)
+	if err != nil {
+		return AccountBillRes{}, errorx.HandleDBError(err, nil)
+	}
+
+	// Pagination: never touch q (the CTE source); clone it.
+	pageQ := q.Clone()
+
+	switch req.Scene {
+	case types.SceneEvaluation:
+		pageQ = pageQ.Order("d.submit_time DESC NULLS LAST")
+	case types.SceneSpace, types.SceneModelInference, types.SceneModelFinetune:
+		pageQ = pageQ.Order("d.created_at DESC NULLS LAST")
+	default:
+		pageQ = pageQ.Order("created_at DESC NULLS LAST")
+	}
+	pageQ = pageQ.Order("customer_id")
+	err = pageQ.Limit(req.Per).Offset((req.Page-1)*req.Per).Scan(ctx, &res)
+	if err != nil {
+		return AccountBillRes{}, errorx.HandleDBError(err, nil)
+	}
+	return AccountBillRes{
+		Data: res,
+		AcctSummary: types.AcctSummary{
+			Total:                  count,
+			TotalValue:             totalResult.TotalValue,
+			TotalConsumption:       totalResult.TotalConsumption,
+			TotalPromptToken:       totalResult.TotalPromptToken,
+			TotalPromptCachedToken: totalResult.TotalPromptCachedToken,
+			TotalCompletionToken:   totalResult.TotalCompletionToken,
+			TotalReasoningToken:    totalResult.TotalReasoningToken,
+			TotalVoucherValue:      totalResult.TotalVoucherValue,
+			TotalCashValue:         totalResult.TotalCashValue,
+			TotalDuration:          totalResult.TotalDuration,
+			TotalCount:             totalResult.TotalCount,
+		},
+	}, err
+}
+
+func (s *accountBillStoreImpl) ListBillsDetailByUserID(ctx context.Context, req types.AcctBillsDetailReq) (AccountBillDetailRes, error) {
+	var bills []AccountBill
+
+	q := s.db.Operator.Core.NewSelect().Model(&bills).
+		Where("bill_date >= ? and bill_date <= ? and user_uuid = ? and scene = ?", req.StartDate, req.EndDate, req.TargetUUID, req.Scene)
+
+	if req.InstanceName != "" {
+		q = q.Where("customer_id = ?", req.InstanceName)
+	}
+
+	q = q.Where("unit_type = ?", req.UnitType)
+
+	count, err := q.Count(ctx)
+	if err != nil {
+		return AccountBillDetailRes{}, errorx.HandleDBError(err, nil)
+	}
+
+	err = q.Order("customer_id").Order("bill_date DESC").Limit(req.Per).Offset((req.Page-1)*req.Per).Scan(ctx, &bills)
+	if err != nil {
+		return AccountBillDetailRes{}, errorx.HandleDBError(err, nil)
+	}
+
+	return AccountBillDetailRes{
+		Data:  bills,
+		Total: count,
+	}, nil
+}
+
+func (s *accountBillStoreImpl) SumValueByAPIKey(ctx context.Context, tokenID int64) (float64, error) {
+	var result struct {
+		TotalValue float64 `bun:"total_value"`
+	}
+	err := s.db.Operator.Core.NewSelect().
+		Table("account_bills").
+		ColumnExpr("SUM(value) AS total_value").
+		Where("token_id = ?", tokenID).
+		Where("scene = ?", types.SceneModelServerless).
+		Scan(ctx, &result)
+	if err != nil {
+		return 0, errorx.HandleDBError(err, nil)
+	}
+	return result.TotalValue, nil
+}
+
+func (s *accountBillStoreImpl) SumValueByAPIKeyBetween(ctx context.Context, tokenID int64, start, end time.Time) (float64, error) {
+	var result struct {
+		TotalValue float64 `bun:"total_value"`
+	}
+	err := s.db.Operator.Core.NewSelect().
+		Table("account_bills").
+		ColumnExpr("SUM(value) AS total_value").
+		Where("token_id = ?", tokenID).
+		Where("scene = ?", types.SceneModelServerless).
+		Where("bill_date >= ? AND bill_date <= ?", start, end).
+		Scan(ctx, &result)
+	if err != nil {
+		return 0, errorx.HandleDBError(err, nil)
+	}
+	return result.TotalValue, nil
+}
+
+func (s *accountBillStoreImpl) SumConsumptionByAPIKey(ctx context.Context, tokenID int64) (float64, error) {
+	var result struct {
+		TotalConsumption float64 `bun:"total_consumption"`
+	}
+	err := s.db.Operator.Core.NewSelect().
+		Table("account_bills").
+		ColumnExpr("SUM(consumption) AS total_consumption").
+		Where("token_id = ?", tokenID).
+		Where("scene = ?", types.SceneModelServerless).
+		Scan(ctx, &result)
+	if err != nil {
+		return 0, errorx.HandleDBError(err, nil)
+	}
+	return result.TotalConsumption, nil
+}
+
+func (s *accountBillStoreImpl) SumConsumptionByAPIKeyBetween(ctx context.Context, tokenID int64, start, end time.Time) (float64, error) {
+	var result struct {
+		TotalConsumption float64 `bun:"total_consumption"`
+	}
+	err := s.db.Operator.Core.NewSelect().
+		Table("account_bills").
+		ColumnExpr("SUM(consumption) AS total_consumption").
+		Where("token_id = ?", tokenID).
+		Where("scene = ?", types.SceneModelServerless).
+		Where("bill_date >= ? AND bill_date <= ?", start, end).
+		Scan(ctx, &result)
+	if err != nil {
+		return 0, errorx.HandleDBError(err, nil)
+	}
+	return result.TotalConsumption, nil
+}
+
+type VoucherBillGroupedResult struct {
+	Scene        types.SceneType `json:"scene"`
+	InstanceName string          `json:"instance_name"`
+	VoucherValue float64         `json:"voucher_value"`
+	Consumption  float64         `json:"consumption"`
+}
+
+func (s *accountBillStoreImpl) GetVoucherBills(ctx context.Context, req types.VoucherBillReq) ([]VoucherBillGroupedResult, error) {
+	var results []VoucherBillGroupedResult
+	q := s.db.Core.NewSelect().
+		Model((*AccountBill)(nil)).
+		ColumnExpr("scene, customer_id as instance_name, SUM(voucher_value) AS voucher_value, SUM(consumption) AS consumption").
+		Where("bill_date >= ? and bill_date <= ?", req.StartDate, req.EndDate).
+		Where("user_uuid = ?", req.TargetUUID)
+
+	if req.Scene != 0 {
+		q = q.Where("scene = ?", req.Scene)
+	}
+
+	if req.InstanceName != "" {
+		q = q.Where("customer_id = ?", req.InstanceName)
+	}
+
+	q = q.Where("voucher_no = ?", req.VoucherNo)
+
+	err := q.Group("scene", "customer_id").Scan(ctx, &results)
+	if err != nil {
+		return nil, fmt.Errorf("query grouped voucher bills for target %s voucher %s: %w", req.TargetUUID, req.VoucherNo, err)
+	}
+	return results, nil
+}

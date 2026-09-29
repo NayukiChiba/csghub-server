@@ -1,0 +1,148 @@
+package video
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"opencsg.com/csghub-server/aigateway/component/adapter/text2video"
+	taskprocessor "opencsg.com/csghub-server/aigateway/task/processor"
+	"opencsg.com/csghub-server/aigateway/token"
+	aigwtypes "opencsg.com/csghub-server/aigateway/types"
+	commontypes "opencsg.com/csghub-server/common/types"
+)
+
+type fakeOpenAIComponent struct {
+	model          *aigwtypes.Model
+	lastNsUUID     string
+	getModelCalled bool
+}
+
+func (c *fakeOpenAIComponent) GetAvailableModels(ctx context.Context, nsUUID string) ([]aigwtypes.Model, error) {
+	return nil, nil
+}
+
+func (c *fakeOpenAIComponent) ListModels(ctx context.Context, nsUUID string, req aigwtypes.ListModelsReq) (aigwtypes.ModelList, error) {
+	return aigwtypes.ModelList{}, nil
+}
+
+func (c *fakeOpenAIComponent) GetModelByID(ctx context.Context, nsUUID, modelID string) (*aigwtypes.Model, error) {
+	c.getModelCalled = true
+	c.lastNsUUID = nsUUID
+	return c.model, nil
+}
+
+func (c *fakeOpenAIComponent) RecordUsage(ctx context.Context, nsUUID string, model *aigwtypes.Model, targetModelName string, tokenCounter token.Counter, apikey string, tokenID int64) error {
+	return nil
+}
+
+func (c *fakeOpenAIComponent) RecordUsageFromTokenUsage(ctx context.Context, nsUUID string, model *aigwtypes.Model, targetModelName string, usage *token.Usage, apikey string, tokenID int64) error {
+	return nil
+}
+
+func (c *fakeOpenAIComponent) BuildUsageMeteringEvent(ctx context.Context, nsUUID string, model *aigwtypes.Model, targetModelName string, usage *token.Usage, apikey string) (*commontypes.MeteringEvent, error) {
+	return nil, nil
+}
+
+func (c *fakeOpenAIComponent) CheckBalance(ctx context.Context, nsUUID string) error {
+	return nil
+}
+
+func (c *fakeOpenAIComponent) CheckUsageLimit(ctx context.Context, userUUID string, model *aigwtypes.Model, endpoint string) error {
+	return nil
+}
+
+func (c *fakeOpenAIComponent) CanManageModel(ctx context.Context, username, nsUUID string, model *aigwtypes.Model) (bool, error) {
+	return false, nil
+}
+
+func (c *fakeOpenAIComponent) CommitUsageLimit(ctx context.Context, userUUID string, model *aigwtypes.Model, tokenCounter token.Counter) error {
+	return nil
+}
+
+func (c *fakeOpenAIComponent) CommitUsageLimitFromUsage(ctx context.Context, userUUID string, model *aigwtypes.Model, usage *token.Usage) error {
+	return nil
+}
+
+func (c *fakeOpenAIComponent) CheckCapacityAdmission(ctx context.Context, req aigwtypes.CapacityAdmissionRequest) *aigwtypes.AdmissionDecision {
+	return nil
+}
+
+func (c *fakeOpenAIComponent) AcquireCapacityAdmission(ctx context.Context, model *aigwtypes.Model, upstreamID int64, estimatedTokens int64) *aigwtypes.AdmissionDecision {
+	return nil
+}
+
+func (c *fakeOpenAIComponent) FinalizeCanceledCapacityAdmission(ctx context.Context, lease *aigwtypes.AdmissionLease, usage *token.Usage) {
+	c.FinalizeCapacityAdmission(ctx, lease, usage)
+}
+
+func (c *fakeOpenAIComponent) FinalizeCapacityAdmission(ctx context.Context, lease *aigwtypes.AdmissionLease, usage *token.Usage) {
+}
+
+func (c *fakeOpenAIComponent) EstimateAdmissionTokens(promptText string) int64 {
+	return 0
+}
+
+func (c *fakeOpenAIComponent) SetCapacityAdmissionAvailabilitySource(src aigwtypes.UpstreamCircuitStateSource) {
+}
+
+func (c *fakeOpenAIComponent) ShutdownCapacityAdmission() {
+}
+
+type fakeHTTPDoer struct {
+	t        *testing.T
+	wantURL  string
+	wantAuth string
+	called   bool
+}
+
+func (d *fakeHTTPDoer) Do(req *http.Request) (*http.Response, error) {
+	d.called = true
+	require.Equal(d.t, http.MethodGet, req.Method)
+	require.Equal(d.t, d.wantURL, req.URL.String())
+	require.Equal(d.t, d.wantAuth, req.Header.Get("Authorization"))
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"id":"provider-id","object":"video","status":"completed"}`)),
+	}, nil
+}
+
+func TestVideoProcessorRefreshUsesHTTPDoer(t *testing.T) {
+	endpoint := "https://upstream.example/v1/videos"
+	doer := &fakeHTTPDoer{
+		t:        t,
+		wantURL:  "https://upstream.example/v1/videos/provider-id",
+		wantAuth: "Bearer token",
+	}
+	openaiComp := &fakeOpenAIComponent{
+		model: &aigwtypes.Model{
+			BaseModel: aigwtypes.BaseModel{
+				ID:   "video-model",
+				Task: string(commontypes.Text2Video),
+			},
+			Endpoint: endpoint,
+			Upstreams: []commontypes.UpstreamConfig{
+				{ID: 7, URL: endpoint, AuthHeader: "Bearer token"},
+			},
+		},
+	}
+	processor := NewProcessor(openaiComp, nil, doer)
+
+	status, err := processor.Refresh(context.Background(), taskprocessor.GenerationRef{
+		ResourceID:         "gateway-id",
+		ProviderResourceID: "provider-id",
+		ModelID:            "video-model",
+		UpstreamID:         7,
+		OwnerUUID:          "owner-uuid-123",
+	})
+
+	require.NoError(t, err)
+	require.True(t, doer.called)
+	require.True(t, openaiComp.getModelCalled, "GetModelByID should have been called")
+	require.Equal(t, "owner-uuid-123", openaiComp.lastNsUUID, "GetModelByID should receive the task owner UUID")
+	require.Equal(t, string(commontypes.AIGatewayAsyncGenerationStatusCompleted), status.Status)
+	require.Equal(t, "completed", status.ProviderMetadata[text2video.ProviderStatusMetadataKey])
+}

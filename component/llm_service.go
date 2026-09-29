@@ -1,0 +1,913 @@
+package component
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"strings"
+
+	"opencsg.com/csghub-server/aigateway/sample"
+	aigatewaytypes "opencsg.com/csghub-server/aigateway/types"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/config"
+	"opencsg.com/csghub-server/common/types"
+)
+
+// LLMServiceComponent is an interface that defines methods for interacting with LLM configurations.
+type LLMServiceComponent interface {
+	// IndexLLMConfig retrieves a batch of LLM configurations.
+	IndexLLMConfig(ctx context.Context, per, page int, search *types.SearchLLMConfig) ([]*types.LLMConfig, int, error)
+	IndexPromptPrefix(ctx context.Context, per, page int, search *types.SearchPromptPrefix) ([]*database.PromptPrefix, int, error)
+	ShowLLMConfig(ctx context.Context, id int64) (*types.LLMConfig, error)
+	ShowPromptConfig(ctx context.Context, id int64) (*types.PromptPrefix, error)
+	CreateLLMConfig(ctx context.Context, req *types.CreateLLMConfigReq) (*types.LLMConfig, error)
+	CreatePromptPrefix(ctx context.Context, req *types.CreatePromptPrefixReq) (*types.PromptPrefix, error)
+	// UpdateLLMConfig updates the LLM configuration.
+	UpdateLLMConfig(ctx context.Context, req *types.UpdateLLMConfigReq) (*types.LLMConfig, error)
+	UpdatePromptPrefix(ctx context.Context, req *types.UpdatePromptPrefixReq) (*types.PromptPrefix, error)
+	// DeleteLLMConfig deletes the LLM configuration by ID.
+	DeleteLLMConfig(ctx context.Context, id int64) error
+	// DeletePromptPrefix deletes the prompt prefix by ID.
+	DeletePromptPrefix(ctx context.Context, id int64) error
+	ListExternalLLMs(ctx context.Context) ([]*types.LLMConfig, error)
+	// CreateUpstream adds a new upstream to an existing LLM config.
+	CreateUpstream(ctx context.Context, req *types.CreateUpstreamReq) (*types.UpstreamConfig, error)
+	// UpdateUpstream updates an existing upstream by ID.
+	UpdateUpstream(ctx context.Context, req *types.UpdateUpstreamReq) (*types.UpstreamConfig, error)
+	// DeleteUpstream deletes an upstream by ID.
+	DeleteUpstream(ctx context.Context, id int64) error
+	// TestUpstream tests connectivity to an upstream endpoint by ID. It fetches
+	// the upstream config from the database, sends a simple "hi" prompt to the
+	// upstream URL (supporting /chat/completions and /responses endpoints), and
+	// returns the masked request summary, response status, body and content.
+	TestUpstream(ctx context.Context, req *types.TestUpstreamReq) (*types.TestUpstreamResult, error)
+}
+
+type llmServiceComponentImpl struct {
+	llmConfigStore    database.LLMConfigStore
+	upstreamStore     database.UpstreamStore
+	promptPrefixStore database.PromptPrefixStore
+	repoStore         database.RepoStore
+	healthStateStore  database.AIGatewayUpstreamHealthStateStore
+	circuitStateStore database.AIGatewayUpstreamCircuitStateStore
+	accountComponent  AccountingComponent
+	sampleRegistry    *sample.Registry
+}
+
+var ErrInvalidLLMConfig = errors.New("invalid llm config")
+
+func NewLLMServiceComponent(config *config.Config) (LLMServiceComponent, error) {
+	llmConfigStore := database.NewLLMConfigStore(config)
+	promptPrefixStore := database.NewPromptPrefixStore(config)
+	repoStore := database.NewRepoStore()
+	upstreamStore := database.NewUpstreamStore(config)
+	healthStateStore := database.NewAIGatewayUpstreamHealthStateStore()
+	circuitStateStore := database.NewAIGatewayUpstreamCircuitStateStore()
+	ac, err := NewAccountingComponent(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create accounting component: %w", err)
+	}
+	llmServiceComp := &llmServiceComponentImpl{
+		llmConfigStore:    llmConfigStore,
+		upstreamStore:     upstreamStore,
+		promptPrefixStore: promptPrefixStore,
+		repoStore:         repoStore,
+		healthStateStore:  healthStateStore,
+		circuitStateStore: circuitStateStore,
+		accountComponent:  ac,
+		sampleRegistry:    sample.NewDefaultRegistry(),
+	}
+	return llmServiceComp, nil
+}
+
+func (s *llmServiceComponentImpl) IndexLLMConfig(ctx context.Context, per, page int, search *types.SearchLLMConfig) ([]*types.LLMConfig, int, error) {
+	if search != nil {
+		if err := validateOptionalLLMTypes(search.Types); err != nil {
+			return nil, 0, err
+		}
+	}
+	dbLLMConfigs, total, err := s.llmConfigStore.Index(ctx, per, page, search)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	llmConfigs := make([]*types.LLMConfig, 0, len(dbLLMConfigs))
+	for _, cfg := range dbLLMConfigs {
+		upstreams := buildUpstreamConfigs(cfg.Upstreams)
+		isAvailable, reason := computeLLMAvailability(upstreams)
+		llmConfigs = append(llmConfigs, &types.LLMConfig{
+			ID:                 cfg.ID,
+			ModelName:          cfg.ModelName,
+			Source:             aggregateLLMSource(upstreams),
+			OfficialName:       cfg.PrimaryOfficialName(),
+			Upstreams:          upstreams,
+			Type:               cfg.Type,
+			Types:              database.SplitLLMType(cfg.Type),
+			Enabled:            cfg.Enabled,
+			RoutingPolicy:      cfg.RoutingPolicy,
+			Metadata:           cfg.Metadata,
+			RepoID:             cfg.RepoID,
+			NeedSensitiveCheck: cfg.NeedSensitiveCheck,
+			ModelSizeB:         cfg.ModelSizeB,
+			IsAvailable:        cfg.Enabled && isAvailable,
+			AvailabilityReason: reason,
+			CreatedAt:          cfg.CreatedAt,
+			UpdatedAt:          cfg.UpdatedAt,
+		})
+	}
+
+	return llmConfigs, total, nil
+}
+
+func (s *llmServiceComponentImpl) IndexPromptPrefix(ctx context.Context, per, page int, search *types.SearchPromptPrefix) ([]*database.PromptPrefix, int, error) {
+	promptPrefixes, total, err := s.promptPrefixStore.Index(ctx, per, page, search)
+	if err != nil {
+		return nil, 0, err
+	}
+	return promptPrefixes, total, nil
+}
+
+func (s *llmServiceComponentImpl) ShowLLMConfig(ctx context.Context, id int64) (*types.LLMConfig, error) {
+	dbLlmConfig, err := s.llmConfigStore.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// Build upstream configs from relational upstreams with health/circuit state
+	upstreams := buildUpstreamConfigs(dbLlmConfig.Upstreams)
+	// Derive deprecated API-level fields from the first enabled upstream
+	llmConfig := &types.LLMConfig{
+		ID:                 dbLlmConfig.ID,
+		ModelName:          dbLlmConfig.ModelName,
+		Upstreams:          upstreams,
+		Type:               dbLlmConfig.Type,
+		Types:              database.SplitLLMType(dbLlmConfig.Type),
+		Enabled:            dbLlmConfig.Enabled,
+		RoutingPolicy:      dbLlmConfig.RoutingPolicy,
+		Metadata:           dbLlmConfig.Metadata,
+		RepoID:             dbLlmConfig.RepoID,
+		NeedSensitiveCheck: dbLlmConfig.NeedSensitiveCheck,
+		ModelSizeB:         dbLlmConfig.ModelSizeB,
+		CreatedAt:          dbLlmConfig.CreatedAt,
+		UpdatedAt:          dbLlmConfig.UpdatedAt,
+	}
+	isAvailable, reason := computeLLMAvailability(upstreams)
+	llmConfig.IsAvailable = llmConfig.Enabled && isAvailable
+	llmConfig.AvailabilityReason = reason
+	if dbLlmConfig.RepoID > 0 {
+		repo, err := s.repoStore.FindById(ctx, dbLlmConfig.RepoID)
+		if err == nil && repo != nil {
+			llmConfig.Repo = &types.RepositoryLite{
+				ID:          repo.ID,
+				Path:        repo.Path,
+				Name:        repo.Name,
+				Nickname:    repo.Nickname,
+				Description: repo.Description,
+			}
+		}
+	}
+	return llmConfig, nil
+}
+
+func (s *llmServiceComponentImpl) ShowPromptConfig(ctx context.Context, id int64) (*types.PromptPrefix, error) {
+	dbPromptPrefix, err := s.promptPrefixStore.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	promptPrefix := &types.PromptPrefix{
+		ID:   dbPromptPrefix.ID,
+		ZH:   dbPromptPrefix.ZH,
+		EN:   dbPromptPrefix.EN,
+		Kind: dbPromptPrefix.Kind,
+	}
+	return promptPrefix, nil
+}
+
+func (s *llmServiceComponentImpl) UpdateLLMConfig(ctx context.Context, req *types.UpdateLLMConfigReq) (*types.LLMConfig, error) {
+	llmConfig, err := s.llmConfigStore.GetByID(ctx, req.ID)
+	if err != nil {
+		return nil, err
+	}
+	if req.ModelName != nil {
+		modelName, err := normalizeRequiredLLMModelName(*req.ModelName)
+		if err != nil {
+			return nil, err
+		}
+		llmConfig.ModelName = modelName
+	}
+	if req.Types != nil {
+		if err := validateLLMTypes(*req.Types); err != nil {
+			return nil, err
+		}
+		llmConfig.Type = database.CombineLLMTypes(*req.Types)
+	}
+	if req.Enabled != nil {
+		llmConfig.Enabled = *req.Enabled
+	}
+	if req.RoutingPolicy != nil {
+		llmConfig.RoutingPolicy = *req.RoutingPolicy
+	}
+	if req.Metadata != nil {
+		llmConfig.Metadata = *req.Metadata
+	}
+	if req.RepoID != nil {
+		llmConfig.RepoID = *req.RepoID
+	}
+	if req.NeedSensitiveCheck != nil {
+		llmConfig.NeedSensitiveCheck = *req.NeedSensitiveCheck
+	}
+	if req.ModelSizeB != nil {
+		llmConfig.ModelSizeB = *req.ModelSizeB
+	}
+	updatedConfig, updateErr := s.llmConfigStore.Update(ctx, *llmConfig)
+	if updateErr != nil {
+		return nil, updateErr
+	}
+	// Re-read upstreams from DB to include IDs and any DB-side defaults
+	dbUpstreams, err := s.upstreamStore.ListByLLMConfigID(ctx, updatedConfig.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read upstreams: %w", err)
+	}
+	upstreams := buildUpstreamConfigs(upstreamPtrsToValues(dbUpstreams))
+	resLLMConfig := &types.LLMConfig{
+		ID:                 updatedConfig.ID,
+		ModelName:          updatedConfig.ModelName,
+		Upstreams:          upstreams,
+		Type:               updatedConfig.Type,
+		Types:              database.SplitLLMType(updatedConfig.Type),
+		Enabled:            updatedConfig.Enabled,
+		RoutingPolicy:      updatedConfig.RoutingPolicy,
+		Metadata:           updatedConfig.Metadata,
+		RepoID:             updatedConfig.RepoID,
+		NeedSensitiveCheck: updatedConfig.NeedSensitiveCheck,
+		ModelSizeB:         updatedConfig.ModelSizeB,
+		CreatedAt:          updatedConfig.CreatedAt,
+		UpdatedAt:          updatedConfig.UpdatedAt,
+	}
+	isAvailable, reason := computeLLMAvailability(upstreams)
+	resLLMConfig.IsAvailable = resLLMConfig.Enabled && isAvailable
+	resLLMConfig.AvailabilityReason = reason
+	return resLLMConfig, nil
+}
+
+func (s *llmServiceComponentImpl) UpdatePromptPrefix(ctx context.Context, req *types.UpdatePromptPrefixReq) (*types.PromptPrefix, error) {
+	promptPrefix, err := s.promptPrefixStore.GetByID(ctx, req.ID)
+	if err != nil {
+		return nil, err
+	}
+	if req.ZH != nil {
+		promptPrefix.ZH = *req.ZH
+	}
+	if req.EN != nil {
+		promptPrefix.EN = *req.EN
+	}
+	if req.Kind != nil {
+		promptPrefix.Kind = *req.Kind
+	}
+	_, err = s.promptPrefixStore.Update(ctx, *promptPrefix)
+	if err != nil {
+		return nil, err
+	}
+	resPromptPrefix := &types.PromptPrefix{
+		ID:   promptPrefix.ID,
+		ZH:   promptPrefix.ZH,
+		EN:   promptPrefix.EN,
+		Kind: promptPrefix.Kind,
+	}
+	return resPromptPrefix, nil
+}
+
+func (s *llmServiceComponentImpl) CreateLLMConfig(ctx context.Context, req *types.CreateLLMConfigReq) (*types.LLMConfig, error) {
+	var repoID int64
+	if req.RepoID != nil {
+		repoID = *req.RepoID
+	}
+	modelName, err := normalizeRequiredLLMModelName(req.ModelName)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.validateLLMEndpointConfig(req.Upstreams); err != nil {
+		return nil, err
+	}
+	if err := validateLLMTypes(req.Types); err != nil {
+		return nil, err
+	}
+	dbLLMConfig := database.LLMConfig{
+		ModelName:          modelName,
+		Type:               database.CombineLLMTypes(req.Types),
+		Enabled:            req.Enabled,
+		RoutingPolicy:      req.RoutingPolicy,
+		Metadata:           req.Metadata,
+		RepoID:             repoID,
+		NeedSensitiveCheck: req.NeedSensitiveCheck,
+		ModelSizeB:         req.ModelSizeB,
+	}
+	dbRes, err := s.llmConfigStore.Create(ctx, dbLLMConfig)
+	if err != nil {
+		return nil, err
+	}
+	// Create upstreams in the relational table (bun auto-fills ID after insert)
+	createdUpstreams := make([]database.Upstream, 0, len(req.Upstreams))
+	for _, u := range req.Upstreams {
+		if strings.TrimSpace(u.URL) == "" {
+			continue
+		}
+		dbUp := &database.Upstream{
+			LLMConfigID:           dbRes.ID,
+			URL:                   strings.TrimSpace(u.URL),
+			Weight:                u.Weight,
+			Enabled:               u.Enabled,
+			ModelName:             strings.TrimSpace(u.ModelName),
+			AuthHeader:            u.AuthHeader,
+			Provider:              strings.TrimSpace(u.Provider),
+			HealthCheckEnabled:    u.HealthCheckEnabled,
+			CircuitBreakerEnabled: u.CircuitBreakerEnabled,
+			Source:                types.UpstreamSourceExternal,
+			Tags:                  u.Tags,
+			Metadata:              u.Metadata,
+			LimitPolicy:           u.LimitPolicy,
+			CapacityPolicy:        u.CapacityPolicy,
+		}
+		if dbUp.Weight <= 0 {
+			dbUp.Weight = 1
+		}
+		if err := s.upstreamStore.Create(ctx, dbUp); err != nil {
+			return nil, fmt.Errorf("create upstream: %w", err)
+		} else {
+			createdUpstreams = append(createdUpstreams, *dbUp)
+		}
+	}
+	upstreams := buildUpstreamConfigs(createdUpstreams)
+	resLLMConfig := &types.LLMConfig{
+		ID:                 dbRes.ID,
+		ModelName:          dbRes.ModelName,
+		Upstreams:          upstreams,
+		Type:               dbRes.Type,
+		Types:              database.SplitLLMType(dbRes.Type),
+		Enabled:            dbRes.Enabled,
+		RoutingPolicy:      dbRes.RoutingPolicy,
+		Metadata:           dbRes.Metadata,
+		RepoID:             dbRes.RepoID,
+		NeedSensitiveCheck: dbRes.NeedSensitiveCheck,
+		ModelSizeB:         dbRes.ModelSizeB,
+		CreatedAt:          dbRes.CreatedAt,
+		UpdatedAt:          dbRes.UpdatedAt,
+	}
+	isAvailable, reason := computeLLMAvailability(upstreams)
+	resLLMConfig.IsAvailable = resLLMConfig.Enabled && isAvailable
+	resLLMConfig.AvailabilityReason = reason
+	return resLLMConfig, nil
+}
+
+func normalizeRequiredLLMModelName(modelName string) (string, error) {
+	trimmed := strings.TrimSpace(modelName)
+	if trimmed == "" {
+		return "", fmt.Errorf("%w: model_name cannot be empty", ErrInvalidLLMConfig)
+	}
+	return trimmed, nil
+}
+
+func validateLLMTypes(types []int) error {
+	if len(types) == 0 {
+		return fmt.Errorf("%w: types cannot be empty", ErrInvalidLLMConfig)
+	}
+	return validateOptionalLLMTypes(types)
+}
+
+func validateOptionalLLMTypes(types []int) error {
+	for _, typ := range types {
+		if !database.IsValidLLMType(typ) {
+			return fmt.Errorf("%w: invalid llm type %d", ErrInvalidLLMConfig, typ)
+		}
+	}
+	return nil
+}
+
+// validateCapacityPolicy checks an admin-supplied CapacityPolicy against the
+// queue-mode semantics. Disabled policies are stored as-is; enabled policies
+// must set every limit to a positive value except:
+//   - MaxTPM: >= 0 allowed (0 = unlimited, meaningful in rate mode)
+//   - queue fields: MaxQueueDepth and QueueWaitSeconds must be both positive
+//     (queue mode) or both zero (rate mode); a half-configured queue is
+//     rejected
+//   - queue mode requires MaxTPM and MaxRPM to be unset (0): they are not
+//     enforced when the queue is active, so storing them would be misleading
+func validateCapacityPolicy(p *types.CapacityPolicy) error {
+	if p == nil || !p.Enabled {
+		return nil
+	}
+	if p.MaxConcurrency < 1 {
+		return fmt.Errorf("%w: capacity_policy.max_concurrency must be >= 1", ErrInvalidLLMConfig)
+	}
+	if (p.MaxQueueDepth > 0) != (p.QueueWaitSeconds > 0) {
+		return fmt.Errorf(
+			"%w: capacity_policy.max_queue_depth and queue_wait_seconds must be both set (queue mode) or both zero (rate mode)",
+			ErrInvalidLLMConfig)
+	}
+	if p.QueueEnabled() && (p.MaxTPM > 0 || p.MaxRPM > 0) {
+		return fmt.Errorf(
+			"%w: capacity_policy.max_tpm and max_rpm must be unset (0) in queue mode: they are not enforced while the queue is active",
+			ErrInvalidLLMConfig)
+	}
+	if p.MaxTPM < 0 {
+		return fmt.Errorf("%w: capacity_policy.max_tpm must be >= 0 (0 means unlimited)", ErrInvalidLLMConfig)
+	}
+	if p.MaxRPM < 0 {
+		return fmt.Errorf("%w: capacity_policy.max_rpm must be >= 0 (0 means unlimited)", ErrInvalidLLMConfig)
+	}
+	return nil
+}
+
+func (s *llmServiceComponentImpl) CreatePromptPrefix(ctx context.Context, req *types.CreatePromptPrefixReq) (*types.PromptPrefix, error) {
+	dbPromptPrefix := database.PromptPrefix{
+		ZH:   req.ZH,
+		EN:   req.EN,
+		Kind: req.Kind,
+	}
+	dbRes, err := s.promptPrefixStore.Create(ctx, dbPromptPrefix)
+	if err != nil {
+		return nil, err
+	}
+	resPromptPrefix := &types.PromptPrefix{
+		ID:   dbRes.ID,
+		ZH:   dbPromptPrefix.ZH,
+		EN:   dbPromptPrefix.EN,
+		Kind: dbPromptPrefix.Kind,
+	}
+	return resPromptPrefix, nil
+}
+
+func (s *llmServiceComponentImpl) DeleteLLMConfig(ctx context.Context, id int64) error {
+	llmConfig, err := s.llmConfigStore.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	llmName := llmConfig.ModelName
+	// Clean up relational upstreams
+	_ = s.upstreamStore.DeleteByLLMConfigID(ctx, id)
+	err = s.llmConfigStore.Delete(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	// Off-line the corresponding price info
+	delReq := types.AcctPriceOffLineReq{
+		SkuType:    types.SKUCSGHub,
+		ResourceID: fmt.Sprintf(types.ExternalLLMResourceFmt, llmName),
+	}
+	_, err = s.accountComponent.OffLinePrice(ctx, delReq)
+	if err != nil {
+		slog.WarnContext(ctx, "off-line price failed for delete llm config",
+			slog.Any("err", err), slog.Any("llmConfig", llmConfig), slog.Any("delReq", delReq))
+	}
+
+	// Off-line upstream procurement-cost prices of every upstream of this config
+	for _, up := range llmConfig.Upstreams {
+		costReq := types.AcctPriceOffLineReq{
+			SkuType:    types.SKUUpstreamCost,
+			ResourceID: types.UpstreamCostResourceID(up.ID),
+		}
+		_, err = s.accountComponent.OffLinePrice(ctx, costReq)
+		if err != nil {
+			slog.WarnContext(ctx, "off-line upstream cost price failed for delete llm config",
+				slog.Any("err", err), slog.Any("upstreamID", up.ID), slog.Any("costReq", costReq))
+		}
+	}
+
+	return nil
+}
+
+func (s *llmServiceComponentImpl) DeletePromptPrefix(ctx context.Context, id int64) error {
+	err := s.promptPrefixStore.Delete(ctx, id)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *llmServiceComponentImpl) validateLLMEndpointConfig(upstreams []types.UpstreamConfig) error {
+	if len(upstreams) == 0 {
+		return fmt.Errorf("%w: upstreams must be provided", ErrInvalidLLMConfig)
+	}
+	enabledCount := 0
+	for _, upstream := range upstreams {
+		if strings.TrimSpace(upstream.URL) == "" {
+			return fmt.Errorf("%w: upstream url cannot be empty", ErrInvalidLLMConfig)
+		}
+		if err := validateUpstreamMetadata(upstream.Metadata); err != nil {
+			return err
+		}
+		if err := validateCapacityPolicy(upstream.CapacityPolicy); err != nil {
+			return err
+		}
+		if upstream.Enabled {
+			enabledCount++
+		}
+	}
+	if len(upstreams) > 0 && enabledCount == 0 {
+		return fmt.Errorf("%w: at least one enabled upstream must be provided", ErrInvalidLLMConfig)
+	}
+	return nil
+}
+
+func (s *llmServiceComponentImpl) ListExternalLLMs(ctx context.Context) ([]*types.LLMConfig, error) {
+	enabled := true
+	search := &types.SearchLLMConfig{
+		Types:   []int{database.LLMTypeAigatewayExternal},
+		Enabled: &enabled,
+	}
+	configs, _, err := s.llmConfigStore.IndexWithRepo(ctx, math.MaxInt, 1, search)
+	if err != nil {
+		return nil, err
+	}
+	var result []*types.LLMConfig
+	for _, cfg := range configs {
+		item := &types.LLMConfig{
+			ID:           cfg.ID,
+			ModelName:    cfg.ModelName,
+			OfficialName: cfg.PrimaryOfficialName(),
+			Type:         cfg.Type,
+			Types:        database.SplitLLMType(cfg.Type),
+			Enabled:      cfg.Enabled,
+			Provider:     cfg.Provider,
+			RepoID:       cfg.RepoID,
+			CreatedAt:    cfg.CreatedAt,
+			UpdatedAt:    cfg.UpdatedAt,
+		}
+		if cfg.Repo != nil {
+			tags, _ := s.repoStore.Tags(ctx, cfg.Repo.ID)
+			var liteTags []types.RepoTag
+			for _, t := range tags {
+				liteTags = append(liteTags, types.RepoTag{
+					Name:     t.Name,
+					Category: t.Category,
+					Group:    t.Group,
+				})
+			}
+			item.Repo = &types.RepositoryLite{
+				ID:          cfg.Repo.ID,
+				Path:        cfg.Repo.Path,
+				Name:        cfg.Repo.Name,
+				Nickname:    cfg.Repo.Nickname,
+				Description: cfg.Repo.Description,
+				Tags:        liteTags,
+			}
+		}
+		result = append(result, item)
+	}
+	return result, nil
+}
+
+func (s *llmServiceComponentImpl) CreateUpstream(ctx context.Context, req *types.CreateUpstreamReq) (*types.UpstreamConfig, error) {
+	if strings.TrimSpace(req.URL) == "" {
+		return nil, fmt.Errorf("%w: upstream url cannot be empty", ErrInvalidLLMConfig)
+	}
+	if req.HealthCheckEnabled != nil {
+		if err := s.validateHealthCheckEndpoint(req.URL, *req.HealthCheckEnabled); err != nil {
+			return nil, err
+		}
+	}
+	// Verify the LLM config exists
+	_, err := s.llmConfigStore.GetByID(ctx, req.LLMConfigID)
+	if err != nil {
+		return nil, fmt.Errorf("llm config not found: %w", err)
+	}
+	if err := validateUpstreamMetadata(req.Metadata); err != nil {
+		return nil, err
+	}
+	if err := validateCapacityPolicy(req.CapacityPolicy); err != nil {
+		return nil, err
+	}
+	dbUp := &database.Upstream{
+		LLMConfigID:           req.LLMConfigID,
+		URL:                   strings.TrimSpace(req.URL),
+		Weight:                req.Weight,
+		Enabled:               req.Enabled,
+		ModelName:             strings.TrimSpace(req.ModelName),
+		AuthHeader:            req.AuthHeader,
+		Provider:              strings.TrimSpace(req.Provider),
+		HealthCheckEnabled:    req.HealthCheckEnabled != nil && *req.HealthCheckEnabled,
+		CircuitBreakerEnabled: req.CircuitBreakerEnabled != nil && *req.CircuitBreakerEnabled,
+		Source:                types.UpstreamSourceExternal,
+		Tags:                  req.Tags,
+		Metadata:              req.Metadata,
+		LimitPolicy:           req.LimitPolicy,
+		CapacityPolicy:        req.CapacityPolicy,
+	}
+	if dbUp.Weight <= 0 {
+		dbUp.Weight = 1
+	}
+	if err := s.upstreamStore.Create(ctx, dbUp); err != nil {
+		return nil, fmt.Errorf("failed to create upstream: %w", err)
+	}
+	res := buildUpstreamConfigs([]database.Upstream{*dbUp})
+	return &res[0], nil
+}
+
+func (s *llmServiceComponentImpl) UpdateUpstream(ctx context.Context, req *types.UpdateUpstreamReq) (*types.UpstreamConfig, error) {
+	dbUp, err := s.upstreamStore.GetByID(ctx, req.ID)
+	if err != nil {
+		return nil, fmt.Errorf("upstream not found: %w", err)
+	}
+	effectiveURL := dbUp.URL
+	if req.URL != nil {
+		effectiveURL = strings.TrimSpace(*req.URL)
+	}
+	effectiveHealthCheckEnabled := dbUp.HealthCheckEnabled
+	if req.HealthCheckEnabled != nil {
+		effectiveHealthCheckEnabled = *req.HealthCheckEnabled
+	}
+	if err := s.validateHealthCheckEndpoint(effectiveURL, effectiveHealthCheckEnabled); err != nil {
+		return nil, err
+	}
+	// Snapshot old state to detect transitions
+	wasEnabled := dbUp.Enabled
+	wasHealthCheckEnabled := dbUp.HealthCheckEnabled
+	wasCircuitBreakerEnabled := dbUp.CircuitBreakerEnabled
+
+	// Protect source-owned fields on internal (csghub) upstreams.
+	// These fields are managed by the deploy sync and must not be overwritten
+	// by admin API updates. Only UI-configured fields are editable.
+	isCSGHubSource := dbUp.Source == types.UpstreamSourceCSGHubDeploy
+
+	// Apply partial updates
+	if req.URL != nil && !isCSGHubSource {
+		dbUp.URL = strings.TrimSpace(*req.URL)
+	}
+	if req.Weight != nil {
+		dbUp.Weight = *req.Weight
+	}
+	if req.Enabled != nil {
+		dbUp.Enabled = *req.Enabled
+	}
+	if req.ModelName != nil && !isCSGHubSource {
+		dbUp.ModelName = strings.TrimSpace(*req.ModelName)
+	}
+	if req.AuthHeader != nil && !isCSGHubSource {
+		dbUp.AuthHeader = *req.AuthHeader
+	}
+	if req.Provider != nil && !isCSGHubSource {
+		dbUp.Provider = strings.TrimSpace(*req.Provider)
+	}
+	if req.HealthCheckEnabled != nil {
+		dbUp.HealthCheckEnabled = *req.HealthCheckEnabled
+	}
+	if req.CircuitBreakerEnabled != nil {
+		dbUp.CircuitBreakerEnabled = *req.CircuitBreakerEnabled
+	}
+	if req.LimitPolicy != nil {
+		dbUp.LimitPolicy = *req.LimitPolicy
+	}
+	if req.CapacityPolicy != nil {
+		if *req.CapacityPolicy == nil {
+			// Component-internal clear; not reachable over HTTP because
+			// encoding/json binds an explicit JSON null to a nil outer
+			// pointer (i.e. omitted). Admins turn the policy off with
+			// enabled=false instead.
+			dbUp.CapacityPolicy = nil
+		} else {
+			newPolicy := **req.CapacityPolicy
+			// An update without any limit values only toggles Enabled and
+			// keeps the stored limits, so a temporary disable (and a later
+			// re-enable) does not lose the admin's configuration. Any
+			// explicit limit replaces the stored policy wholesale.
+			if newPolicy.AllLimitsUnset() && dbUp.CapacityPolicy != nil {
+				newPolicy.MaxConcurrency = dbUp.CapacityPolicy.MaxConcurrency
+				newPolicy.MaxQueueDepth = dbUp.CapacityPolicy.MaxQueueDepth
+				newPolicy.MaxTPM = dbUp.CapacityPolicy.MaxTPM
+				newPolicy.MaxRPM = dbUp.CapacityPolicy.MaxRPM
+				newPolicy.QueueWaitSeconds = dbUp.CapacityPolicy.QueueWaitSeconds
+			}
+			// Validate the effective (merged) policy: whatever ends up stored
+			// must satisfy the queue-mode semantics.
+			if err := validateCapacityPolicy(&newPolicy); err != nil {
+				return nil, err
+			}
+			dbUp.CapacityPolicy = &newPolicy
+		}
+	}
+	if req.Tags != nil {
+		dbUp.Tags = *req.Tags
+	}
+	if req.Metadata != nil {
+		if err := validateUpstreamMetadata(req.Metadata); err != nil {
+			return nil, err
+		}
+		if isCSGHubSource {
+			// For csghub upstreams, preserve sync-owned metadata fields
+			// (InternalModelInfo including Host, Protocol) and only apply
+			// UI-configurable metadata (ResponsesChatAdapter). If the existing
+			// row has no metadata yet (e.g. not yet synced), clear the
+			// sync-owned fields so client-supplied values cannot leak in.
+			if dbUp.Metadata != nil {
+				req.Metadata.InternalModelInfo = dbUp.Metadata.InternalModelInfo
+				req.Metadata.Protocol = dbUp.Metadata.Protocol
+			} else {
+				req.Metadata.InternalModelInfo = nil
+				req.Metadata.Protocol = ""
+			}
+		}
+		dbUp.Metadata = req.Metadata
+	}
+	if dbUp.Weight <= 0 {
+		dbUp.Weight = 1
+	}
+	if err := s.upstreamStore.Update(ctx, dbUp); err != nil {
+		return nil, fmt.Errorf("failed to update upstream: %w", err)
+	}
+
+	// When upstream or check is re-enabled, reset stale state to unknown.
+	// Existing DB records from the previous active period are outdated,
+	// but we preserve them by updating rather than deleting.
+	if dbUp.Enabled {
+		if (!wasEnabled || !wasHealthCheckEnabled) && dbUp.HealthCheckEnabled {
+			_ = s.resetHealthStateToUnknown(ctx, dbUp.ID)
+		}
+		if (!wasEnabled || !wasCircuitBreakerEnabled) && dbUp.CircuitBreakerEnabled {
+			_ = s.resetCircuitStateToUnknown(ctx, dbUp.ID)
+		}
+	}
+
+	// Re-read upstream to pick up refreshed health/circuit state
+	dbUp, err = s.upstreamStore.GetByID(ctx, req.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reload upstream: %w", err)
+	}
+	res := buildUpstreamConfigs([]database.Upstream{*dbUp})
+	return &res[0], nil
+}
+
+// resetHealthStateToUnknown resets the health state of an upstream to unknown
+// if a DB record exists. No-op if no record exists (buildUpstreamConfigs
+// will treat nil as unknown).
+func (s *llmServiceComponentImpl) resetHealthStateToUnknown(ctx context.Context, upstreamID int64) error {
+	_, err := s.healthStateStore.MutateByUpstreamID(ctx, database.AIGatewayUpstreamHealthStateMutation{
+		UpstreamID: upstreamID,
+		Mutate: func(state *database.AIGatewayUpstreamHealthState) error {
+			state.HealthState = string(aigatewaytypes.HealthStateUnknown)
+			return nil
+		},
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	return err
+}
+
+// resetCircuitStateToUnknown resets the circuit state of an upstream to unknown
+// if a DB record exists. No-op if no record exists (buildUpstreamConfigs
+// will treat nil as unknown).
+func (s *llmServiceComponentImpl) resetCircuitStateToUnknown(ctx context.Context, upstreamID int64) error {
+	state, err := s.circuitStateStore.GetByUpstreamID(ctx, upstreamID)
+	if err != nil {
+		// No record exists, nothing to reset
+		return nil
+	}
+	state.CircuitState = string(aigatewaytypes.CircuitStateUnknown)
+	return s.circuitStateStore.Update(ctx, state)
+}
+
+func (s *llmServiceComponentImpl) DeleteUpstream(ctx context.Context, id int64) error {
+	upstream, err := s.upstreamStore.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := s.upstreamStore.Delete(ctx, id); err != nil {
+		return err
+	}
+
+	// Off-line the upstream's procurement-cost prices
+	costReq := types.AcctPriceOffLineReq{
+		SkuType:    types.SKUUpstreamCost,
+		ResourceID: types.UpstreamCostResourceID(id),
+	}
+	_, err = s.accountComponent.OffLinePrice(ctx, costReq)
+	if err != nil {
+		slog.WarnContext(ctx, "off-line upstream cost price failed for delete upstream",
+			slog.Any("err", err), slog.Any("upstreamID", id), slog.Any("llmConfigID", upstream.LLMConfigID), slog.Any("costReq", costReq))
+	}
+	return nil
+}
+
+// upstreamPtrsToValues converts a slice of upstream pointers to a slice of values.
+func upstreamPtrsToValues(ptrs []*database.Upstream) []database.Upstream {
+	result := make([]database.Upstream, 0, len(ptrs))
+	for _, p := range ptrs {
+		result = append(result, *p)
+	}
+	return result
+}
+
+// buildUpstreamConfigs converts database.Upstream slice to types.UpstreamConfig slice.
+func buildUpstreamConfigs(dbUpstreams []database.Upstream) []types.UpstreamConfig {
+	result := make([]types.UpstreamConfig, 0, len(dbUpstreams))
+	for _, u := range dbUpstreams {
+		uc := types.UpstreamConfig{
+			ID:                    u.ID,
+			Source:                u.Source,
+			SourceID:              u.SourceID,
+			URL:                   u.URL,
+			Weight:                u.Weight,
+			Enabled:               u.Enabled,
+			ModelName:             u.ModelName,
+			AuthHeader:            u.AuthHeader,
+			Provider:              u.Provider,
+			HealthCheckEnabled:    u.HealthCheckEnabled,
+			CircuitBreakerEnabled: u.CircuitBreakerEnabled,
+			Tags:                  u.Tags,
+			Metadata:              u.Metadata,
+			LimitPolicy:           u.LimitPolicy,
+			CapacityPolicy:        u.CapacityPolicy,
+		}
+		// Only use the real DB state when the feature is enabled AND a record exists.
+		// In all other cases (feature off, no record yet), the state is "unknown".
+		if u.HealthCheckEnabled && u.HealthState != nil {
+			uc.HealthState = u.HealthState.HealthState
+		} else {
+			uc.HealthState = string(aigatewaytypes.HealthStateUnknown)
+		}
+		if u.CircuitBreakerEnabled && u.CircuitState != nil {
+			uc.CircuitState = u.CircuitState.CircuitState
+		} else {
+			uc.CircuitState = string(aigatewaytypes.CircuitStateUnknown)
+		}
+		uc.IsAvailable, _ = computeUpstreamAvailability(uc)
+		uc.AvailabilityStatus = computeUpstreamAvailabilityStatus(uc)
+		result = append(result, uc)
+	}
+	return result
+}
+
+func computeUpstreamAvailability(u types.UpstreamConfig) (bool, string) {
+	if !u.Enabled {
+		return false, aigatewaytypes.ReasonUpstreamDisabled
+	}
+	// Only check states when the corresponding feature is enabled.
+	// "unknown" state means "not yet probed" and should NOT block traffic —
+	// only explicitly bad states (open circuit, unhealthy) make an upstream unavailable.
+	if u.CircuitBreakerEnabled && u.CircuitState == string(aigatewaytypes.CircuitStateOpen) {
+		return false, aigatewaytypes.ReasonCircuitBreakerOpen
+	}
+	if u.HealthCheckEnabled && u.HealthState == string(aigatewaytypes.HealthStateUnhealthy) {
+		return false, aigatewaytypes.ReasonHealthStateUnhealthy
+	}
+	return true, ""
+}
+
+func computeUpstreamAvailabilityStatus(u types.UpstreamConfig) string {
+	if !u.Enabled {
+		return string(aigatewaytypes.UpstreamStatusDisabled)
+	}
+	// Check explicitly bad states first — they take priority over "unknown".
+	if u.CircuitBreakerEnabled && u.CircuitState == string(aigatewaytypes.CircuitStateOpen) {
+		return string(aigatewaytypes.UpstreamStatusUnavailable)
+	}
+	if u.HealthCheckEnabled && u.HealthState == string(aigatewaytypes.HealthStateUnhealthy) {
+		return string(aigatewaytypes.UpstreamStatusUnavailable)
+	}
+	if u.HealthCheckEnabled && u.HealthState == string(aigatewaytypes.HealthStateDegraded) {
+		return string(aigatewaytypes.UpstreamStatusDegraded)
+	}
+	// "unknown" means "not yet probed". Report unknown only when every
+	// enabled check still lacks data; any known state (e.g. healthy health
+	// check or closed circuit) is enough signal to report availability.
+	if u.HealthCheckEnabled || u.CircuitBreakerEnabled {
+		healthNotProbed := !u.HealthCheckEnabled || u.HealthState == string(aigatewaytypes.HealthStateUnknown)
+		circuitNotProbed := !u.CircuitBreakerEnabled || u.CircuitState == string(aigatewaytypes.CircuitStateUnknown)
+		if healthNotProbed && circuitNotProbed {
+			return string(aigatewaytypes.UpstreamStatusUnknown)
+		}
+	}
+	return string(aigatewaytypes.UpstreamStatusAvailable)
+}
+
+func computeLLMAvailability(upstreams []types.UpstreamConfig) (bool, string) {
+	if len(upstreams) == 0 {
+		return true, ""
+	}
+	for _, upstream := range upstreams {
+		if available, _ := computeUpstreamAvailability(upstream); available {
+			return true, ""
+		}
+	}
+	return false, aigatewaytypes.ReasonAllUpstreamsUnavailable
+}
+
+// aggregateLLMSource computes a single source value for an LLM config from its
+// upstreams. If all upstreams share the same source, that source is returned.
+// If upstreams have different sources, UpstreamSourceMixed is returned.
+// If there are no upstreams, an empty string is returned.
+func aggregateLLMSource(upstreams []types.UpstreamConfig) types.UpstreamSource {
+	if len(upstreams) == 0 {
+		return ""
+	}
+	first := upstreams[0].Source
+	for _, u := range upstreams[1:] {
+		if u.Source != first {
+			return types.UpstreamSourceMixed
+		}
+	}
+	return first
+}

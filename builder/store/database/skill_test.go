@@ -1,0 +1,217 @@
+package database_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/tests"
+)
+
+func TestSkillStore_CRUD(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewSkillStoreWithDB(db)
+	repo, err := database.NewRepoStoreWithDB(db).CreateRepo(ctx, database.Repository{
+		Path:    "foo/bar",
+		Private: true,
+	})
+	require.Nil(t, err)
+
+	_, err = store.Create(ctx, database.Skill{
+		RepositoryID: 123,
+	})
+	require.Nil(t, err)
+
+	skill := &database.Skill{}
+	err = db.Core.NewSelect().Model(skill).Where("repository_id=?", 123).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, int64(123), skill.RepositoryID)
+
+	skill.RepositoryID = repo.ID
+	err = store.Update(ctx, *skill)
+	require.Nil(t, err)
+	err = db.Core.NewSelect().Model(skill).Where("repository_id=?", repo.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, repo.ID, skill.RepositoryID)
+
+	sk, err := store.ByRepoID(ctx, repo.ID)
+	require.Nil(t, err)
+	require.Equal(t, repo.ID, sk.RepositoryID)
+
+	skByID, err := store.BySkillID(ctx, sk.ID)
+	require.Nil(t, err)
+	require.Equal(t, sk.ID, skByID.ID)
+	require.Equal(t, repo.ID, skByID.RepositoryID)
+	require.NotNil(t, skByID.Repository)
+	require.Equal(t, "foo/bar", skByID.Repository.Path)
+
+	skills, err := store.ByRepoIDs(ctx, []int64{repo.ID}, false)
+	require.Nil(t, err)
+	require.Equal(t, 1, len(skills))
+	require.Equal(t, repo.ID, skills[0].RepositoryID)
+
+	skills, total, err := store.ByUsername(ctx, "foo", 10, 1, false)
+	require.Nil(t, err)
+	require.Equal(t, 1, total)
+	require.Equal(t, 1, len(skills))
+	require.Equal(t, repo.ID, skills[0].RepositoryID)
+
+	skills, total, err = store.ByUsername(ctx, "foo", 10, 1, true)
+	require.Nil(t, err)
+	require.Equal(t, 0, total)
+	require.Equal(t, 0, len(skills))
+
+	sk, err = store.FindByPath(ctx, "foo", "bar")
+	require.Nil(t, err)
+	require.Equal(t, repo.ID, sk.RepositoryID)
+
+	skills, err = store.ListByPath(ctx, []string{"foo/bar"})
+	require.Nil(t, err)
+	require.Equal(t, 1, len(skills))
+	require.Equal(t, repo.ID, skills[0].RepositoryID)
+
+	skills, total, err = store.ByOrgPath(ctx, "foo", 10, 1, false)
+	require.Nil(t, err)
+	require.Equal(t, 1, total)
+	require.Equal(t, 1, len(skills))
+	require.Equal(t, repo.ID, skills[0].RepositoryID)
+
+	skills, total, err = store.ByOrgPath(ctx, "foo", 10, 1, true)
+	require.Nil(t, err)
+	require.Equal(t, 0, total)
+	require.Equal(t, 0, len(skills))
+
+}
+
+func TestSkillStore_UserLikesSkills(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewSkillStoreWithDB(db)
+
+	repo1, err := database.NewRepoStoreWithDB(db).CreateRepo(ctx, database.Repository{
+		Path:    "foo/bar",
+		GitPath: "p1",
+	})
+	require.Nil(t, err)
+	repo2, err := database.NewRepoStoreWithDB(db).CreateRepo(ctx, database.Repository{
+		Path:    "foo/bar2",
+		GitPath: "p2",
+	})
+	require.Nil(t, err)
+
+	repo3, err := database.NewRepoStoreWithDB(db).CreateRepo(ctx, database.Repository{
+		Path:    "foo/bar3",
+		GitPath: "p3",
+	})
+	require.Nil(t, err)
+
+	_, err = store.Create(ctx, database.Skill{
+		RepositoryID: repo1.ID,
+	})
+	require.Nil(t, err)
+	_, err = store.Create(ctx, database.Skill{
+		RepositoryID: repo2.ID,
+	})
+	require.Nil(t, err)
+	_, err = store.Create(ctx, database.Skill{
+		RepositoryID: repo3.ID,
+	})
+	require.Nil(t, err)
+	_, err = db.Core.NewInsert().Model(&database.UserLike{
+		UserID: 123,
+		RepoID: repo2.ID,
+	}).Exec(ctx)
+	require.Nil(t, err)
+	_, err = db.Core.NewInsert().Model(&database.UserLike{
+		UserID:    123,
+		RepoID:    repo3.ID,
+		DeletedAt: time.Now(),
+	}).Exec(ctx)
+	require.Nil(t, err)
+
+	sk, total, err := store.UserLikesSkills(ctx, 123, 10, 1)
+	require.Nil(t, err)
+	require.Equal(t, 1, total)
+	require.Equal(t, repo2.ID, sk[0].RepositoryID)
+
+}
+
+func TestSkillStore_CreateAndUpdateRepoPath(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewSkillStoreWithDB(db)
+
+	repo := &database.Repository{
+		Name: "repo1",
+		Path: "p1",
+	}
+	err := db.Core.NewInsert().Model(repo).Scan(ctx, repo)
+	require.Nil(t, err)
+
+	skill, err := store.CreateAndUpdateRepoPath(ctx, database.Skill{
+		RepositoryID: repo.ID,
+	}, "p2")
+
+	require.Nil(t, err)
+	require.Equal(t, "p2", skill.Repository.Path)
+}
+
+func TestSkillStore_BySkillID_NotFound(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewSkillStoreWithDB(db)
+
+	_, err := store.BySkillID(ctx, 99999)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errorx.ErrDatabaseNoRows))
+}
+
+func TestSkillStore_ByRepoIDs_OnlyPublished(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewSkillStoreWithDB(db)
+	repoWithVersion, err := database.NewRepoStoreWithDB(db).CreateRepo(ctx, database.Repository{
+		Name:    "with-version",
+		Path:    "foo/with-version",
+		GitPath: "skills_foo/with-version",
+	})
+	require.Nil(t, err)
+	repoDraft, err := database.NewRepoStoreWithDB(db).CreateRepo(ctx, database.Repository{
+		Name:    "draft",
+		Path:    "foo/draft",
+		GitPath: "skills_foo/draft",
+	})
+	require.Nil(t, err)
+
+	skillWithVersion, err := store.Create(ctx, database.Skill{RepositoryID: repoWithVersion.ID})
+	require.Nil(t, err)
+	_, err = store.Create(ctx, database.Skill{RepositoryID: repoDraft.ID})
+	require.Nil(t, err)
+
+	version := database.SkillVersion{
+		SkillID: skillWithVersion.ID,
+		Version: "v1.0.0",
+	}
+	_, err = db.Core.NewInsert().Model(&version).Exec(ctx)
+	require.Nil(t, err)
+
+	skills, err := store.ByRepoIDs(ctx, []int64{repoWithVersion.ID, repoDraft.ID}, true)
+	require.Nil(t, err)
+	require.Len(t, skills, 1)
+	require.Equal(t, repoWithVersion.ID, skills[0].RepositoryID)
+}

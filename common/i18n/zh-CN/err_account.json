@@ -1,0 +1,20 @@
+{
+    "error.ACT-ERR-0": {
+        "other": "帐户余额不足"
+    },
+    "error.ACT-ERR-1": {
+        "other": "存在一个活动订阅, 不能重复创建"
+    },
+    "error.ACT-ERR-2": {
+        "other": "非法时间单位. 必须是以下之一: day, week, month, year"
+    },
+    "error.ACT-ERR-3": {
+        "other": "不在订阅有效期内"
+    },
+    "error.ACT-ERR-4": {
+        "other": "必须为非负数价格"
+    },
+    "error.ACT-ERR-5": {
+        "other": "该场景不允许同步扣费"
+    }
+}

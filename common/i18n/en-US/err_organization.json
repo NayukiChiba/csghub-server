@@ -1,0 +1,20 @@
+{
+    "error.ORG-ERR-0": {
+        "other": "Organization member not found"
+    },
+    "error.ORG-ERR-1": {
+        "other": "Organization not found"
+    },
+    "error.ORG-ERR-2": {
+        "other": "You do not have permission to manage this organization"
+    },
+    "error.ORG-ERR-3": {
+        "other": "You do not have permission to access this organization"
+    },
+    "error.ORG-ERR-4": {
+        "other": "The current architecture does not support viewing this organization. Please migrate the organization."
+    },
+    "error.ORG-ERR-5": {
+        "other": "The system already has an organization and cannot create another one"
+    }
+}

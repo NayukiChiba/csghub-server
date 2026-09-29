@@ -1,0 +1,170 @@
+package types
+
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+)
+
+func ResponsesPromptText(req *ResponsesRequest) string {
+	if req == nil {
+		return ""
+	}
+	var b strings.Builder
+	if sys := ResponsesInstructionText(req.Instructions); sys != "" {
+		b.WriteString(sys)
+		b.WriteByte('\n')
+	}
+	b.WriteString(ResponsesInputText(req.Input))
+	return b.String()
+}
+
+// PromptText satisfies types.PromptTextProvider so the Planner can
+// extract prompt text for sensitive-content checking without depending
+// on the concrete ResponsesRequest type.
+func (r *ResponsesRequest) PromptText() string {
+	return ResponsesPromptText(r)
+}
+
+// HasMultimodalContent reports whether the request input carries non-text
+// content parts (images, audio, files). It satisfies
+// types.MultimodalContentProvider so capacity admission can skip the
+// text-based TPM estimate: a text-only estimate is fiction for such requests.
+func (r *ResponsesRequest) HasMultimodalContent() bool {
+	if r == nil || len(r.Input) == 0 {
+		return false
+	}
+	return responsesRawHasMultimodal(r.Input)
+}
+
+func responsesRawHasMultimodal(raw json.RawMessage) bool {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var asString string
+	if err := json.Unmarshal(raw, &asString); err == nil {
+		return false // plain text input
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return false
+	}
+	for _, item := range items {
+		if responsesValueHasMultimodal(item) {
+			return true
+		}
+	}
+	return false
+}
+
+func responsesValueHasMultimodal(v any) bool {
+	switch t := v.(type) {
+	case map[string]any:
+		if s, _ := t["type"].(string); isResponsesMultimodalType(s) {
+			return true
+		}
+		// Content parts live under "content"; "parts" covers the reasoning
+		// item shape for safety.
+		for _, key := range []string{"content", "parts"} {
+			if child, ok := t[key]; ok && responsesValueHasMultimodal(child) {
+				return true
+			}
+		}
+		return false
+	case []any:
+		for _, item := range t {
+			if responsesValueHasMultimodal(item) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func isResponsesMultimodalType(s string) bool {
+	switch s {
+	case "input_image", "input_audio", "input_file", "image", "audio", "file":
+		return true
+	}
+	return false
+}
+
+func ResponsesInstructionText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(text)
+}
+
+func ResponsesInputText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return strings.TrimSpace(string(raw))
+	}
+	var b strings.Builder
+	for _, item := range items {
+		b.WriteString(responsesItemText(item))
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+func responsesItemText(item map[string]any) string {
+	var b strings.Builder
+	switch item["type"] {
+	case "function_call":
+		writeAnyResponsesText(&b, item["name"])
+		writeAnyResponsesText(&b, item["arguments"])
+	case "function_call_output":
+		writeAnyResponsesText(&b, item["output"])
+	default:
+		writeAnyResponsesText(&b, item["content"])
+	}
+	return b.String()
+}
+
+func writeAnyResponsesText(b *strings.Builder, value any) {
+	switch v := value.(type) {
+	case nil:
+		return
+	case string:
+		b.WriteString(v)
+	case []any:
+		for _, item := range v {
+			writeAnyResponsesText(b, item)
+		}
+	case map[string]any:
+		if text, _ := v["text"].(string); text != "" {
+			b.WriteString(text)
+			return
+		}
+		for _, key := range []string{"output", "arguments", "content"} {
+			if child, ok := v[key]; ok {
+				writeAnyResponsesText(b, child)
+			}
+		}
+	default:
+		data, err := json.Marshal(v)
+		if err == nil {
+			var compact bytes.Buffer
+			if json.Compact(&compact, data) == nil {
+				b.Write(compact.Bytes())
+			}
+		}
+	}
+}

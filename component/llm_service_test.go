@@ -1,0 +1,2606 @@
+package component
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"math"
+	"testing"
+
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	mockdatabase "opencsg.com/csghub-server/_mocks/opencsg.com/csghub-server/builder/store/database"
+	mockComps "opencsg.com/csghub-server/_mocks/opencsg.com/csghub-server/component"
+	"opencsg.com/csghub-server/aigateway/sample"
+	aigatewaytypes "opencsg.com/csghub-server/aigateway/types"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/tests"
+	"opencsg.com/csghub-server/common/types"
+)
+
+func TestLLMServiceComponent_CreateLLMConfig(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	upstreamStore.EXPECT().Create(ctx, mock.Anything).Return(nil).Maybe()
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	req := &types.CreateLLMConfigReq{
+		ModelName: "new-model",
+		Types:     []int{16},
+		Enabled:   true,
+		Upstreams: []types.UpstreamConfig{
+			{URL: "http://upstream.example.com/v1", Enabled: true, Weight: 1},
+		},
+		RoutingPolicy: types.RoutingPolicy{
+			Strategy:      "session_hash",
+			SessionHeader: "X-Session-ID",
+			HashReplicas:  128,
+		},
+		Metadata:   map[string]any{"tasks": []any{"text-generation"}},
+		ModelSizeB: 7.5,
+	}
+	dbLLMConfig := &database.LLMConfig{
+		ID:        123,
+		ModelName: "new-model",
+		Type:      16,
+		Enabled:   true,
+		RoutingPolicy: types.RoutingPolicy{
+			Strategy:      "session_hash",
+			SessionHeader: "X-Session-ID",
+			HashReplicas:  128,
+		},
+		Metadata:   map[string]any{"tasks": []any{"text-generation"}},
+		ModelSizeB: 7.5,
+	}
+	stores.LLMConfigMock().EXPECT().Create(ctx, database.LLMConfig{
+		ModelName: "new-model",
+		Type:      16,
+		Enabled:   true,
+		RoutingPolicy: types.RoutingPolicy{
+			Strategy:      "session_hash",
+			SessionHeader: "X-Session-ID",
+			HashReplicas:  128,
+		},
+		Metadata:   map[string]any{"tasks": []any{"text-generation"}},
+		ModelSizeB: 7.5,
+	}).Return(dbLLMConfig, nil)
+	res, err := mc.CreateLLMConfig(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, res.ID, int64(123))
+	require.Equal(t, res.ModelName, "new-model")
+	require.Equal(t, 7.5, res.ModelSizeB)
+}
+
+func TestLLMServiceComponent_CreateLLMConfig_TrimsWhitespace(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	upstreamStore.EXPECT().Create(ctx, &database.Upstream{
+		LLMConfigID: 123,
+		URL:         "http://upstream.example.com/v1",
+		Weight:      1,
+		Enabled:     true,
+		ModelName:   "upstream-model", // trimmed
+		Provider:    "upstream-prov",  // trimmed
+		Source:      types.UpstreamSourceExternal,
+	}).Return(nil)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+		sampleRegistry:    sample.NewDefaultRegistry(),
+	}
+	req := &types.CreateLLMConfigReq{
+		ModelName: "  new-model  ",
+		Types:     []int{16},
+		Enabled:   true,
+		Upstreams: []types.UpstreamConfig{
+			{
+				URL:     "http://upstream.example.com/v1",
+				Enabled: true, Weight: 1,
+				ModelName: "  upstream-model  ",
+				Provider:  "  upstream-prov  ",
+			},
+		},
+	}
+	dbLLMConfig := &database.LLMConfig{ID: 123, ModelName: "new-model", Type: 16, Enabled: true}
+	stores.LLMConfigMock().EXPECT().Create(ctx, database.LLMConfig{
+		ModelName: "new-model",
+		Type:      16,
+		Enabled:   true,
+	}).Return(dbLLMConfig, nil)
+	res, err := mc.CreateLLMConfig(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, "new-model", res.ModelName)
+}
+
+func TestLLMServiceComponent_CreateLLMConfig_RejectsBlankModelName(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+	}
+	req := &types.CreateLLMConfigReq{
+		ModelName: "   ",
+		Types:     []int{16},
+		Enabled:   true,
+		Upstreams: []types.UpstreamConfig{
+			{URL: "http://upstream.example.com/v1", Enabled: true, Weight: 1},
+		},
+	}
+
+	res, err := mc.CreateLLMConfig(ctx, req)
+	require.Nil(t, res)
+	require.ErrorIs(t, err, ErrInvalidLLMConfig)
+	require.Contains(t, err.Error(), "model_name cannot be empty")
+}
+
+func TestLLMServiceComponent_CreateLLMConfig_MultiType(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	upstreamStore.EXPECT().Create(ctx, mock.Anything).Return(nil).Maybe()
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	req := &types.CreateLLMConfigReq{
+		ModelName: "multi-type-model",
+		Types:     []int{database.LLMTypeSummaryReadme, database.LLMTypeAigatewayExternal},
+		Enabled:   true,
+		Upstreams: []types.UpstreamConfig{
+			{URL: "http://upstream.example.com/v1", Enabled: true, Weight: 1},
+		},
+	}
+	dbLLMConfig := &database.LLMConfig{
+		ID:        123,
+		ModelName: "multi-type-model",
+		Type:      database.LLMTypeSummaryReadme | database.LLMTypeAigatewayExternal,
+		Enabled:   true,
+	}
+	stores.LLMConfigMock().EXPECT().Create(ctx, database.LLMConfig{
+		ModelName: "multi-type-model",
+		Type:      database.LLMTypeSummaryReadme | database.LLMTypeAigatewayExternal,
+		Enabled:   true,
+	}).Return(dbLLMConfig, nil)
+	res, err := mc.CreateLLMConfig(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, int64(123), res.ID)
+	require.Equal(t, []int{database.LLMTypeSummaryReadme, database.LLMTypeAigatewayExternal}, res.Types)
+}
+
+func TestLLMServiceComponent_CreateLLMConfig_RejectsInvalidTypes(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+	}
+	req := &types.CreateLLMConfigReq{
+		ModelName: "bad-types-model",
+		Types:     []int{32},
+		Enabled:   true,
+		Upstreams: []types.UpstreamConfig{
+			{URL: "http://upstream.example.com/v1", Enabled: true, Weight: 1},
+		},
+	}
+	res, err := mc.CreateLLMConfig(ctx, req)
+	require.Nil(t, res)
+	require.ErrorIs(t, err, ErrInvalidLLMConfig)
+	require.Contains(t, err.Error(), "invalid llm type")
+}
+
+func TestLLMServiceComponent_CreateLLMConfig_RejectsEmptyTypes(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+	}
+	req := &types.CreateLLMConfigReq{
+		ModelName: "no-types-model",
+		Types:     []int{},
+		Enabled:   true,
+		Upstreams: []types.UpstreamConfig{
+			{URL: "http://upstream.example.com/v1", Enabled: true, Weight: 1},
+		},
+	}
+	res, err := mc.CreateLLMConfig(ctx, req)
+	require.Nil(t, res)
+	require.ErrorIs(t, err, ErrInvalidLLMConfig)
+	require.Contains(t, err.Error(), "types cannot be empty")
+}
+
+func TestLLMServiceComponent_CreatePromptPrefix(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+	}
+	req := &types.CreatePromptPrefixReq{
+		ZH:   "zh",
+		EN:   "en",
+		Kind: "kind",
+	}
+	dbPromptPrefix := &database.PromptPrefix{
+		ID:   123,
+		ZH:   "zh",
+		EN:   "en",
+		Kind: "kind",
+	}
+	stores.PromptPrefixMock().EXPECT().Create(ctx, database.PromptPrefix{
+		ZH:   "zh",
+		EN:   "en",
+		Kind: "kind",
+	}).Return(dbPromptPrefix, nil)
+	res, err := mc.CreatePromptPrefix(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, res.Kind, "kind")
+}
+func TestLLMServiceComponent_IndexLLMConfig(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+	}
+	per := 1
+	page := 1
+	search := &types.SearchLLMConfig{
+		Keyword: "",
+	}
+	dbLLMConfig := &database.LLMConfig{
+		ID:        123,
+		ModelName: "new-model",
+		Type:      666,
+		Enabled:   true,
+	}
+	stores.LLMConfigMock().EXPECT().Index(ctx, per, page, search).Return([]*database.LLMConfig{dbLLMConfig}, 1, nil)
+	res, total, err := mc.IndexLLMConfig(ctx, per, page, search)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, []*types.LLMConfig{{ID: 123, ModelName: "new-model", OfficialName: "new-model", Type: 666, Types: []int{2, 8, 16}, Enabled: true, IsAvailable: true, Upstreams: []types.UpstreamConfig{}}}, res)
+	require.Equal(t, total, 1)
+}
+
+func TestLLMServiceComponent_IndexLLMConfig_RejectsInvalidTypes(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+	}
+	search := &types.SearchLLMConfig{
+		Types: []int{0},
+	}
+
+	res, total, err := mc.IndexLLMConfig(ctx, 1, 1, search)
+	require.Nil(t, res)
+	require.Zero(t, total)
+	require.ErrorIs(t, err, ErrInvalidLLMConfig)
+	require.Contains(t, err.Error(), "invalid llm type 0")
+}
+
+func TestAggregateLLMSource(t *testing.T) {
+	tests := []struct {
+		name      string
+		upstreams []types.UpstreamConfig
+		want      types.UpstreamSource
+	}{
+		{
+			name:      "empty upstreams returns empty source",
+			upstreams: []types.UpstreamConfig{},
+			want:      "",
+		},
+		{
+			name: "single external upstream",
+			upstreams: []types.UpstreamConfig{
+				{Source: types.UpstreamSourceExternal},
+			},
+			want: types.UpstreamSourceExternal,
+		},
+		{
+			name: "single csghub upstream",
+			upstreams: []types.UpstreamConfig{
+				{Source: types.UpstreamSourceCSGHubDeploy},
+			},
+			want: types.UpstreamSourceCSGHubDeploy,
+		},
+		{
+			name: "multiple upstreams same external source",
+			upstreams: []types.UpstreamConfig{
+				{Source: types.UpstreamSourceExternal},
+				{Source: types.UpstreamSourceExternal},
+			},
+			want: types.UpstreamSourceExternal,
+		},
+		{
+			name: "multiple upstreams same csghub source",
+			upstreams: []types.UpstreamConfig{
+				{Source: types.UpstreamSourceCSGHubDeploy},
+				{Source: types.UpstreamSourceCSGHubDeploy},
+			},
+			want: types.UpstreamSourceCSGHubDeploy,
+		},
+		{
+			name: "mixed external and csghub sources",
+			upstreams: []types.UpstreamConfig{
+				{Source: types.UpstreamSourceExternal},
+				{Source: types.UpstreamSourceCSGHubDeploy},
+			},
+			want: types.UpstreamSourceMixed,
+		},
+		{
+			name: "mixed csghub and external sources (reverse order)",
+			upstreams: []types.UpstreamConfig{
+				{Source: types.UpstreamSourceCSGHubDeploy},
+				{Source: types.UpstreamSourceExternal},
+			},
+			want: types.UpstreamSourceMixed,
+		},
+		{
+			name: "three upstreams with mixed sources",
+			upstreams: []types.UpstreamConfig{
+				{Source: types.UpstreamSourceExternal},
+				{Source: types.UpstreamSourceCSGHubDeploy},
+				{Source: types.UpstreamSourceExternal},
+			},
+			want: types.UpstreamSourceMixed,
+		},
+		{
+			name: "upstreams with empty source treated as distinct",
+			upstreams: []types.UpstreamConfig{
+				{Source: ""},
+				{Source: types.UpstreamSourceExternal},
+			},
+			want: types.UpstreamSourceMixed,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := aggregateLLMSource(tt.upstreams)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestLLMServiceComponent_IndexLLMConfig_WithSource(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+	}
+	per := 10
+	page := 1
+	search := &types.SearchLLMConfig{Keyword: ""}
+
+	// LLM config with two external upstreams — aggregated source should be "external"
+	dbLLMConfig := &database.LLMConfig{
+		ID:        200,
+		ModelName: "ext-model",
+		Type:      666,
+		Enabled:   true,
+		Upstreams: []database.Upstream{
+			{ID: 1, Source: types.UpstreamSourceExternal, URL: "http://ext1", Enabled: true, Weight: 1},
+			{ID: 2, Source: types.UpstreamSourceExternal, URL: "http://ext2", Enabled: true, Weight: 1},
+		},
+	}
+	// LLM config with mixed source upstreams — aggregated source should be "mixed"
+	dbLLMConfigMixed := &database.LLMConfig{
+		ID:        201,
+		ModelName: "mixed-model",
+		Type:      666,
+		Enabled:   true,
+		Upstreams: []database.Upstream{
+			{ID: 3, Source: types.UpstreamSourceExternal, URL: "http://ext3", Enabled: true, Weight: 1},
+			{ID: 4, Source: types.UpstreamSourceCSGHubDeploy, URL: "http://csghub1", Enabled: true, Weight: 1},
+		},
+	}
+	// LLM config with all csghub upstreams — aggregated source should be "csghub"
+	dbLLMConfigCSGHub := &database.LLMConfig{
+		ID:        202,
+		ModelName: "csghub-model",
+		Type:      666,
+		Enabled:   true,
+		Upstreams: []database.Upstream{
+			{ID: 5, Source: types.UpstreamSourceCSGHubDeploy, URL: "http://csghub2", Enabled: true, Weight: 1},
+		},
+	}
+
+	stores.LLMConfigMock().EXPECT().Index(ctx, per, page, search).
+		Return([]*database.LLMConfig{dbLLMConfig, dbLLMConfigMixed, dbLLMConfigCSGHub}, 3, nil)
+
+	res, total, err := mc.IndexLLMConfig(ctx, per, page, search)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, 3, total)
+	require.Len(t, res, 3)
+
+	// First config: all external upstreams
+	require.Equal(t, types.UpstreamSourceExternal, res[0].Source)
+	// Second config: mixed sources
+	require.Equal(t, types.UpstreamSourceMixed, res[1].Source)
+	// Third config: all csghub upstreams
+	require.Equal(t, types.UpstreamSourceCSGHubDeploy, res[2].Source)
+}
+
+func TestLLMServiceComponent_IndexPromptPrefix(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+	}
+	per := 1
+	page := 1
+	dbPromptPrefix := &database.PromptPrefix{
+		ID: 123,
+		ZH: "zh",
+	}
+	search := &types.SearchPromptPrefix{}
+	stores.PromptPrefixMock().EXPECT().Index(ctx, per, page, search).Return([]*database.PromptPrefix{dbPromptPrefix}, 1, nil)
+	res, total, err := mc.IndexPromptPrefix(ctx, per, page, search)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, res, []*database.PromptPrefix{dbPromptPrefix})
+	require.Equal(t, total, 1)
+}
+
+func TestLLMServiceComponent_UpdateLLMConfig(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	upstreamStore.EXPECT().ListByLLMConfigID(ctx, int64(123)).Return([]*database.Upstream{}, nil).Maybe()
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	newName := "new-model"
+	metadata := map[string]any{"tasks": []any{"text-to-image"}}
+	routingPolicy := types.RoutingPolicy{
+		Strategy:      "session_hash",
+		SessionHeader: "X-Session-ID",
+		HashReplicas:  128,
+	}
+	newSize := 13.0
+	req := &types.UpdateLLMConfigReq{
+		ID:            123,
+		ModelName:     &newName,
+		RoutingPolicy: &routingPolicy,
+		Metadata:      &metadata,
+		ModelSizeB:    &newSize,
+	}
+	dbLLMConfig := &database.LLMConfig{
+		ID:            123,
+		ModelName:     newName,
+		RoutingPolicy: routingPolicy,
+		Metadata:      metadata,
+		ModelSizeB:    newSize,
+	}
+	stores.LLMConfigMock().EXPECT().GetByID(ctx, int64(123)).Return(dbLLMConfig, nil)
+	stores.LLMConfigMock().EXPECT().Update(ctx, database.LLMConfig{
+		ID:            123,
+		ModelName:     newName,
+		RoutingPolicy: routingPolicy,
+		Metadata:      metadata,
+		ModelSizeB:    newSize,
+	}).Return(dbLLMConfig, nil)
+	res, err := mc.UpdateLLMConfig(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, res.ID, int64(123))
+	require.Equal(t, res.ModelName, "new-model")
+	require.Equal(t, 13.0, res.ModelSizeB)
+}
+
+func TestLLMServiceComponent_UpdateLLMConfig_Types(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	upstreamStore.EXPECT().ListByLLMConfigID(ctx, int64(123)).Return([]*database.Upstream{}, nil).Maybe()
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	newTypes := []int{database.LLMTypeOptimization, database.LLMTypeAigatewayExternal}
+	req := &types.UpdateLLMConfigReq{
+		ID:    123,
+		Types: &newTypes,
+	}
+	dbLLMConfig := &database.LLMConfig{
+		ID:        123,
+		ModelName: "existing-model",
+		Type:      database.LLMTypeComparison,
+	}
+	updatedLLMConfig := &database.LLMConfig{
+		ID:        123,
+		ModelName: "existing-model",
+		Type:      database.LLMTypeOptimization | database.LLMTypeAigatewayExternal,
+	}
+	stores.LLMConfigMock().EXPECT().GetByID(ctx, int64(123)).Return(dbLLMConfig, nil)
+	stores.LLMConfigMock().EXPECT().Update(ctx, database.LLMConfig{
+		ID:        123,
+		ModelName: "existing-model",
+		Type:      database.LLMTypeOptimization | database.LLMTypeAigatewayExternal,
+	}).Return(updatedLLMConfig, nil)
+	res, err := mc.UpdateLLMConfig(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, []int{database.LLMTypeOptimization, database.LLMTypeAigatewayExternal}, res.Types)
+}
+
+func TestLLMServiceComponent_UpdateLLMConfig_TrimsWhitespace(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	upstreamStore.EXPECT().ListByLLMConfigID(ctx, int64(123)).Return([]*database.Upstream{}, nil).Maybe()
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	newName := "  new-model  "
+	req := &types.UpdateLLMConfigReq{
+		ID:        123,
+		ModelName: &newName,
+	}
+	dbLLMConfig := &database.LLMConfig{ID: 123, ModelName: "new-model"}
+	stores.LLMConfigMock().EXPECT().GetByID(ctx, int64(123)).Return(dbLLMConfig, nil)
+	stores.LLMConfigMock().EXPECT().Update(ctx, database.LLMConfig{
+		ID:        123,
+		ModelName: "new-model",
+	}).Return(dbLLMConfig, nil)
+	res, err := mc.UpdateLLMConfig(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, "new-model", res.ModelName)
+}
+
+func TestLLMServiceComponent_UpdateLLMConfig_RejectsBlankModelName(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+	}
+	newName := "   "
+	req := &types.UpdateLLMConfigReq{
+		ID:        123,
+		ModelName: &newName,
+	}
+	stores.LLMConfigMock().EXPECT().GetByID(ctx, int64(123)).Return(&database.LLMConfig{
+		ID:        123,
+		ModelName: "existing-model",
+	}, nil)
+
+	res, err := mc.UpdateLLMConfig(ctx, req)
+	require.Nil(t, res)
+	require.ErrorIs(t, err, ErrInvalidLLMConfig)
+	require.Contains(t, err.Error(), "model_name cannot be empty")
+}
+
+func TestLLMServiceComponent_CreateUpstream(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	upstreamStore.EXPECT().Create(ctx, mock.Anything).Return(nil).Maybe()
+	stores.LLMConfigMock().EXPECT().GetByID(ctx, int64(100)).Return(&database.LLMConfig{ID: 100}, nil)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	req := &types.CreateUpstreamReq{
+		LLMConfigID: 100,
+		URL:         "http://upstream.example.com/v1",
+		Weight:      2,
+		Enabled:     true,
+		Provider:    "test-provider",
+	}
+	res, err := mc.CreateUpstream(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, "http://upstream.example.com/v1", res.URL)
+	require.Equal(t, 2, res.Weight)
+}
+
+func TestLLMServiceComponent_CreateUpstream_WithCapacityPolicy(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	stores.LLMConfigMock().EXPECT().GetByID(ctx, int64(100)).Return(&database.LLMConfig{ID: 100}, nil)
+	// Queue mode: TPM/RPM must be unset because they are not enforced.
+	capacityPolicy := &types.CapacityPolicy{
+		Enabled:          true,
+		MaxConcurrency:   16,
+		MaxQueueDepth:    32,
+		QueueWaitSeconds: 60,
+	}
+	upstreamStore.EXPECT().Create(ctx, &database.Upstream{
+		LLMConfigID:    100,
+		URL:            "http://upstream.example.com/v1",
+		Weight:         1,
+		Enabled:        true,
+		Source:         types.UpstreamSourceExternal,
+		CapacityPolicy: capacityPolicy,
+	}).Return(nil)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	req := &types.CreateUpstreamReq{
+		LLMConfigID:    100,
+		URL:            "http://upstream.example.com/v1",
+		Enabled:        true,
+		CapacityPolicy: capacityPolicy,
+	}
+	res, err := mc.CreateUpstream(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, capacityPolicy, res.CapacityPolicy)
+}
+
+func TestValidateCapacityPolicy(t *testing.T) {
+	cases := []struct {
+		name    string
+		policy  *types.CapacityPolicy
+		wantErr bool
+	}{
+		{
+			name:   "nil policy is valid",
+			policy: nil,
+		},
+		{
+			name:   "disabled policy is stored as-is without validation",
+			policy: &types.CapacityPolicy{Enabled: false, MaxConcurrency: -5},
+		},
+		{
+			name:    "enabled policy with all limits unset is invalid (mode must be explicit)",
+			policy:  &types.CapacityPolicy{Enabled: true},
+			wantErr: true,
+		},
+		{
+			name:   "queue mode is valid",
+			policy: &types.CapacityPolicy{Enabled: true, MaxConcurrency: 16, MaxQueueDepth: 32, QueueWaitSeconds: 60},
+		},
+		{
+			name:   "rate mode is valid",
+			policy: &types.CapacityPolicy{Enabled: true, MaxConcurrency: 16, MaxTPM: 200000, MaxRPM: 120},
+		},
+		{
+			name:   "rate mode with max_tpm zero means unlimited",
+			policy: &types.CapacityPolicy{Enabled: true, MaxConcurrency: 8, MaxRPM: 10},
+		},
+		{
+			name:    "half-configured queue (depth without wait) is invalid",
+			policy:  &types.CapacityPolicy{Enabled: true, MaxConcurrency: 8, MaxQueueDepth: 4},
+			wantErr: true,
+		},
+		{
+			name:    "half-configured queue (wait without depth) is invalid",
+			policy:  &types.CapacityPolicy{Enabled: true, MaxConcurrency: 8, QueueWaitSeconds: 30},
+			wantErr: true,
+		},
+		{
+			name:    "queue mode with max_tpm set is invalid (not enforced in queue mode)",
+			policy:  &types.CapacityPolicy{Enabled: true, MaxConcurrency: 8, MaxQueueDepth: 4, QueueWaitSeconds: 30, MaxTPM: 1000},
+			wantErr: true,
+		},
+		{
+			name:    "queue mode with max_rpm set is invalid (not enforced in queue mode)",
+			policy:  &types.CapacityPolicy{Enabled: true, MaxConcurrency: 8, MaxQueueDepth: 4, QueueWaitSeconds: 30, MaxRPM: 10},
+			wantErr: true,
+		},
+		{
+			name:    "negative max_concurrency is invalid",
+			policy:  &types.CapacityPolicy{Enabled: true, MaxConcurrency: -1},
+			wantErr: true,
+		},
+		{
+			name:    "negative max_queue_depth is invalid",
+			policy:  &types.CapacityPolicy{Enabled: true, MaxQueueDepth: -1},
+			wantErr: true,
+		},
+		{
+			name:    "negative max_tpm is invalid",
+			policy:  &types.CapacityPolicy{Enabled: true, MaxConcurrency: 8, MaxTPM: -1},
+			wantErr: true,
+		},
+		{
+			name:    "negative max_rpm is invalid",
+			policy:  &types.CapacityPolicy{Enabled: true, MaxConcurrency: 8, MaxRPM: -1},
+			wantErr: true,
+		},
+		{
+			name:    "negative queue_wait_seconds is invalid",
+			policy:  &types.CapacityPolicy{Enabled: true, QueueWaitSeconds: -1},
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCapacityPolicy(tc.policy)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.ErrorIs(t, err, ErrInvalidLLMConfig)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestLLMServiceComponent_CreateUpstream_TrimsWhitespace(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	stores.LLMConfigMock().EXPECT().GetByID(ctx, int64(100)).Return(&database.LLMConfig{ID: 100}, nil)
+	upstreamStore.EXPECT().Create(ctx, &database.Upstream{
+		LLMConfigID: 100,
+		URL:         "http://upstream.example.com/v1",
+		Weight:      2,
+		Enabled:     true,
+		ModelName:   "upstream-model",
+		Provider:    "test-provider",
+		Source:      types.UpstreamSourceExternal,
+	}).Return(nil)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	req := &types.CreateUpstreamReq{
+		LLMConfigID: 100,
+		URL:         "http://upstream.example.com/v1",
+		Weight:      2,
+		Enabled:     true,
+		ModelName:   "  upstream-model  ",
+		Provider:    "  test-provider  ",
+	}
+	res, err := mc.CreateUpstream(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, "upstream-model", res.ModelName)
+	require.Equal(t, "test-provider", res.Provider)
+}
+
+func TestLLMServiceComponent_CreateUpstream_HealthCheckDefaultsFalseWhenNil(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	stores.LLMConfigMock().EXPECT().GetByID(ctx, int64(100)).Return(&database.LLMConfig{ID: 100}, nil)
+	// When HealthCheckEnabled and CircuitBreakerEnabled are nil (not provided),
+	// the component should default to false.
+	upstreamStore.EXPECT().Create(ctx, &database.Upstream{
+		LLMConfigID:           100,
+		URL:                   "http://upstream.example.com/v1",
+		Weight:                1,
+		Enabled:               true,
+		HealthCheckEnabled:    false,
+		CircuitBreakerEnabled: false,
+		Source:                types.UpstreamSourceExternal,
+	}).Return(nil)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	req := &types.CreateUpstreamReq{
+		LLMConfigID: 100,
+		URL:         "http://upstream.example.com/v1",
+		Enabled:     true,
+		// HealthCheckEnabled and CircuitBreakerEnabled intentionally left nil
+	}
+	res, err := mc.CreateUpstream(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.False(t, res.HealthCheckEnabled)
+	require.False(t, res.CircuitBreakerEnabled)
+}
+
+func TestLLMServiceComponent_CreateUpstream_HealthCheckExplicitFalse(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	stores.LLMConfigMock().EXPECT().GetByID(ctx, int64(100)).Return(&database.LLMConfig{ID: 100}, nil)
+	// When HealthCheckEnabled is explicitly set to false via pointer,
+	// the component should persist false (not a DB default of true).
+	healthCheckFalse := false
+	circuitBreakerFalse := false
+	upstreamStore.EXPECT().Create(ctx, &database.Upstream{
+		LLMConfigID:           100,
+		URL:                   "http://upstream.example.com/v1",
+		Weight:                1,
+		Enabled:               true,
+		HealthCheckEnabled:    false,
+		CircuitBreakerEnabled: false,
+		Source:                types.UpstreamSourceExternal,
+	}).Return(nil)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	req := &types.CreateUpstreamReq{
+		LLMConfigID:           100,
+		URL:                   "http://upstream.example.com/v1",
+		Enabled:               true,
+		HealthCheckEnabled:    &healthCheckFalse,
+		CircuitBreakerEnabled: &circuitBreakerFalse,
+	}
+	res, err := mc.CreateUpstream(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.False(t, res.HealthCheckEnabled)
+	require.False(t, res.CircuitBreakerEnabled)
+}
+
+func TestLLMServiceComponent_CreateUpstream_HealthCheckExplicitTrue(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	stores.LLMConfigMock().EXPECT().GetByID(ctx, int64(100)).Return(&database.LLMConfig{ID: 100}, nil)
+	// When HealthCheckEnabled is explicitly set to true via pointer,
+	// the component should persist true.
+	healthCheckTrue := true
+	circuitBreakerTrue := true
+	upstreamStore.EXPECT().Create(ctx, &database.Upstream{
+		LLMConfigID:           100,
+		URL:                   "http://upstream.example.com/v1/chat/completions",
+		Weight:                1,
+		Enabled:               true,
+		HealthCheckEnabled:    true,
+		CircuitBreakerEnabled: true,
+		Source:                types.UpstreamSourceExternal,
+	}).Return(nil)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+		sampleRegistry:    sample.NewDefaultRegistry(),
+	}
+	req := &types.CreateUpstreamReq{
+		LLMConfigID:           100,
+		URL:                   "http://upstream.example.com/v1/chat/completions",
+		Enabled:               true,
+		HealthCheckEnabled:    &healthCheckTrue,
+		CircuitBreakerEnabled: &circuitBreakerTrue,
+	}
+	res, err := mc.CreateUpstream(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.True(t, res.HealthCheckEnabled)
+	require.True(t, res.CircuitBreakerEnabled)
+}
+
+func TestLLMServiceComponent_CreateUpstream_RejectsUnsupportedHealthCheck(t *testing.T) {
+	healthCheckEnabled := true
+	mc := &llmServiceComponentImpl{sampleRegistry: sample.NewDefaultRegistry()}
+
+	_, err := mc.CreateUpstream(context.Background(), &types.CreateUpstreamReq{
+		LLMConfigID:        100,
+		URL:                "https://api.example.com/v1/ocr",
+		HealthCheckEnabled: &healthCheckEnabled,
+	})
+
+	customErr, ok := errorx.GetFirstCustomError(err)
+	require.True(t, ok)
+	require.ErrorIs(t, customErr, errorx.ErrUpstreamHealthCheckNotSupported)
+}
+
+func TestLLMServiceComponent_UpdateUpstream_RejectsExplicitUnsupportedHealthCheck(t *testing.T) {
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	upstreamStore.EXPECT().GetByID(mock.Anything, int64(10)).Return(&database.Upstream{
+		ID:  10,
+		URL: "https://api.example.com/v1/chat/completions",
+	}, nil).Once()
+	healthCheckEnabled := true
+	unsupportedURL := "https://api.example.com/v1/ocr"
+	mc := &llmServiceComponentImpl{
+		upstreamStore:  upstreamStore,
+		sampleRegistry: sample.NewDefaultRegistry(),
+	}
+
+	_, err := mc.UpdateUpstream(context.Background(), &types.UpdateUpstreamReq{
+		ID:                 10,
+		URL:                &unsupportedURL,
+		HealthCheckEnabled: &healthCheckEnabled,
+	})
+
+	customErr, ok := errorx.GetFirstCustomError(err)
+	require.True(t, ok)
+	require.ErrorIs(t, customErr, errorx.ErrUpstreamHealthCheckNotSupported)
+}
+
+func TestLLMServiceComponent_UpdateUpstream_RejectsUnsupportedURLWhenHealthCheckAlreadyEnabled(t *testing.T) {
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	upstreamStore.EXPECT().GetByID(mock.Anything, int64(10)).Return(&database.Upstream{
+		ID:                 10,
+		URL:                "https://api.example.com/v1/chat/completions",
+		HealthCheckEnabled: true,
+	}, nil).Once()
+	unsupportedURL := "https://api.example.com/v1/ocr"
+	mc := &llmServiceComponentImpl{
+		upstreamStore:  upstreamStore,
+		sampleRegistry: sample.NewDefaultRegistry(),
+	}
+
+	_, err := mc.UpdateUpstream(context.Background(), &types.UpdateUpstreamReq{
+		ID:  10,
+		URL: &unsupportedURL,
+	})
+
+	customErr, ok := errorx.GetFirstCustomError(err)
+	require.True(t, ok)
+	require.ErrorIs(t, customErr, errorx.ErrUpstreamHealthCheckNotSupported)
+}
+
+func TestLLMServiceComponent_UpdateUpstream_AllowsUnsupportedURLWhenHealthCheckDisabled(t *testing.T) {
+	ctx := context.Background()
+	unsupportedURL := "https://api.example.com/v1/ocr"
+	healthCheckEnabled := false
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	callCount := 0
+	upstreamStore.EXPECT().GetByID(ctx, int64(10)).RunAndReturn(func(context.Context, int64) (*database.Upstream, error) {
+		callCount++
+		if callCount == 1 {
+			return &database.Upstream{
+				ID:                 10,
+				URL:                "https://api.example.com/v1/chat/completions",
+				Enabled:            true,
+				HealthCheckEnabled: true,
+			}, nil
+		}
+		return &database.Upstream{
+			ID:                 10,
+			URL:                unsupportedURL,
+			Enabled:            true,
+			HealthCheckEnabled: false,
+		}, nil
+	}).Times(2)
+	upstreamStore.EXPECT().Update(ctx, mock.MatchedBy(func(upstream *database.Upstream) bool {
+		return upstream.URL == unsupportedURL && !upstream.HealthCheckEnabled
+	})).Return(nil).Once()
+	mc := &llmServiceComponentImpl{upstreamStore: upstreamStore}
+
+	result, err := mc.UpdateUpstream(ctx, &types.UpdateUpstreamReq{
+		ID:                 10,
+		URL:                &unsupportedURL,
+		HealthCheckEnabled: &healthCheckEnabled,
+	})
+
+	require.NoError(t, err)
+	require.False(t, result.HealthCheckEnabled)
+}
+
+func TestLLMServiceComponent_CreateLLMConfig_HealthCheckPersistedFalse(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	// Verify that when UpstreamConfig has HealthCheckEnabled=false and
+	// CircuitBreakerEnabled=false (the zero value / default), the database
+	// Upstream persisted via CreateLLMConfig also has false values.
+	// This is the core regression test for the bun default:true bug.
+	upstreamStore.EXPECT().Create(ctx, &database.Upstream{
+		LLMConfigID:           123,
+		URL:                   "http://upstream.example.com/v1",
+		Weight:                1,
+		Enabled:               true,
+		HealthCheckEnabled:    false,
+		CircuitBreakerEnabled: false,
+		Source:                types.UpstreamSourceExternal,
+	}).Return(nil)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	req := &types.CreateLLMConfigReq{
+		ModelName: "test-model",
+		Types:     []int{16},
+		Enabled:   true,
+		Upstreams: []types.UpstreamConfig{
+			{
+				URL:                   "http://upstream.example.com/v1",
+				Enabled:               true,
+				Weight:                1,
+				HealthCheckEnabled:    false,
+				CircuitBreakerEnabled: false,
+			},
+		},
+	}
+	dbLLMConfig := &database.LLMConfig{ID: 123, ModelName: "test-model", Type: 16, Enabled: true}
+	stores.LLMConfigMock().EXPECT().Create(ctx, database.LLMConfig{
+		ModelName: "test-model",
+		Type:      16,
+		Enabled:   true,
+	}).Return(dbLLMConfig, nil)
+	res, err := mc.CreateLLMConfig(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.False(t, res.Upstreams[0].HealthCheckEnabled)
+	require.False(t, res.Upstreams[0].CircuitBreakerEnabled)
+}
+
+func TestLLMServiceComponent_CreateLLMConfig_HealthCheckPersistedTrue(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	upstreamStore.EXPECT().Create(ctx, &database.Upstream{
+		LLMConfigID:           123,
+		URL:                   "http://upstream.example.com/v1",
+		Weight:                1,
+		Enabled:               true,
+		HealthCheckEnabled:    true,
+		CircuitBreakerEnabled: true,
+		Source:                types.UpstreamSourceExternal,
+	}).Return(nil)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+	}
+	req := &types.CreateLLMConfigReq{
+		ModelName: "test-model",
+		Types:     []int{16},
+		Enabled:   true,
+		Upstreams: []types.UpstreamConfig{
+			{
+				URL:                   "http://upstream.example.com/v1",
+				Enabled:               true,
+				Weight:                1,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+			},
+		},
+	}
+	dbLLMConfig := &database.LLMConfig{ID: 123, ModelName: "test-model", Type: 16, Enabled: true}
+	stores.LLMConfigMock().EXPECT().Create(ctx, database.LLMConfig{
+		ModelName: "test-model",
+		Type:      16,
+		Enabled:   true,
+	}).Return(dbLLMConfig, nil)
+	res, err := mc.CreateLLMConfig(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.True(t, res.Upstreams[0].HealthCheckEnabled)
+	require.True(t, res.Upstreams[0].CircuitBreakerEnabled)
+}
+
+func TestLLMServiceComponent_UpdateUpstream_TrimsWhitespace(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	callCount := 0
+	upstreamStore.EXPECT().GetByID(ctx, int64(10)).RunAndReturn(func(ctx context.Context, id int64) (*database.Upstream, error) {
+		callCount++
+		if callCount == 1 {
+			return &database.Upstream{ID: 10, LLMConfigID: 100, URL: "http://old", Weight: 1, Enabled: true}, nil
+		}
+		return &database.Upstream{ID: 10, LLMConfigID: 100, URL: "http://old", Weight: 1, Enabled: true,
+			ModelName: "new-model", Provider: "new-provider"}, nil
+	}).Times(2)
+	upstreamStore.EXPECT().Update(ctx, &database.Upstream{
+		ID: 10, LLMConfigID: 100, URL: "http://old", Weight: 1, Enabled: true,
+		ModelName: "new-model",
+		Provider:  "new-provider",
+	}).Return(nil)
+	healthStateStore := mockdatabase.NewMockAIGatewayUpstreamHealthStateStore(t)
+	circuitStateStore := mockdatabase.NewMockAIGatewayUpstreamCircuitStateStore(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+		healthStateStore:  healthStateStore,
+		circuitStateStore: circuitStateStore,
+	}
+	newModelName := "  new-model  "
+	newProvider := "  new-provider  "
+	req := &types.UpdateUpstreamReq{
+		ID:        10,
+		ModelName: &newModelName,
+		Provider:  &newProvider,
+	}
+	res, err := mc.UpdateUpstream(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, "new-model", res.ModelName)
+	require.Equal(t, "new-provider", res.Provider)
+}
+
+func TestLLMServiceComponent_UpdateUpstream(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	callCount := 0
+	upstreamStore.EXPECT().GetByID(ctx, int64(10)).RunAndReturn(func(ctx context.Context, id int64) (*database.Upstream, error) {
+		callCount++
+		if callCount == 1 {
+			return &database.Upstream{
+				ID:          10,
+				LLMConfigID: 100,
+				URL:         "http://old-endpoint",
+				Weight:      1,
+				Enabled:     true,
+			}, nil
+		}
+		return &database.Upstream{
+			ID:          10,
+			LLMConfigID: 100,
+			URL:         "http://new-endpoint",
+			Weight:      3,
+			Enabled:     true,
+		}, nil
+	}).Times(2)
+	upstreamStore.EXPECT().Update(ctx, mock.Anything).Return(nil).Maybe()
+	healthStateStore := mockdatabase.NewMockAIGatewayUpstreamHealthStateStore(t)
+	circuitStateStore := mockdatabase.NewMockAIGatewayUpstreamCircuitStateStore(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+		healthStateStore:  healthStateStore,
+		circuitStateStore: circuitStateStore,
+	}
+	newURL := "http://new-endpoint"
+	newWeight := 3
+	req := &types.UpdateUpstreamReq{
+		ID:     10,
+		URL:    &newURL,
+		Weight: &newWeight,
+	}
+	res, err := mc.UpdateUpstream(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, int64(10), res.ID)
+	require.Equal(t, "http://new-endpoint", res.URL)
+	require.Equal(t, 3, res.Weight)
+}
+
+func TestLLMServiceComponent_UpdateUpstream_CapacityPolicy(t *testing.T) {
+	existingPolicy := &types.CapacityPolicy{Enabled: true, MaxConcurrency: 8}
+	// Queue mode replacement policy: TPM/RPM must be unset in queue mode.
+	newPolicy := &types.CapacityPolicy{
+		Enabled:          true,
+		MaxConcurrency:   32,
+		MaxQueueDepth:    16,
+		QueueWaitSeconds: 60,
+	}
+	// The component contract for **CapacityPolicy is three-state: nil outer
+	// pointer = field omitted (keep existing), non-nil outer wrapping nil =
+	// clear, non-nil inner = replace. Note that encoding/json maps an explicit
+	// JSON null to a nil outer pointer (i.e. "omitted") for **T fields, so
+	// clearing a policy over HTTP requires sending a disabled policy payload;
+	// this test verifies the component-side handling of the inner nil case.
+	explicitNull := func() **types.CapacityPolicy {
+		var p *types.CapacityPolicy
+		return &p
+	}()
+
+	cases := []struct {
+		name          string
+		reqPolicy     **types.CapacityPolicy
+		initialPolicy *types.CapacityPolicy
+		wantPolicy    *types.CapacityPolicy
+	}{
+		{
+			name:          "field omitted keeps existing policy",
+			reqPolicy:     nil,
+			initialPolicy: existingPolicy,
+			wantPolicy:    existingPolicy,
+		},
+		{
+			name:          "explicit null clears policy",
+			reqPolicy:     explicitNull,
+			initialPolicy: existingPolicy,
+			wantPolicy:    nil,
+		},
+		{
+			name:          "value replaces policy",
+			reqPolicy:     &newPolicy,
+			initialPolicy: nil,
+			wantPolicy:    newPolicy,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.TODO()
+			stores := tests.NewMockStores(t)
+			upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+			callCount := 0
+			upstreamStore.EXPECT().GetByID(ctx, int64(10)).RunAndReturn(func(ctx context.Context, id int64) (*database.Upstream, error) {
+				callCount++
+				if callCount == 1 {
+					return &database.Upstream{
+						ID:             10,
+						LLMConfigID:    100,
+						URL:            "http://old-endpoint",
+						Weight:         1,
+						Enabled:        true,
+						CapacityPolicy: tc.initialPolicy,
+					}, nil
+				}
+				return &database.Upstream{
+					ID:             10,
+					LLMConfigID:    100,
+					URL:            "http://old-endpoint",
+					Weight:         1,
+					Enabled:        true,
+					CapacityPolicy: tc.wantPolicy,
+				}, nil
+			}).Times(2)
+			upstreamStore.EXPECT().Update(ctx, &database.Upstream{
+				ID:             10,
+				LLMConfigID:    100,
+				URL:            "http://old-endpoint",
+				Weight:         1,
+				Enabled:        true,
+				CapacityPolicy: tc.wantPolicy,
+			}).Return(nil)
+			healthStateStore := mockdatabase.NewMockAIGatewayUpstreamHealthStateStore(t)
+			circuitStateStore := mockdatabase.NewMockAIGatewayUpstreamCircuitStateStore(t)
+			mc := &llmServiceComponentImpl{
+				llmConfigStore:    stores.LLMConfig,
+				promptPrefixStore: stores.PromptPrefix,
+				upstreamStore:     upstreamStore,
+				healthStateStore:  healthStateStore,
+				circuitStateStore: circuitStateStore,
+			}
+			req := &types.UpdateUpstreamReq{
+				ID:             10,
+				CapacityPolicy: tc.reqPolicy,
+			}
+			res, err := mc.UpdateUpstream(ctx, req)
+			require.Nil(t, err)
+			require.NotNil(t, res)
+			require.Equal(t, tc.wantPolicy, res.CapacityPolicy)
+		})
+	}
+}
+
+func TestLLMServiceComponent_DeleteUpstream(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	mockAcct := mockComps.NewMockAccountingComponent(t)
+	upstreamStore.EXPECT().GetByID(ctx, int64(10)).Return(&database.Upstream{ID: 10, LLMConfigID: 74}, nil)
+	upstreamStore.EXPECT().Delete(ctx, int64(10)).Return(nil)
+	mockAcct.EXPECT().OffLinePrice(ctx, types.AcctPriceOffLineReq{
+		SkuType:    types.SKUUpstreamCost,
+		ResourceID: types.UpstreamCostResourceID(10),
+	}).Return(nil, nil)
+	mc := &llmServiceComponentImpl{
+		upstreamStore:    upstreamStore,
+		llmConfigStore:   stores.LLMConfig,
+		accountComponent: mockAcct,
+	}
+	err := mc.DeleteUpstream(ctx, 10)
+	require.Nil(t, err)
+}
+
+func TestLLMServiceComponent_DeleteUpstream_CostOfflineFailureIgnored(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	mockAcct := mockComps.NewMockAccountingComponent(t)
+	upstreamStore.EXPECT().GetByID(ctx, int64(10)).Return(&database.Upstream{ID: 10, LLMConfigID: 74}, nil)
+	upstreamStore.EXPECT().Delete(ctx, int64(10)).Return(nil)
+	mockAcct.EXPECT().OffLinePrice(ctx, mock.Anything).Return(nil, fmt.Errorf("accounting unreachable"))
+	mc := &llmServiceComponentImpl{
+		upstreamStore:    upstreamStore,
+		llmConfigStore:   stores.LLMConfig,
+		accountComponent: mockAcct,
+	}
+	err := mc.DeleteUpstream(ctx, 10)
+	require.Nil(t, err)
+}
+
+func TestLLMServiceComponent_UpdateUpstream_CSGHubAllowsEnabledToggle(t *testing.T) {
+	ctx := context.TODO()
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	healthStateStore := mockdatabase.NewMockAIGatewayUpstreamHealthStateStore(t)
+	circuitStateStore := mockdatabase.NewMockAIGatewayUpstreamCircuitStateStore(t)
+
+	dbUp := &database.Upstream{
+		ID:          65,
+		LLMConfigID: 74,
+		URL:         "http://original-csghub-url",
+		Weight:      1,
+		Enabled:     false,
+		ModelName:   "original-model",
+		AuthHeader:  "original-auth",
+		Provider:    "inference",
+		Source:      types.UpstreamSourceCSGHubDeploy,
+		SourceID:    964,
+	}
+	upstreamStore.EXPECT().GetByID(ctx, int64(65)).Return(dbUp, nil)
+	upstreamStore.EXPECT().Update(ctx, mock.Anything).Return(nil).Maybe()
+
+	mc := &llmServiceComponentImpl{
+		upstreamStore:     upstreamStore,
+		healthStateStore:  healthStateStore,
+		circuitStateStore: circuitStateStore,
+	}
+
+	// User requests to enable the upstream
+	enabled := true
+	req := &types.UpdateUpstreamReq{
+		ID:      65,
+		Enabled: &enabled,
+	}
+	res, err := mc.UpdateUpstream(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	// Enabled should be updated to true
+	require.True(t, res.Enabled)
+	// Source-owned fields should remain unchanged
+	require.Equal(t, "http://original-csghub-url", res.URL)
+	require.Equal(t, "original-model", res.ModelName)
+	require.Equal(t, "original-auth", res.AuthHeader)
+	require.Equal(t, "inference", res.Provider)
+}
+
+func TestLLMServiceComponent_UpdateUpstream_CSGHubProtectsSourceOwnedFields(t *testing.T) {
+	ctx := context.TODO()
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	healthStateStore := mockdatabase.NewMockAIGatewayUpstreamHealthStateStore(t)
+	circuitStateStore := mockdatabase.NewMockAIGatewayUpstreamCircuitStateStore(t)
+
+	dbUp := &database.Upstream{
+		ID:          65,
+		LLMConfigID: 74,
+		URL:         "http://original-csghub-url",
+		Weight:      1,
+		Enabled:     false,
+		ModelName:   "original-model",
+		AuthHeader:  "original-auth",
+		Provider:    "inference",
+		Source:      types.UpstreamSourceCSGHubDeploy,
+		SourceID:    964,
+	}
+	upstreamStore.EXPECT().GetByID(ctx, int64(65)).Return(dbUp, nil)
+	upstreamStore.EXPECT().Update(ctx, mock.Anything).Return(nil).Maybe()
+
+	mc := &llmServiceComponentImpl{
+		upstreamStore:     upstreamStore,
+		healthStateStore:  healthStateStore,
+		circuitStateStore: circuitStateStore,
+	}
+
+	// User tries to change source-owned fields — they should be ignored
+	newURL := "http://hijacked-url"
+	newModelName := "hijacked-model"
+	newProvider := "hijacked-provider"
+	newAuthHeader := "hijacked-auth"
+	enabled := true
+	req := &types.UpdateUpstreamReq{
+		ID:         65,
+		URL:        &newURL,
+		ModelName:  &newModelName,
+		Provider:   &newProvider,
+		AuthHeader: &newAuthHeader,
+		Enabled:    &enabled,
+	}
+	res, err := mc.UpdateUpstream(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	// Source-owned fields must NOT be updated
+	require.Equal(t, "http://original-csghub-url", res.URL)
+	require.Equal(t, "original-model", res.ModelName)
+	require.Equal(t, "original-auth", res.AuthHeader)
+	require.Equal(t, "inference", res.Provider)
+	// Enabled is NOT source-owned from the admin perspective — it should be updated
+	require.True(t, res.Enabled)
+}
+
+func TestLLMServiceComponent_validateLLMEndpointConfig(t *testing.T) {
+	mc := &llmServiceComponentImpl{}
+	testCases := []struct {
+		name        string
+		upstreams   []types.UpstreamConfig
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:        "api_endpoint and upstreams are both empty",
+			upstreams:   nil,
+			wantErr:     true,
+			errContains: "upstreams must be provided",
+		},
+		{
+			name: "upstream url is empty",
+			upstreams: []types.UpstreamConfig{
+				{URL: " ", Enabled: true},
+			},
+			wantErr:     true,
+			errContains: "upstream url cannot be empty",
+		},
+		{
+			name: "all upstreams disabled and api_endpoint empty",
+			upstreams: []types.UpstreamConfig{
+				{URL: "http://a", Enabled: false},
+				{URL: "http://b", Enabled: false},
+			},
+			wantErr:     true,
+			errContains: "at least one enabled upstream must be provided",
+		},
+		{
+			name:        "api_endpoint provided without upstreams",
+			upstreams:   nil,
+			wantErr:     true,
+			errContains: "upstreams must be provided",
+		},
+		{
+			name: "valid enabled upstream",
+			upstreams: []types.UpstreamConfig{
+				{URL: "http://a", Enabled: true},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := mc.validateLLMEndpointConfig(tc.upstreams)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.ErrorContains(t, err, tc.errContains)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestLLMServiceComponent_UpdatePromptPrefix(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+	}
+	newKind := "new-kind"
+	req := &types.UpdatePromptPrefixReq{
+		ID:   123,
+		Kind: &newKind,
+	}
+	dbPromptPrefix := &database.PromptPrefix{
+		ID:   123,
+		Kind: newKind,
+	}
+	stores.PromptPrefixMock().EXPECT().GetByID(ctx, int64(123)).Return(dbPromptPrefix, nil)
+	stores.PromptPrefixMock().EXPECT().Update(ctx, database.PromptPrefix{
+		ID:   123,
+		Kind: newKind,
+	}).Return(dbPromptPrefix, nil)
+	res, err := mc.UpdatePromptPrefix(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Equal(t, res.ID, int64(123))
+	require.Equal(t, res.Kind, "new-kind")
+}
+
+func TestLLMServiceComponent_DeleteLLMConfig(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+	mockAcct := mockComps.NewMockAccountingComponent(t)
+	upstreamStore.EXPECT().DeleteByLLMConfigID(ctx, int64(123)).Return(nil)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		upstreamStore:     upstreamStore,
+		accountComponent:  mockAcct,
+	}
+	stores.LLMConfigMock().EXPECT().GetByID(ctx, int64(123)).Return(&database.LLMConfig{
+		ModelName: "test-model",
+		Upstreams: []database.Upstream{{ID: 10}, {ID: 11}},
+	}, nil)
+	stores.LLMConfigMock().EXPECT().Delete(ctx, int64(123)).Return(nil)
+	mockAcct.EXPECT().OffLinePrice(ctx, types.AcctPriceOffLineReq{
+		SkuType:    types.SKUCSGHub,
+		ResourceID: fmt.Sprintf(types.ExternalLLMResourceFmt, "test-model"),
+	}).Return(nil, nil)
+	mockAcct.EXPECT().OffLinePrice(ctx, types.AcctPriceOffLineReq{
+		SkuType:    types.SKUUpstreamCost,
+		ResourceID: types.UpstreamCostResourceID(10),
+	}).Return(nil, nil)
+	mockAcct.EXPECT().OffLinePrice(ctx, types.AcctPriceOffLineReq{
+		SkuType:    types.SKUUpstreamCost,
+		ResourceID: types.UpstreamCostResourceID(11),
+	}).Return(nil, fmt.Errorf("accounting unreachable")) // failure is warn-only
+	err := mc.DeleteLLMConfig(ctx, int64(123))
+	require.Nil(t, err)
+}
+
+func TestLLMServiceComponent_DeletePromptPrefix(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+	}
+	stores.PromptPrefixMock().EXPECT().Delete(ctx, int64(123)).Return(nil)
+	err := mc.DeletePromptPrefix(ctx, int64(123))
+	require.Nil(t, err)
+}
+
+func TestLLMServiceComponent_ListExternalLLMs(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		repoStore:         stores.Repo,
+	}
+
+	// Mock repository
+	dbRepo := &database.Repository{
+		ID:          456,
+		Path:        "test/model",
+		Name:        "model",
+		Nickname:    "Test Model",
+		Description: "A test model",
+	}
+
+	// Mock LLMConfig with repo_id and preloaded Repo
+	typeVal := database.LLMTypeAigatewayExternal
+	enabled := true
+	dbLLMConfig := &database.LLMConfig{
+		ID:        123,
+		ModelName: "external-model",
+		Type:      typeVal,
+		Enabled:   true,
+		RepoID:    456,
+		Repo:      dbRepo,
+	}
+
+	// Mock search params
+	search := &types.SearchLLMConfig{
+		Types:   []int{typeVal},
+		Enabled: &enabled,
+	}
+
+	// Setup mock expectations for LLMConfig store
+	stores.LLMConfigMock().EXPECT().IndexWithRepo(ctx, math.MaxInt, 1, search).Return([]*database.LLMConfig{dbLLMConfig}, 1, nil)
+
+	// Mock tags
+	dbTags := []database.Tag{
+		{Name: "text-generation", Category: "task", Group: "nlp"},
+		{Name: "transformer", Category: "framework", Group: "architecture"},
+	}
+	stores.RepoMock().EXPECT().Tags(ctx, int64(456)).Return(dbTags, nil)
+
+	// Call the method
+	res, err := mc.ListExternalLLMs(ctx)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Len(t, res, 1)
+	require.Equal(t, int64(123), res[0].ID)
+	require.Equal(t, "external-model", res[0].ModelName)
+	require.NotNil(t, res[0].Repo)
+	require.Equal(t, int64(456), res[0].Repo.ID)
+	require.Len(t, res[0].Repo.Tags, 2)
+	require.Equal(t, "text-generation", res[0].Repo.Tags[0].Name)
+}
+
+func TestLLMServiceComponent_ListExternalLLMs_NoRepo(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		repoStore:         stores.Repo,
+	}
+
+	// Mock LLMConfig without repo
+	typeVal := database.LLMTypeAigatewayExternal
+	enabled := true
+	dbLLMConfig := &database.LLMConfig{
+		ID:        123,
+		ModelName: "external-model-no-repo",
+		Type:      typeVal,
+		Enabled:   true,
+		RepoID:    0,
+		Repo:      nil,
+	}
+
+	search := &types.SearchLLMConfig{
+		Types:   []int{typeVal},
+		Enabled: &enabled,
+	}
+
+	stores.LLMConfigMock().EXPECT().IndexWithRepo(ctx, math.MaxInt, 1, search).Return([]*database.LLMConfig{dbLLMConfig}, 1, nil)
+
+	res, err := mc.ListExternalLLMs(ctx)
+	require.Nil(t, err)
+	require.NotNil(t, res)
+	require.Len(t, res, 1)
+	require.Equal(t, int64(123), res[0].ID)
+	require.Nil(t, res[0].Repo)
+}
+
+func TestLLMServiceComponent_ListExternalLLMs_Error(t *testing.T) {
+	ctx := context.TODO()
+	stores := tests.NewMockStores(t)
+	mc := &llmServiceComponentImpl{
+		llmConfigStore:    stores.LLMConfig,
+		promptPrefixStore: stores.PromptPrefix,
+		repoStore:         stores.Repo,
+	}
+
+	typeVal := database.LLMTypeAigatewayExternal
+	enabled := true
+	search := &types.SearchLLMConfig{
+		Types:   []int{typeVal},
+		Enabled: &enabled,
+	}
+
+	stores.LLMConfigMock().EXPECT().IndexWithRepo(ctx, math.MaxInt, 1, search).Return(nil, 0, fmt.Errorf("db error"))
+
+	res, err := mc.ListExternalLLMs(ctx)
+	require.NotNil(t, err)
+	require.Nil(t, res)
+}
+
+func TestComputeUpstreamAvailability(t *testing.T) {
+	testCases := []struct {
+		name          string
+		upstream      types.UpstreamConfig
+		wantAvailable bool
+		wantReason    string
+	}{
+		{
+			name: "disabled upstream is unavailable",
+			upstream: types.UpstreamConfig{
+				Enabled: false,
+			},
+			wantAvailable: false,
+			wantReason:    aigatewaytypes.ReasonUpstreamDisabled,
+		},
+		{
+			name: "enabled upstream without health check or circuit breaker is available",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    false,
+				CircuitBreakerEnabled: false,
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "enabled upstream with healthy state is available",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: true,
+				HealthState:        string(aigatewaytypes.HealthStateHealthy),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "enabled upstream with unhealthy state is unavailable",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: true,
+				HealthState:        string(aigatewaytypes.HealthStateUnhealthy),
+			},
+			wantAvailable: false,
+			wantReason:    aigatewaytypes.ReasonHealthStateUnhealthy,
+		},
+		{
+			name: "enabled upstream with open circuit is unavailable",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				CircuitBreakerEnabled: true,
+				CircuitState:          string(aigatewaytypes.CircuitStateOpen),
+			},
+			wantAvailable: false,
+			wantReason:    aigatewaytypes.ReasonCircuitBreakerOpen,
+		},
+		{
+			name: "unknown health state is available (not yet probed)",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: true,
+				HealthState:        string(aigatewaytypes.HealthStateUnknown),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "unknown circuit state is available (not yet probed)",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				CircuitBreakerEnabled: true,
+				CircuitState:          string(aigatewaytypes.CircuitStateUnknown),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "both unknown states are available (not yet probed)",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           string(aigatewaytypes.HealthStateUnknown),
+				CircuitState:          string(aigatewaytypes.CircuitStateUnknown),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "health unknown with healthy circuit state is available",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           string(aigatewaytypes.HealthStateUnknown),
+				CircuitState:          string(aigatewaytypes.CircuitStateClosed),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "empty health state treated as unknown when health check enabled",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: true,
+				HealthState:        "",
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "degraded health state still available",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: true,
+				HealthState:        string(aigatewaytypes.HealthStateDegraded),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "half-open circuit state still available",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				CircuitBreakerEnabled: true,
+				CircuitState:          string(aigatewaytypes.CircuitStateHalfOpen),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "health check disabled ignores unknown health state",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: false,
+				HealthState:        string(aigatewaytypes.HealthStateUnknown),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "circuit breaker disabled ignores unknown circuit state",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				CircuitBreakerEnabled: false,
+				CircuitState:          string(aigatewaytypes.CircuitStateUnknown),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "health check disabled ignores historical unhealthy state",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: false,
+				HealthState:        string(aigatewaytypes.HealthStateUnhealthy),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "circuit breaker disabled ignores historical open circuit",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				CircuitBreakerEnabled: false,
+				CircuitState:          string(aigatewaytypes.CircuitStateOpen),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "health check off, circuit breaker on, circuit unknown -> available",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    false,
+				CircuitBreakerEnabled: true,
+				CircuitState:          string(aigatewaytypes.CircuitStateUnknown),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "both disabled with stale historical states -> available",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    false,
+				CircuitBreakerEnabled: false,
+				HealthState:           string(aigatewaytypes.HealthStateUnhealthy),
+				CircuitState:          string(aigatewaytypes.CircuitStateOpen),
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			available, reason := computeUpstreamAvailability(tc.upstream)
+			require.Equal(t, tc.wantAvailable, available)
+			require.Equal(t, tc.wantReason, reason)
+		})
+	}
+}
+
+func TestComputeUpstreamAvailabilityStatus(t *testing.T) {
+	testCases := []struct {
+		name       string
+		upstream   types.UpstreamConfig
+		wantStatus string
+	}{
+		{
+			name: "disabled upstream",
+			upstream: types.UpstreamConfig{
+				Enabled: false,
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusDisabled),
+		},
+		{
+			name: "unknown health state returns unknown status (not yet probed)",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: true,
+				HealthState:        string(aigatewaytypes.HealthStateUnknown),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusUnknown),
+		},
+		{
+			name: "unknown circuit state returns unknown status (not yet probed)",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				CircuitBreakerEnabled: true,
+				CircuitState:          string(aigatewaytypes.CircuitStateUnknown),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusUnknown),
+		},
+		{
+			name: "both unknown states return unknown status (not yet probed)",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           string(aigatewaytypes.HealthStateUnknown),
+				CircuitState:          string(aigatewaytypes.CircuitStateUnknown),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusUnknown),
+		},
+		{
+			name: "open circuit returns unavailable",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				CircuitBreakerEnabled: true,
+				CircuitState:          string(aigatewaytypes.CircuitStateOpen),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusUnavailable),
+		},
+		{
+			name: "unhealthy health returns unavailable",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: true,
+				HealthState:        string(aigatewaytypes.HealthStateUnhealthy),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusUnavailable),
+		},
+		{
+			name: "degraded health returns degraded",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: true,
+				HealthState:        string(aigatewaytypes.HealthStateDegraded),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusDegraded),
+		},
+		{
+			name: "healthy upstream returns available",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: true,
+				HealthState:        string(aigatewaytypes.HealthStateHealthy),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "no health check or circuit breaker returns available",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    false,
+				CircuitBreakerEnabled: false,
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "health check disabled ignores unknown health state",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: false,
+				HealthState:        string(aigatewaytypes.HealthStateUnknown),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "circuit breaker disabled ignores unknown circuit state",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				CircuitBreakerEnabled: false,
+				CircuitState:          string(aigatewaytypes.CircuitStateUnknown),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "health check disabled ignores historical unhealthy state",
+			upstream: types.UpstreamConfig{
+				Enabled:            true,
+				HealthCheckEnabled: false,
+				HealthState:        string(aigatewaytypes.HealthStateUnhealthy),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "circuit breaker disabled ignores historical open circuit",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				CircuitBreakerEnabled: false,
+				CircuitState:          string(aigatewaytypes.CircuitStateOpen),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "health check off, circuit breaker on, circuit unknown -> unknown status",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    false,
+				CircuitBreakerEnabled: true,
+				CircuitState:          string(aigatewaytypes.CircuitStateUnknown),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusUnknown),
+		},
+		{
+			name: "both disabled with stale historical states -> available",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    false,
+				CircuitBreakerEnabled: false,
+				HealthState:           string(aigatewaytypes.HealthStateUnhealthy),
+				CircuitState:          string(aigatewaytypes.CircuitStateOpen),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "healthy health + unknown circuit returns available (any known state is enough)",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           string(aigatewaytypes.HealthStateHealthy),
+				CircuitState:          string(aigatewaytypes.CircuitStateUnknown),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "unknown health + closed circuit returns available (any known state is enough)",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           string(aigatewaytypes.HealthStateUnknown),
+				CircuitState:          string(aigatewaytypes.CircuitStateClosed),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "degraded health + unknown circuit returns degraded (bad state takes priority over unknown)",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           string(aigatewaytypes.HealthStateDegraded),
+				CircuitState:          string(aigatewaytypes.CircuitStateUnknown),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusDegraded),
+		},
+		{
+			name: "health unhealthy + circuit unknown -> unavailable (bad state takes priority over unknown)",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           string(aigatewaytypes.HealthStateUnhealthy),
+				CircuitState:          string(aigatewaytypes.CircuitStateUnknown),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusUnavailable),
+		},
+		{
+			name: "circuit open + health unknown -> unavailable (bad state takes priority over unknown)",
+			upstream: types.UpstreamConfig{
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           string(aigatewaytypes.HealthStateUnknown),
+				CircuitState:          string(aigatewaytypes.CircuitStateOpen),
+			},
+			wantStatus: string(aigatewaytypes.UpstreamStatusUnavailable),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			status := computeUpstreamAvailabilityStatus(tc.upstream)
+			require.Equal(t, tc.wantStatus, status)
+		})
+	}
+}
+
+func TestComputeLLMAvailability(t *testing.T) {
+	testCases := []struct {
+		name          string
+		upstreams     []types.UpstreamConfig
+		wantAvailable bool
+		wantReason    string
+	}{
+		{
+			name:          "no upstreams is available",
+			upstreams:     nil,
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "one available upstream makes LLM available",
+			upstreams: []types.UpstreamConfig{
+				{Enabled: true, HealthCheckEnabled: true, HealthState: string(aigatewaytypes.HealthStateHealthy)},
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "all upstreams unknown makes LLM available (unknown is not unavailable)",
+			upstreams: []types.UpstreamConfig{
+				{Enabled: true, HealthCheckEnabled: true, HealthState: string(aigatewaytypes.HealthStateUnknown)},
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "mixed available and unknown upstreams makes LLM available",
+			upstreams: []types.UpstreamConfig{
+				{Enabled: true, HealthCheckEnabled: true, HealthState: string(aigatewaytypes.HealthStateUnknown)},
+				{Enabled: true, HealthCheckEnabled: true, HealthState: string(aigatewaytypes.HealthStateHealthy)},
+			},
+			wantAvailable: true,
+			wantReason:    "",
+		},
+		{
+			name: "all upstreams disabled makes LLM unavailable",
+			upstreams: []types.UpstreamConfig{
+				{Enabled: false},
+			},
+			wantAvailable: false,
+			wantReason:    aigatewaytypes.ReasonAllUpstreamsUnavailable,
+		},
+		{
+			name: "all upstreams unhealthy makes LLM unavailable",
+			upstreams: []types.UpstreamConfig{
+				{Enabled: true, HealthCheckEnabled: true, HealthState: string(aigatewaytypes.HealthStateUnhealthy)},
+			},
+			wantAvailable: false,
+			wantReason:    aigatewaytypes.ReasonAllUpstreamsUnavailable,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			available, reason := computeLLMAvailability(tc.upstreams)
+			require.Equal(t, tc.wantAvailable, available)
+			require.Equal(t, tc.wantReason, reason)
+		})
+	}
+}
+
+func TestBuildUpstreamConfigs_UnknownStateWhenNoDBRecord(t *testing.T) {
+	testCases := []struct {
+		name                string
+		dbUpstream          database.Upstream
+		wantHealthState     string
+		wantCircuitState    string
+		wantIsAvailable     bool
+		wantAvailabilitySts string
+	}{
+		{
+			name: "health check enabled with no DB health record -> unknown health state, available, unknown status",
+			dbUpstream: database.Upstream{
+				ID:                 1,
+				URL:                "http://upstream.example.com/v1",
+				Enabled:            true,
+				HealthCheckEnabled: true,
+				HealthState:        nil,
+				CircuitState:       nil,
+			},
+			wantHealthState:     string(aigatewaytypes.HealthStateUnknown),
+			wantCircuitState:    string(aigatewaytypes.CircuitStateUnknown),
+			wantIsAvailable:     true,
+			wantAvailabilitySts: string(aigatewaytypes.UpstreamStatusUnknown),
+		},
+		{
+			name: "circuit breaker enabled with no DB circuit record -> unknown circuit state, available, unknown status",
+			dbUpstream: database.Upstream{
+				ID:                    2,
+				URL:                   "http://upstream.example.com/v1",
+				Enabled:               true,
+				CircuitBreakerEnabled: true,
+				HealthState:           nil,
+				CircuitState:          nil,
+			},
+			wantHealthState:     string(aigatewaytypes.HealthStateUnknown),
+			wantCircuitState:    string(aigatewaytypes.CircuitStateUnknown),
+			wantIsAvailable:     true,
+			wantAvailabilitySts: string(aigatewaytypes.UpstreamStatusUnknown),
+		},
+		{
+			name: "both enabled with no DB records -> both unknown, available, unknown status",
+			dbUpstream: database.Upstream{
+				ID:                    3,
+				URL:                   "http://upstream.example.com/v1",
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           nil,
+				CircuitState:          nil,
+			},
+			wantHealthState:     string(aigatewaytypes.HealthStateUnknown),
+			wantCircuitState:    string(aigatewaytypes.CircuitStateUnknown),
+			wantIsAvailable:     true,
+			wantAvailabilitySts: string(aigatewaytypes.UpstreamStatusUnknown),
+		},
+		{
+			name: "neither enabled with no DB records -> available",
+			dbUpstream: database.Upstream{
+				ID:                    4,
+				URL:                   "http://upstream.example.com/v1",
+				Enabled:               true,
+				HealthCheckEnabled:    false,
+				CircuitBreakerEnabled: false,
+				HealthState:           nil,
+				CircuitState:          nil,
+			},
+			wantHealthState:     string(aigatewaytypes.HealthStateUnknown),
+			wantCircuitState:    string(aigatewaytypes.CircuitStateUnknown),
+			wantIsAvailable:     true,
+			wantAvailabilitySts: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "health check enabled with existing healthy record -> available",
+			dbUpstream: database.Upstream{
+				ID:                 5,
+				URL:                "http://upstream.example.com/v1",
+				Enabled:            true,
+				HealthCheckEnabled: true,
+				HealthState:        &database.AIGatewayUpstreamHealthState{HealthState: string(aigatewaytypes.HealthStateHealthy)},
+				CircuitState:       nil,
+			},
+			wantHealthState:     string(aigatewaytypes.HealthStateHealthy),
+			wantCircuitState:    string(aigatewaytypes.CircuitStateUnknown),
+			wantIsAvailable:     true,
+			wantAvailabilitySts: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "disabled upstream with no DB records -> disabled status",
+			dbUpstream: database.Upstream{
+				ID:                    6,
+				URL:                   "http://upstream.example.com/v1",
+				Enabled:               false,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           nil,
+				CircuitState:          nil,
+			},
+			wantHealthState:     string(aigatewaytypes.HealthStateUnknown),
+			wantCircuitState:    string(aigatewaytypes.CircuitStateUnknown),
+			wantIsAvailable:     false,
+			wantAvailabilitySts: string(aigatewaytypes.UpstreamStatusDisabled),
+		},
+		{
+			name: "checks disabled with stale DB records -> unknown states and available",
+			dbUpstream: database.Upstream{
+				ID:                    7,
+				URL:                   "http://upstream.example.com/v1",
+				Enabled:               true,
+				HealthCheckEnabled:    false,
+				CircuitBreakerEnabled: false,
+				HealthState:           &database.AIGatewayUpstreamHealthState{HealthState: string(aigatewaytypes.HealthStateUnhealthy)},
+				CircuitState:          &database.AIGatewayUpstreamCircuitState{CircuitState: string(aigatewaytypes.CircuitStateOpen)},
+			},
+			wantHealthState:     string(aigatewaytypes.HealthStateUnknown),
+			wantCircuitState:    string(aigatewaytypes.CircuitStateUnknown),
+			wantIsAvailable:     true,
+			wantAvailabilitySts: string(aigatewaytypes.UpstreamStatusAvailable),
+		},
+		{
+			name: "health check off, circuit breaker on, stale unhealthy DB record -> available, unknown status",
+			dbUpstream: database.Upstream{
+				ID:                    8,
+				URL:                   "http://upstream.example.com/v1",
+				Enabled:               true,
+				HealthCheckEnabled:    false,
+				CircuitBreakerEnabled: true,
+				HealthState:           &database.AIGatewayUpstreamHealthState{HealthState: string(aigatewaytypes.HealthStateUnhealthy)},
+				CircuitState:          nil,
+			},
+			wantHealthState:     string(aigatewaytypes.HealthStateUnknown),
+			wantCircuitState:    string(aigatewaytypes.CircuitStateUnknown),
+			wantIsAvailable:     true,
+			wantAvailabilitySts: string(aigatewaytypes.UpstreamStatusUnknown),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := buildUpstreamConfigs([]database.Upstream{tc.dbUpstream})
+			require.Len(t, result, 1)
+			uc := result[0]
+			require.Equal(t, tc.wantHealthState, uc.HealthState)
+			require.Equal(t, tc.wantCircuitState, uc.CircuitState)
+			require.Equal(t, tc.wantIsAvailable, uc.IsAvailable)
+			require.Equal(t, tc.wantAvailabilitySts, uc.AvailabilityStatus)
+		})
+	}
+}
+
+func TestUpdateUpstream_ResetStaleStateOnReEnable(t *testing.T) {
+	ctx := context.TODO()
+
+	t.Run("disabled_to_enabled_resets_health_state_to_unknown", func(t *testing.T) {
+		upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+		healthStateStore := mockdatabase.NewMockAIGatewayUpstreamHealthStateStore(t)
+		circuitStateStore := mockdatabase.NewMockAIGatewayUpstreamCircuitStateStore(t)
+
+		// Upstream is disabled with stale healthy state in DB
+		disabledUp := &database.Upstream{
+			ID:                    10,
+			URL:                   "http://upstream.example.com/v1/chat/completions",
+			Enabled:               false,
+			HealthCheckEnabled:    true,
+			CircuitBreakerEnabled: true,
+			HealthState:           &database.AIGatewayUpstreamHealthState{ID: 1, UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateHealthy)},
+			CircuitState:          &database.AIGatewayUpstreamCircuitState{ID: 1, UpstreamID: 10, CircuitState: string(aigatewaytypes.CircuitStateClosed)},
+		}
+		enabledUp := &database.Upstream{
+			ID:                    10,
+			URL:                   "http://upstream.example.com/v1/chat/completions",
+			Enabled:               true,
+			HealthCheckEnabled:    true,
+			CircuitBreakerEnabled: true,
+			HealthState:           &database.AIGatewayUpstreamHealthState{ID: 1, UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateUnknown)},
+			CircuitState:          &database.AIGatewayUpstreamCircuitState{ID: 1, UpstreamID: 10, CircuitState: string(aigatewaytypes.CircuitStateUnknown)},
+		}
+		getByIDCallCount := 0
+		upstreamStore.EXPECT().GetByID(ctx, int64(10)).RunAndReturn(func(ctx context.Context, id int64) (*database.Upstream, error) {
+			getByIDCallCount++
+			if getByIDCallCount == 1 {
+				return disabledUp, nil
+			}
+			return enabledUp, nil
+		}).Times(2)
+		upstreamStore.EXPECT().Update(ctx, mock.Anything).Return(nil)
+
+		// Health state should be atomically updated to unknown.
+		healthStateStore.EXPECT().MutateByUpstreamID(ctx, mock.MatchedBy(func(m database.AIGatewayUpstreamHealthStateMutation) bool {
+			state := &database.AIGatewayUpstreamHealthState{UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateHealthy)}
+			return m.UpstreamID == 10 && !m.CreateIfMissing && m.Mutate(state) == nil &&
+				state.HealthState == string(aigatewaytypes.HealthStateUnknown)
+		})).Return(&database.AIGatewayUpstreamHealthState{UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateUnknown)}, nil)
+
+		// Circuit state should be fetched and updated to unknown
+		circuitStateStore.EXPECT().GetByUpstreamID(ctx, int64(10)).Return(&database.AIGatewayUpstreamCircuitState{
+			ID:           1,
+			UpstreamID:   10,
+			CircuitState: string(aigatewaytypes.CircuitStateClosed),
+		}, nil)
+		circuitStateStore.EXPECT().Update(ctx, mock.MatchedBy(func(s *database.AIGatewayUpstreamCircuitState) bool {
+			return s.UpstreamID == 10 && s.CircuitState == string(aigatewaytypes.CircuitStateUnknown)
+		})).Return(nil)
+
+		mc := &llmServiceComponentImpl{
+			upstreamStore:     upstreamStore,
+			healthStateStore:  healthStateStore,
+			circuitStateStore: circuitStateStore,
+			sampleRegistry:    sample.NewDefaultRegistry(),
+		}
+		enabled := true
+		res, err := mc.UpdateUpstream(ctx, &types.UpdateUpstreamReq{ID: 10, Enabled: &enabled})
+		require.Nil(t, err)
+		require.NotNil(t, res)
+		require.Equal(t, string(aigatewaytypes.UpstreamStatusUnknown), res.AvailabilityStatus)
+		require.True(t, res.IsAvailable)
+	})
+
+	t.Run("health_check_re_enabled_resets_health_state_to_unknown", func(t *testing.T) {
+		upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+		healthStateStore := mockdatabase.NewMockAIGatewayUpstreamHealthStateStore(t)
+		circuitStateStore := mockdatabase.NewMockAIGatewayUpstreamCircuitStateStore(t)
+
+		// Upstream is enabled, health check was off, stale healthy record in DB
+		callCount := 0
+		upstreamStore.EXPECT().GetByID(ctx, int64(10)).RunAndReturn(func(ctx context.Context, id int64) (*database.Upstream, error) {
+			callCount++
+			if callCount == 1 {
+				return &database.Upstream{
+					ID:                    10,
+					URL:                   "http://upstream.example.com/v1/chat/completions",
+					Enabled:               true,
+					HealthCheckEnabled:    false,
+					CircuitBreakerEnabled: false,
+					HealthState:           &database.AIGatewayUpstreamHealthState{ID: 1, UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateHealthy)},
+				}, nil
+			}
+			return &database.Upstream{
+				ID:                    10,
+				URL:                   "http://upstream.example.com/v1/chat/completions",
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: false,
+				HealthState:           &database.AIGatewayUpstreamHealthState{ID: 1, UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateUnknown)},
+			}, nil
+		}).Times(2)
+		upstreamStore.EXPECT().Update(ctx, mock.Anything).Return(nil)
+
+		// Health state should be atomically reset to unknown when health check is re-enabled.
+		healthStateStore.EXPECT().MutateByUpstreamID(ctx, mock.MatchedBy(func(m database.AIGatewayUpstreamHealthStateMutation) bool {
+			state := &database.AIGatewayUpstreamHealthState{UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateHealthy)}
+			return m.UpstreamID == 10 && !m.CreateIfMissing && m.Mutate(state) == nil &&
+				state.HealthState == string(aigatewaytypes.HealthStateUnknown)
+		})).Return(&database.AIGatewayUpstreamHealthState{UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateUnknown)}, nil)
+
+		mc := &llmServiceComponentImpl{
+			upstreamStore:     upstreamStore,
+			healthStateStore:  healthStateStore,
+			circuitStateStore: circuitStateStore,
+			sampleRegistry:    sample.NewDefaultRegistry(),
+		}
+		healthCheckOn := true
+		res, err := mc.UpdateUpstream(ctx, &types.UpdateUpstreamReq{ID: 10, HealthCheckEnabled: &healthCheckOn})
+		require.Nil(t, err)
+		require.NotNil(t, res)
+		require.Equal(t, string(aigatewaytypes.UpstreamStatusUnknown), res.AvailabilityStatus)
+		require.True(t, res.IsAvailable)
+	})
+
+	t.Run("circuit_breaker_re_enabled_resets_circuit_state_to_unknown", func(t *testing.T) {
+		upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+		healthStateStore := mockdatabase.NewMockAIGatewayUpstreamHealthStateStore(t)
+		circuitStateStore := mockdatabase.NewMockAIGatewayUpstreamCircuitStateStore(t)
+
+		// Upstream is enabled, circuit breaker was off, stale closed record in DB
+		callCount := 0
+		upstreamStore.EXPECT().GetByID(ctx, int64(10)).RunAndReturn(func(ctx context.Context, id int64) (*database.Upstream, error) {
+			callCount++
+			if callCount == 1 {
+				return &database.Upstream{
+					ID:                    10,
+					URL:                   "http://upstream.example.com/v1",
+					Enabled:               true,
+					HealthCheckEnabled:    false,
+					CircuitBreakerEnabled: false,
+					CircuitState:          &database.AIGatewayUpstreamCircuitState{ID: 1, UpstreamID: 10, CircuitState: string(aigatewaytypes.CircuitStateClosed)},
+				}, nil
+			}
+			return &database.Upstream{
+				ID:                    10,
+				URL:                   "http://upstream.example.com/v1",
+				Enabled:               true,
+				HealthCheckEnabled:    false,
+				CircuitBreakerEnabled: true,
+				CircuitState:          &database.AIGatewayUpstreamCircuitState{ID: 1, UpstreamID: 10, CircuitState: string(aigatewaytypes.CircuitStateUnknown)},
+			}, nil
+		}).Times(2)
+		upstreamStore.EXPECT().Update(ctx, mock.Anything).Return(nil)
+
+		// Circuit state should be reset to unknown when circuit breaker is re-enabled
+		circuitStateStore.EXPECT().GetByUpstreamID(ctx, int64(10)).Return(&database.AIGatewayUpstreamCircuitState{
+			ID:           1,
+			UpstreamID:   10,
+			CircuitState: string(aigatewaytypes.CircuitStateClosed),
+		}, nil)
+		circuitStateStore.EXPECT().Update(ctx, mock.MatchedBy(func(s *database.AIGatewayUpstreamCircuitState) bool {
+			return s.UpstreamID == 10 && s.CircuitState == string(aigatewaytypes.CircuitStateUnknown)
+		})).Return(nil)
+
+		mc := &llmServiceComponentImpl{
+			upstreamStore:     upstreamStore,
+			healthStateStore:  healthStateStore,
+			circuitStateStore: circuitStateStore,
+			sampleRegistry:    sample.NewDefaultRegistry(),
+		}
+		cbOn := true
+		res, err := mc.UpdateUpstream(ctx, &types.UpdateUpstreamReq{ID: 10, CircuitBreakerEnabled: &cbOn})
+		require.Nil(t, err)
+		require.NotNil(t, res)
+		require.Equal(t, string(aigatewaytypes.UpstreamStatusUnknown), res.AvailabilityStatus)
+		require.True(t, res.IsAvailable)
+	})
+
+	t.Run("no_reset_when_already_enabled_and_checks_unchanged", func(t *testing.T) {
+		upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+		healthStateStore := mockdatabase.NewMockAIGatewayUpstreamHealthStateStore(t)
+		circuitStateStore := mockdatabase.NewMockAIGatewayUpstreamCircuitStateStore(t)
+
+		// Already enabled with both checks enabled, just updating URL
+		callCount := 0
+		upstreamStore.EXPECT().GetByID(ctx, int64(10)).RunAndReturn(func(ctx context.Context, id int64) (*database.Upstream, error) {
+			callCount++
+			if callCount == 1 {
+				return &database.Upstream{
+					ID:                    10,
+					URL:                   "http://old-endpoint/v1/chat/completions",
+					Enabled:               true,
+					HealthCheckEnabled:    true,
+					CircuitBreakerEnabled: true,
+					HealthState:           &database.AIGatewayUpstreamHealthState{ID: 1, UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateHealthy)},
+					CircuitState:          &database.AIGatewayUpstreamCircuitState{ID: 1, UpstreamID: 10, CircuitState: string(aigatewaytypes.CircuitStateClosed)},
+				}, nil
+			}
+			return &database.Upstream{
+				ID:                    10,
+				URL:                   "http://new-endpoint/v1/chat/completions",
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           &database.AIGatewayUpstreamHealthState{ID: 1, UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateHealthy)},
+				CircuitState:          &database.AIGatewayUpstreamCircuitState{ID: 1, UpstreamID: 10, CircuitState: string(aigatewaytypes.CircuitStateClosed)},
+			}, nil
+		}).Times(2)
+		upstreamStore.EXPECT().Update(ctx, mock.Anything).Return(nil)
+
+		mc := &llmServiceComponentImpl{
+			upstreamStore:     upstreamStore,
+			healthStateStore:  healthStateStore,
+			circuitStateStore: circuitStateStore,
+			sampleRegistry:    sample.NewDefaultRegistry(),
+		}
+		newURL := "http://new-endpoint/v1/chat/completions"
+		res, err := mc.UpdateUpstream(ctx, &types.UpdateUpstreamReq{ID: 10, URL: &newURL})
+		require.Nil(t, err)
+		require.NotNil(t, res)
+		require.Equal(t, string(aigatewaytypes.UpstreamStatusAvailable), res.AvailabilityStatus)
+		require.True(t, res.IsAvailable)
+	})
+
+	t.Run("no_reset_when_no_db_record_exists", func(t *testing.T) {
+		upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+		healthStateStore := mockdatabase.NewMockAIGatewayUpstreamHealthStateStore(t)
+		circuitStateStore := mockdatabase.NewMockAIGatewayUpstreamCircuitStateStore(t)
+
+		// Upstream disabled, no health/circuit records in DB
+		callCount := 0
+		upstreamStore.EXPECT().GetByID(ctx, int64(10)).RunAndReturn(func(ctx context.Context, id int64) (*database.Upstream, error) {
+			callCount++
+			if callCount == 1 {
+				return &database.Upstream{
+					ID:                    10,
+					URL:                   "http://upstream.example.com/v1/chat/completions",
+					Enabled:               false,
+					HealthCheckEnabled:    true,
+					CircuitBreakerEnabled: true,
+					HealthState:           nil,
+					CircuitState:          nil,
+				}, nil
+			}
+			return &database.Upstream{
+				ID:                    10,
+				URL:                   "http://upstream.example.com/v1/chat/completions",
+				Enabled:               true,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           nil,
+				CircuitState:          nil,
+			}, nil
+		}).Times(2)
+		upstreamStore.EXPECT().Update(ctx, mock.Anything).Return(nil)
+
+		// A missing health state remains a no-op.
+		healthStateStore.EXPECT().MutateByUpstreamID(ctx, mock.MatchedBy(func(m database.AIGatewayUpstreamHealthStateMutation) bool {
+			return m.UpstreamID == 10 && !m.CreateIfMissing
+		})).Return(nil, sql.ErrNoRows)
+		circuitStateStore.EXPECT().GetByUpstreamID(ctx, int64(10)).Return(nil, fmt.Errorf("not found"))
+
+		mc := &llmServiceComponentImpl{
+			upstreamStore:     upstreamStore,
+			healthStateStore:  healthStateStore,
+			circuitStateStore: circuitStateStore,
+			sampleRegistry:    sample.NewDefaultRegistry(),
+		}
+		enabled := true
+		res, err := mc.UpdateUpstream(ctx, &types.UpdateUpstreamReq{ID: 10, Enabled: &enabled})
+		require.Nil(t, err)
+		require.NotNil(t, res)
+		// buildUpstreamConfigs handles nil → unknown
+		require.Equal(t, string(aigatewaytypes.UpstreamStatusUnknown), res.AvailabilityStatus)
+		require.True(t, res.IsAvailable)
+	})
+
+	t.Run("disabling_upstream_does_not_reset_state", func(t *testing.T) {
+		upstreamStore := mockdatabase.NewMockUpstreamStore(t)
+		healthStateStore := mockdatabase.NewMockAIGatewayUpstreamHealthStateStore(t)
+		circuitStateStore := mockdatabase.NewMockAIGatewayUpstreamCircuitStateStore(t)
+
+		// Upstream enabled, disabling it
+		callCount := 0
+		upstreamStore.EXPECT().GetByID(ctx, int64(10)).RunAndReturn(func(ctx context.Context, id int64) (*database.Upstream, error) {
+			callCount++
+			if callCount == 1 {
+				return &database.Upstream{
+					ID:                    10,
+					URL:                   "http://upstream.example.com/v1/chat/completions",
+					Enabled:               true,
+					HealthCheckEnabled:    true,
+					CircuitBreakerEnabled: true,
+					HealthState:           &database.AIGatewayUpstreamHealthState{ID: 1, UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateHealthy)},
+					CircuitState:          &database.AIGatewayUpstreamCircuitState{ID: 1, UpstreamID: 10, CircuitState: string(aigatewaytypes.CircuitStateClosed)},
+				}, nil
+			}
+			return &database.Upstream{
+				ID:                    10,
+				URL:                   "http://upstream.example.com/v1/chat/completions",
+				Enabled:               false,
+				HealthCheckEnabled:    true,
+				CircuitBreakerEnabled: true,
+				HealthState:           &database.AIGatewayUpstreamHealthState{ID: 1, UpstreamID: 10, HealthState: string(aigatewaytypes.HealthStateHealthy)},
+				CircuitState:          &database.AIGatewayUpstreamCircuitState{ID: 1, UpstreamID: 10, CircuitState: string(aigatewaytypes.CircuitStateClosed)},
+			}, nil
+		}).Times(2)
+		upstreamStore.EXPECT().Update(ctx, mock.Anything).Return(nil)
+
+		mc := &llmServiceComponentImpl{
+			upstreamStore:     upstreamStore,
+			healthStateStore:  healthStateStore,
+			circuitStateStore: circuitStateStore,
+			sampleRegistry:    sample.NewDefaultRegistry(),
+		}
+		disabled := false
+		res, err := mc.UpdateUpstream(ctx, &types.UpdateUpstreamReq{ID: 10, Enabled: &disabled})
+		require.Nil(t, err)
+		require.NotNil(t, res)
+		require.Equal(t, string(aigatewaytypes.UpstreamStatusDisabled), res.AvailabilityStatus)
+		require.False(t, res.IsAvailable)
+	})
+}

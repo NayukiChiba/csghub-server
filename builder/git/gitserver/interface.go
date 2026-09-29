@@ -1,0 +1,72 @@
+package gitserver
+
+import (
+	"context"
+	"io"
+
+	"opencsg.com/csghub-server/common/types"
+)
+
+const (
+	Git_Header_X_Pagecount = "x-pagecount"
+	Git_Header_X_Total     = "x-total"
+)
+
+type GitServer interface {
+	RepositoryExists(ctx context.Context, req CheckRepoReq) (bool, error)
+	GetRepo(ctx context.Context, req GetRepoReq) (*CreateRepoResp, error)
+	CreateRepo(ctx context.Context, req CreateRepoReq) (*CreateRepoResp, error)
+	UpdateRepo(ctx context.Context, req UpdateRepoReq) (*CreateRepoResp, error)
+	DeleteRepo(ctx context.Context, relativePath string) error
+	CreateBranch(ctx context.Context, req CreateBranchReq) error
+	GetRepoBranches(ctx context.Context, req GetBranchesReq) ([]types.Branch, error)
+	GetRepoBranchByName(ctx context.Context, req GetBranchReq) (*types.Branch, error)
+	DeleteRepoBranch(ctx context.Context, req DeleteBranchReq) error
+	SetDefaultBranch(ctx context.Context, req SetDefaultBranchReq) error
+	GetRepoCommits(ctx context.Context, req GetRepoCommitsReq) ([]types.Commit, *types.RepoPageOpts, error)
+	GetRepoLastCommit(ctx context.Context, req GetRepoLastCommitReq) (*types.Commit, error)
+	GetSingleCommit(ctx context.Context, req GetRepoLastCommitReq) (*types.CommitResponse, error)
+	GetCommitDiff(ctx context.Context, req GetRepoLastCommitReq) ([]byte, error)
+	GetArchive(ctx context.Context, req GetArchiveReq) ([]byte, error)
+	GetRepoFileTree(ctx context.Context, req GetRepoInfoByPathReq) ([]*types.File, error)
+	GetTree(ctx context.Context, req types.GetTreeRequest) (*types.GetRepoFileTreeResp, error)
+	GetLogsTree(ctx context.Context, req types.GetLogsTreeRequest) (*types.LogsTreeResp, error)
+	GetRepoFileRaw(ctx context.Context, req GetRepoInfoByPathReq) (string, error)
+	GetRepoFileReader(ctx context.Context, req GetRepoInfoByPathReq) (io.ReadCloser, int64, error)
+	GetRepoFileContents(ctx context.Context, req GetRepoInfoByPathReq) (*types.File, error)
+	CreateRepoFile(req *types.CreateFileReq) (err error)
+	UpdateRepoFile(req *types.UpdateFileReq) (err error)
+	DeleteRepoFile(req *types.DeleteFileReq) (err error)
+	GetRepoAllFiles(ctx context.Context, req GetRepoAllFilesReq) ([]*types.File, error)
+	GetRepoAllLfsPointers(ctx context.Context, req GetRepoAllFilesReq) ([]*types.LFSPointer, error)
+	GetDiffBetweenTwoCommits(ctx context.Context, req GetDiffBetweenTwoCommitsReq) (*types.GiteaCallbackPushReq, error)
+	GetRepoFiles(ctx context.Context, req GetRepoFilesReq) ([]*types.File, error)
+
+	// Mirror
+	// CreateMirrorRepo creates a mirror repository and returns a task id
+	CreateMirrorRepo(ctx context.Context, req CreateMirrorRepoReq) (int64, error)
+	// MirrorSync requests to start mirror synchronization
+	MirrorSync(ctx context.Context, req MirrorSyncReq) error
+
+	// For gitaly smart http methods
+	InfoRefsResponse(ctx context.Context, req InfoRefsReq) (io.Reader, error)
+	// Handle git clone or fetch request
+	UploadPack(ctx context.Context, req UploadPackReq) error
+	// Handle git push request
+	ReceivePack(ctx context.Context, req ReceivePackReq) error
+
+	CommitFiles(ctx context.Context, req CommitFilesReq) error
+	BuildRelativePath(ctx context.Context, repoType types.RepositoryType, namespace, name string) (string, error)
+	UpdateRef(ctx context.Context, req UpdateRefReq) error
+	GetRepoLfsPointers(ctx context.Context, req GetRepoFilesReq) ([]*types.LFSPointer, error)
+	CopyRepository(ctx context.Context, req CopyRepositoryReq) error
+	GetFilesByRevisionAndPaths(ctx context.Context, req GetFilesByRevisionAndPathsReq) ([]*types.File, error)
+	// GetRepoSize returns the repository size in kilobytes, including LFS pointer files but not actual LFS file content
+	GetRepoSize(ctx context.Context, req GetRepoInfoByPathReq) (int64, error)
+	// GetRepoLfsSize returns the total size of all LFS files in the repository
+	GetRepoLfsSize(ctx context.Context, req GetRepoInfoByPathReq) (int64, error)
+	// GetLastCommitSize returns the total size of files changed in the last commit (HEAD)
+	GetLastCommitSize(ctx context.Context, req GetRepoInfoByPathReq) (int64, error)
+	// CreateFork creates a fork of a repository
+	CreateFork(ctx context.Context, req CreateForkReq) error
+}

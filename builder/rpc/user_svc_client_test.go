@@ -1,0 +1,544 @@
+package rpc
+
+import (
+	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"opencsg.com/csghub-server/api/httpbase"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/types"
+)
+
+func setupTestClient(server *httptest.Server) *UserSvcHttpClient {
+	return &UserSvcHttpClient{
+		hc: &HttpClient{
+			endpoint: server.URL,
+			hc:       server.Client(),
+			logger:   slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+		},
+	}
+}
+
+func TestGetNameSpaceInfo_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/namespace/test-namespace", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+
+		resp := httpbase.R{
+			Data: &Namespace{Path: "test-namespace"},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	ns, err := client.GetNameSpaceInfo(context.Background(), "test-namespace")
+
+	assert.NoError(t, err)
+	assert.NotNil(t, ns)
+	assert.Equal(t, "test-namespace", ns.Path)
+}
+
+func TestGetNameSpaceInfoByUUID_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/namespace/uuid/test-namespace-uuid", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+
+		resp := httpbase.R{
+			Data: &Namespace{
+				Path:   "test-namespace",
+				UUID:   "test-namespace-uuid",
+				Type:   "user",
+				Avatar: "avatar_url",
+			},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	ns, err := client.GetNameSpaceInfoByUUID(context.Background(), "test-namespace-uuid")
+
+	assert.NoError(t, err)
+	assert.NotNil(t, ns)
+	assert.Equal(t, "test-namespace", ns.Path)
+	assert.Equal(t, "test-namespace-uuid", ns.UUID)
+	assert.Equal(t, "user", ns.Type)
+	assert.Equal(t, "avatar_url", ns.Avatar)
+}
+
+func TestGetNameSpaceInfoByUUID_Failure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	ns, err := client.GetNameSpaceInfoByUUID(context.Background(), "test-namespace-uuid")
+
+	assert.Error(t, err)
+	assert.Nil(t, ns)
+}
+
+func TestGetUserInfo_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/user/test-user?current_user=visitor", r.URL.String())
+		assert.Equal(t, http.MethodGet, r.Method)
+
+		resp := httpbase.R{
+			Data: &User{Username: "test-user"},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	user, err := client.GetUserInfo(context.Background(), "test-user", "visitor")
+
+	assert.NoError(t, err)
+	assert.NotNil(t, user)
+	assert.Equal(t, "test-user", user.Username)
+}
+
+func TestGetOrCreateFirstAvaiTokens_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/user/test-user/tokens/first?current_user=visitor&app=test-app&token_name=test-token", r.URL.String())
+		assert.Equal(t, http.MethodGet, r.Method)
+
+		resp := httpbase.R{
+			Data: "test-token-value",
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	token, err := client.GetOrCreateFirstAvaiTokens(context.Background(), "test-user", "visitor", "test-app", "test-token")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "test-token-value", token)
+}
+
+func TestVerifyByAccessToken_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/token/test-token", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+
+		resp := httpbase.R{
+			Data: &types.CheckAccessTokenResp{UserUUID: "123", Username: "test-user"},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	result, err := client.VerifyByAccessToken(context.Background(), "test-token")
+
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Equal(t, "123", result.UserUUID)
+	assert.Equal(t, "test-user", result.Username)
+}
+
+func TestGetUserByName_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/user/test-user", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+
+		resp := httpbase.R{
+			Data: &types.User{Username: "test-user", Email: "test@example.com"},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	user, err := client.GetUserByName(context.Background(), "test-user")
+
+	assert.NoError(t, err)
+	assert.NotNil(t, user)
+	assert.Equal(t, "test-user", user.Username)
+	assert.Equal(t, "test@example.com", user.Email)
+}
+
+func TestGetUserByUUID_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/user/test-uuid", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "uuid", r.URL.Query().Get("type"))
+
+		resp := httpbase.R{
+			Data: &types.User{
+				UUID:     "test-uuid",
+				Username: "test-user",
+				Email:    "test@example.com",
+			},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	user, err := client.GetUserByUUID(context.Background(), "test-uuid")
+
+	assert.NoError(t, err)
+	assert.NotNil(t, user)
+	assert.Equal(t, "test-uuid", user.UUID)
+	assert.Equal(t, "test-user", user.Username)
+	assert.Equal(t, "test@example.com", user.Email)
+}
+
+func TestGetUserByUUID_Failure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	user, err := client.GetUserByUUID(context.Background(), "test-uuid")
+
+	assert.Error(t, err)
+	assert.Nil(t, user)
+}
+
+func TestFindByUUIDs_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/users/by-uuids", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "uuids=uuid1&uuids=uuid2", r.URL.RawQuery)
+
+		resp := struct {
+			Msg  string        `json:"msg"`
+			Data []*types.User `json:"data"`
+		}{
+			Data: []*types.User{
+				{UUID: "uuid1", Username: "user1"},
+				{UUID: "uuid2", Username: "user2"},
+			},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	result, err := client.FindByUUIDs(context.Background(), []string{"uuid1", "uuid2"})
+
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Len(t, result, 2)
+	assert.Equal(t, "user1", result["uuid1"].Username)
+	assert.Equal(t, "user2", result["uuid2"].Username)
+}
+
+func TestFindByUUIDs_Failure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	result, err := client.FindByUUIDs(context.Background(), []string{"uuid1", "uuid2"})
+
+	assert.Error(t, err)
+	assert.Nil(t, result)
+}
+
+func TestFindByUUIDs_EmptyResult(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/users/by-uuids", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+
+		resp := struct {
+			Msg  string        `json:"msg"`
+			Data []*types.User `json:"data"`
+		}{
+			Data: []*types.User{},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	result, err := client.FindByUUIDs(context.Background(), []string{"uuid1"})
+
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Len(t, result, 0)
+}
+
+func TestFindByUUIDs_FiltersInvalidUsers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/users/by-uuids", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+
+		resp := struct {
+			Msg  string        `json:"msg"`
+			Data []*types.User `json:"data"`
+		}{
+			Data: []*types.User{
+				{UUID: "uuid1", Username: "user1"},
+				{UUID: "", Username: "user2"}, // Empty UUID should be filtered
+				{UUID: "uuid3", Username: "user3"},
+				nil, // Nil user should be filtered
+			},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	result, err := client.FindByUUIDs(context.Background(), []string{"uuid1", "uuid2", "uuid3"})
+
+	assert.NoError(t, err)
+	assert.NotNil(t, result)
+	assert.Len(t, result, 2) // Only uuid1 and uuid3 should be in the result
+	assert.Equal(t, "user1", result["uuid1"].Username)
+	assert.Equal(t, "user3", result["uuid3"].Username)
+	assert.Nil(t, result["uuid2"]) // uuid2 should not be in result
+}
+
+func TestGetUserUUIDs_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/user/user_uuids", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "10", r.URL.Query().Get("per"))
+		assert.Equal(t, "1", r.URL.Query().Get("page"))
+
+		resp := struct {
+			Data struct {
+				UserUUIDs []string `json:"data"`
+				Total     int      `json:"total"`
+			} `json:"data"`
+		}{
+			Data: struct {
+				UserUUIDs []string `json:"data"`
+				Total     int      `json:"total"`
+			}{
+				UserUUIDs: []string{"uuid1", "uuid2", "uuid3"},
+				Total:     100,
+			},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	uuids, total, err := client.GetUserUUIDs(context.Background(), 10, 1)
+
+	assert.NoError(t, err)
+	assert.Len(t, uuids, 3)
+	assert.Equal(t, 100, total)
+	assert.Contains(t, uuids, "uuid1")
+}
+
+func TestGetAdminUserUUIDs(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "/api/v1/user/admin_uuids", r.URL.Path)
+			assert.Equal(t, http.MethodGet, r.Method)
+			err := json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"data":  []string{"admin-uuid", "super-user-uuid"},
+					"total": 2,
+				},
+			})
+			assert.NoError(t, err)
+		}))
+		defer server.Close()
+
+		client := setupTestClient(server)
+		uuids, total, err := client.GetAdminUserUUIDs(context.Background())
+
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"admin-uuid", "super-user-uuid"}, uuids)
+		assert.Equal(t, 2, total)
+	})
+
+	t.Run("remote error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "user service unavailable", http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		client := setupTestClient(server)
+		uuids, total, err := client.GetAdminUserUUIDs(context.Background())
+
+		assert.Error(t, err)
+		assert.Nil(t, uuids)
+		assert.Zero(t, total)
+	})
+}
+
+func TestGetAdminEmails(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "/api/v1/user/admin_emails", r.URL.Path)
+			assert.Equal(t, http.MethodGet, r.Method)
+			err := json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"data":  []string{"admin@example.com", "super-user@example.com"},
+					"total": 2,
+				},
+			})
+			assert.NoError(t, err)
+		}))
+		defer server.Close()
+
+		client := setupTestClient(server)
+		emails, total, err := client.GetAdminEmails(context.Background())
+
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"admin@example.com", "super-user@example.com"}, emails)
+		assert.Equal(t, 2, total)
+	})
+
+	t.Run("remote error", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "user service unavailable", http.StatusInternalServerError)
+		}))
+		defer server.Close()
+
+		client := setupTestClient(server)
+		emails, total, err := client.GetAdminEmails(context.Background())
+
+		assert.Error(t, err)
+		assert.Nil(t, emails)
+		assert.Zero(t, total)
+	})
+}
+
+func TestGetEmails_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/internal/user/emails", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "20", r.URL.Query().Get("per"))
+		assert.Equal(t, "1", r.URL.Query().Get("page"))
+
+		resp := struct {
+			Msg   string   `json:"msg"`
+			Data  []string `json:"data"`
+			Total int      `json:"total"`
+		}{
+			Data:  []string{"test1@example.com", "test2@example.com"},
+			Total: 50,
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	emails, total, err := client.GetEmails(context.Background(), 20, 1)
+
+	assert.NoError(t, err)
+	assert.Len(t, emails, 2)
+	assert.Equal(t, 50, total)
+	assert.Contains(t, emails, "test1@example.com")
+}
+
+func TestGetAPIKeyQuotas_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/token/test-key-name/quotas", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+
+		resp := struct {
+			Msg  string                             `json:"msg"`
+			Data []database.AccountAccessTokenQuota `json:"data"`
+		}{
+			Data: []database.AccountAccessTokenQuota{
+				{QuotaType: types.AccountingQuotaTypeMonthly, ValueType: types.AccountingQuotaValueTypeFee, Usage: 50, Quota: 100},
+				{QuotaType: types.AccountingQuotaTotal, ValueType: types.AccountingQuotaValueTypeFee, Usage: 200, Quota: 1000},
+			},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	quotas, err := client.GetTokenQuotas(context.Background(), "test-key-name")
+
+	assert.NoError(t, err)
+	assert.NotNil(t, quotas)
+	assert.Len(t, quotas, 2)
+	assert.Equal(t, types.AccountingQuotaTypeMonthly, quotas[0].QuotaType)
+	assert.Equal(t, types.AccountingQuotaValueTypeFee, quotas[0].ValueType)
+	assert.Equal(t, float64(50), quotas[0].Usage)
+	assert.Equal(t, float64(100), quotas[0].Quota)
+	assert.Equal(t, types.AccountingQuotaTotal, quotas[1].QuotaType)
+	assert.Equal(t, types.AccountingQuotaValueTypeFee, quotas[1].ValueType)
+	assert.Equal(t, float64(200), quotas[1].Usage)
+	assert.Equal(t, float64(1000), quotas[1].Quota)
+}
+
+func TestGetAPIKeyQuotas_Failure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	quotas, err := client.GetTokenQuotas(context.Background(), "test-key-name")
+
+	assert.Error(t, err)
+	assert.Nil(t, quotas)
+}
+
+func TestGetAPIKeyQuotas_EmptyResult(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/token/test-key/quotas", r.URL.Path)
+		assert.Equal(t, http.MethodGet, r.Method)
+
+		resp := struct {
+			Msg  string                             `json:"msg"`
+			Data []database.AccountAccessTokenQuota `json:"data"`
+		}{
+			Data: []database.AccountAccessTokenQuota{},
+		}
+		err := json.NewEncoder(w).Encode(resp)
+		assert.NoError(t, err)
+	}))
+	defer server.Close()
+
+	client := setupTestClient(server)
+
+	quotas, err := client.GetTokenQuotas(context.Background(), "test-key")
+
+	assert.NoError(t, err)
+	assert.NotNil(t, quotas)
+	assert.Len(t, quotas, 0)
+}

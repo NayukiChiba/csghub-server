@@ -1,0 +1,1746 @@
+package database_test
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"github.com/uptrace/bun"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/tests"
+	"opencsg.com/csghub-server/common/types"
+)
+
+// fakeMirrorLFSJobClient records LFS job enqueue attempts made inside a database transaction.
+type fakeMirrorLFSJobClient struct {
+	err    error
+	inputs []database.MirrorLFSJobInput
+}
+
+// InsertMirrorLFSJobTx records the transactional LFS job input.
+func (c *fakeMirrorLFSJobClient) InsertMirrorLFSJobTx(ctx context.Context, tx *sql.Tx, input database.MirrorLFSJobInput) (int64, error) {
+	c.inputs = append(c.inputs, input)
+	if c.err != nil {
+		return 0, c.err
+	}
+	return 456, nil
+}
+
+// fakeMirrorRepoJobClient records repository job enqueue attempts made inside a database transaction.
+type fakeMirrorRepoJobClient struct {
+	err    error
+	inputs []database.MirrorJobInput
+}
+
+// InsertMirrorRepoJobTx records the transactional repo job input.
+func (c *fakeMirrorRepoJobClient) InsertMirrorRepoJobTx(ctx context.Context, tx *sql.Tx, input database.MirrorJobInput) (int64, error) {
+	c.inputs = append(c.inputs, input)
+	if c.err != nil {
+		return 0, c.err
+	}
+	return 789, nil
+}
+
+// fakeMirrorJobCancelClient records River job cancellation attempts made inside a database transaction.
+type fakeMirrorJobCancelClient struct {
+	err    error
+	jobIDs []int64
+}
+
+// JobCancelTx records the job ID cancelled inside the current transaction.
+func (c *fakeMirrorJobCancelClient) JobCancelTx(ctx context.Context, tx *sql.Tx, jobID int64) error {
+	c.jobIDs = append(c.jobIDs, jobID)
+	return c.err
+}
+
+// mirrorLockOrderHook records business rows locked with SELECT FOR UPDATE.
+type mirrorLockOrderHook struct {
+	tables []string
+}
+
+// BeforeQuery leaves the query context unchanged.
+func (h *mirrorLockOrderHook) BeforeQuery(ctx context.Context, _ *bun.QueryEvent) context.Context {
+	return ctx
+}
+
+// AfterQuery records the aggregate table locked by a SELECT FOR UPDATE statement.
+func (h *mirrorLockOrderHook) AfterQuery(_ context.Context, event *bun.QueryEvent) {
+	query := strings.ToLower(event.Query)
+	if !strings.Contains(query, "for update") {
+		return
+	}
+	switch {
+	case strings.Contains(query, `from "mirrors"`):
+		h.tables = append(h.tables, "mirror")
+	case strings.Contains(query, `from "repositories"`):
+		h.tables = append(h.tables, "repository")
+	case strings.Contains(query, `from "mirror_tasks"`):
+		h.tables = append(h.tables, "mirror_task")
+	}
+}
+
+// TestMirrorTaskStore_RequeueMirrorRepoTaskCreatesRepoJobInTx verifies requeue only cancels the current task job.
+func TestMirrorTaskStore_RequeueMirrorRepoTaskCreatesRepoJobInTx(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+	jobClient := &fakeMirrorRepoJobClient{}
+	cancelClient := &fakeMirrorJobCancelClient{}
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:         1,
+		Path:           "test/requeue",
+		GitPath:        "models_test/requeue",
+		Name:           "requeue",
+		Nickname:       "Requeue",
+		DefaultBranch:  "main",
+		Private:        false,
+		RepositoryType: types.ModelRepo,
+		SyncStatus:     types.SyncStatusCompleted,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/requeue.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorLfsSyncStart,
+		Priority:       types.LowMirrorPriority,
+	})
+	require.Nil(t, err)
+	oldUpdatedAt := time.Now().Add(-time.Hour)
+	_, err = db.Core.NewUpdate().
+		Model((*database.Mirror)(nil)).
+		Set("updated_at = ?", oldUpdatedAt).
+		Where("id = ?", mirror.ID).
+		Exec(ctx)
+	require.Nil(t, err)
+
+	historicalTask, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID:  mirror.ID,
+		Status:    types.MirrorCanceled,
+		Priority:  types.LowMirrorPriority,
+		RepoJobID: 303,
+		LFSJobID:  404,
+	})
+	require.Nil(t, err)
+	currentTask, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID:  mirror.ID,
+		Status:    types.MirrorLfsSyncStart,
+		Priority:  types.LowMirrorPriority,
+		RepoJobID: 101,
+		LFSJobID:  202,
+	})
+	require.Nil(t, err)
+	_, err = db.Core.NewUpdate().
+		Model(&database.Mirror{}).
+		Set("current_task_id = ?", currentTask.ID).
+		Where("id = ?", mirror.ID).
+		Exec(ctx)
+	require.Nil(t, err)
+	username := "new-user"
+	accessToken := "new-token"
+	lockHook := &mirrorLockOrderHook{}
+	db.BunDB.AddQueryHook(lockHook)
+
+	task, err := taskStore.RequeueMirrorRepoTask(ctx, database.RequeueMirrorRepoTaskInput{
+		MirrorID:        mirror.ID,
+		RepositoryID:    repo.ID,
+		Username:        &username,
+		AccessToken:     &accessToken,
+		Priority:        types.ASAPMirrorPriority,
+		Urgent:          true,
+		JobClient:       jobClient,
+		JobCancelClient: cancelClient,
+	})
+
+	require.Nil(t, err)
+	require.Equal(t, []string{"mirror", "repository", "mirror_task"}, lockHook.tables)
+	require.Equal(t, types.MirrorQueued, task.Status)
+	require.Equal(t, types.ASAPMirrorPriority, task.Priority)
+	require.Equal(t, int64(789), task.RepoJobID)
+	require.True(t, task.IsUrgent)
+	require.Equal(t, []int64{int64(101), int64(202)}, cancelClient.jobIDs)
+	require.Len(t, jobClient.inputs, 1)
+	require.Equal(t, database.MirrorJobInput{
+		MirrorID:     mirror.ID,
+		RepositoryID: repo.ID,
+		MirrorTaskID: task.ID,
+		RepoType:     types.ModelRepo,
+		SourceURL:    "https://example.com/test/requeue.git",
+		RepoPath:     "test/requeue",
+		Priority:     types.ASAPMirrorPriority,
+		Urgent:       true,
+	}, jobClient.inputs[0])
+
+	var storedCurrentTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&storedCurrentTask).Where("id = ?", currentTask.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorCanceled, storedCurrentTask.Status)
+
+	var storedHistoricalTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&storedHistoricalTask).Where("id = ?", historicalTask.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorCanceled, storedHistoricalTask.Status)
+
+	var storedNewTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&storedNewTask).Where("id = ?", task.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.True(t, storedNewTask.IsUrgent)
+
+	var storedMirror database.Mirror
+	err = db.Core.NewSelect().Model(&storedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorQueued, storedMirror.Status)
+	require.Equal(t, task.ID, storedMirror.CurrentTaskID)
+	require.Equal(t, types.ASAPMirrorPriority, storedMirror.Priority)
+	require.Equal(t, username, storedMirror.Username)
+	require.Equal(t, accessToken, storedMirror.AccessToken)
+	require.True(t, storedMirror.UpdatedAt.After(oldUpdatedAt))
+
+	var storedRepo database.Repository
+	err = db.Core.NewSelect().Model(&storedRepo).Where("id = ?", repo.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.SyncStatusPending, storedRepo.SyncStatus)
+}
+
+func TestMirrorTaskStore_RequeueMirrorRepoTaskRollsBackWhenJobInsertFails(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+	jobClient := &fakeMirrorRepoJobClient{err: errors.New("insert job failed")}
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:         1,
+		Path:           "test/requeue-rollback",
+		GitPath:        "models_test/requeue-rollback",
+		Name:           "requeue-rollback",
+		Nickname:       "Requeue Rollback",
+		DefaultBranch:  "main",
+		Private:        false,
+		RepositoryType: types.ModelRepo,
+		SyncStatus:     types.SyncStatusCompleted,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/requeue-rollback.git",
+		Username:       "old-user",
+		AccessToken:    "old-token",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorLfsSyncFinished,
+		Priority:       types.LowMirrorPriority,
+	})
+	require.Nil(t, err)
+	username := "new-user"
+	accessToken := "new-token"
+
+	_, err = taskStore.RequeueMirrorRepoTask(ctx, database.RequeueMirrorRepoTaskInput{
+		MirrorID:     mirror.ID,
+		RepositoryID: repo.ID,
+		Username:     &username,
+		AccessToken:  &accessToken,
+		Priority:     types.ASAPMirrorPriority,
+		JobClient:    jobClient,
+	})
+
+	require.ErrorContains(t, err, "insert job failed")
+	var storedMirror database.Mirror
+	err = db.Core.NewSelect().Model(&storedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorLfsSyncFinished, storedMirror.Status)
+	require.Equal(t, types.LowMirrorPriority, storedMirror.Priority)
+	require.Equal(t, "old-user", storedMirror.Username)
+	require.Equal(t, "old-token", storedMirror.AccessToken)
+
+	var taskCount int
+	taskCount, err = db.Core.NewSelect().
+		Model((*database.MirrorTask)(nil)).
+		Where("mirror_id = ?", mirror.ID).
+		Count(ctx)
+	require.Nil(t, err)
+	require.Equal(t, 0, taskCount)
+}
+
+func TestMirrorTaskStore_CRUD(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewMirrorTaskStoreWithDB(db)
+
+	m, err := store.Create(ctx, database.MirrorTask{
+		MirrorID: 1,
+		Status:   types.MirrorQueued,
+		Priority: types.LowMirrorPriority,
+	})
+	require.Nil(t, err)
+
+	var mt database.MirrorTask
+	err = db.Core.NewSelect().Model(&mt).Where("id = ?", m.ID).Scan(ctx)
+	require.Nil(t, err)
+
+	require.Equal(t, m.ID, mt.ID)
+	require.Equal(t, int64(1), mt.MirrorID)
+	require.Equal(t, types.MirrorQueued, mt.Status)
+	require.Equal(t, types.LowMirrorPriority, mt.Priority)
+
+	m1, err := store.Update(ctx, database.MirrorTask{
+		ID:       m.ID,
+		MirrorID: 1,
+		Status:   types.MirrorQueued,
+		Priority: types.LowMirrorPriority,
+	})
+	require.Nil(t, err)
+
+	var mt1 database.MirrorTask
+	err = db.Core.NewSelect().Model(&mt1).Where("id = ?", m.ID).Scan(ctx)
+	require.Nil(t, err)
+
+	require.Equal(t, types.MirrorQueued, m1.Status)
+	require.Equal(t, types.LowMirrorPriority, m1.Priority)
+	require.Equal(t, types.MirrorQueued, mt1.Status)
+	require.Equal(t, types.LowMirrorPriority, mt1.Priority)
+
+	m2, err := store.FindByMirrorID(ctx, 1)
+	require.Nil(t, err)
+	require.Equal(t, m.ID, m2.ID)
+	require.Equal(t, int64(1), m2.MirrorID)
+	require.Equal(t, types.MirrorQueued, m2.Status)
+	require.Equal(t, types.LowMirrorPriority, m2.Priority)
+
+	err = store.Delete(ctx, m.ID)
+	require.Nil(t, err)
+
+	err = db.Core.NewSelect().Model(&mt).Where("id = ?", m.ID).Scan(ctx)
+	require.NotNil(t, err)
+	require.Equal(t, "sql: no rows in result set", err.Error())
+}
+
+func TestMirrorTaskStore_SetMirrorCurrentTaskID(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewMirrorTaskStoreWithDB(db)
+	mstore := database.NewMirrorStoreWithDB(db)
+
+	mirror, err := mstore.Create(ctx, &database.Mirror{
+		SourceUrl:      "test",
+		RepositoryID:   1,
+		MirrorSourceID: 1,
+	})
+	require.Nil(t, err)
+
+	mt, err := store.Create(ctx, database.MirrorTask{
+		MirrorID: mirror.ID,
+		Status:   types.MirrorQueued,
+		Priority: types.LowMirrorPriority,
+	})
+	require.Nil(t, err)
+
+	err = store.SetMirrorCurrentTaskID(ctx, mt)
+	require.Nil(t, err)
+
+	var m database.Mirror
+
+	err = db.Operator.Core.NewSelect().Model(&m).Where("id = ?", mirror.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, mt.ID, m.CurrentTaskID)
+}
+
+// TestMirrorTaskStore_UpdateStatusAndRepoSyncStatus verifies worker updates use the canonical aggregate lock order.
+func TestMirrorTaskStore_UpdateStatusAndRepoSyncStatus(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/repo",
+		GitPath:       "test/repo.git",
+		Name:          "repo",
+		Nickname:      "Test Repo",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusPending,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/repo.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID: mirror.ID,
+		Status:   types.MirrorRepoSyncStart,
+		Priority: types.LowMirrorPriority,
+		Mirror: &database.Mirror{
+			RepositoryID: repo.ID,
+		},
+	})
+	require.Nil(t, err)
+
+	lockHook := &mirrorLockOrderHook{}
+	db.BunDB.AddQueryHook(lockHook)
+	updatedTask, err := taskStore.UpdateStatusAndRepoSyncStatus(ctx, task, database.MirrorSuccess)
+	require.Nil(t, err)
+	require.Equal(t, []string{"mirror", "repository", "mirror_task"}, lockHook.tables)
+	require.Equal(t, types.MirrorRepoSyncFinished, updatedTask.Status)
+
+	var updatedRepo database.Repository
+	err = db.Core.NewSelect().Model(&updatedRepo).Where("id = ?", repo.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.SyncStatusInProgress, updatedRepo.SyncStatus)
+
+	var updatedTaskFromDB database.MirrorTask
+	err = db.Core.NewSelect().Model(&updatedTaskFromDB).Where("id = ?", task.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorRepoSyncFinished, updatedTaskFromDB.Status)
+}
+
+func TestMirrorTaskStore_UpdateStatusAndRepoSyncStatus_MultipleSyncStatuses(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/repo2",
+		GitPath:       "test/repo2.git",
+		Name:          "repo2",
+		Nickname:      "Test Repo 2",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusPending,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/repo2.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+	})
+	require.Nil(t, err)
+
+	testCases := []struct {
+		name           string
+		initialStatus  types.MirrorTaskStatus
+		action         string
+		expectedStatus types.MirrorTaskStatus
+		expectedSync   types.RepositorySyncStatus
+	}{
+		{"continue from queued", types.MirrorQueued, database.MirrorContinue, types.MirrorRepoSyncStart, types.SyncStatusInProgress},
+		{"pause from repo_sync_start", types.MirrorRepoSyncStart, database.MirrorPause, types.MirrorQueued, types.SyncStatusPending},
+		{"success from repo_sync_start", types.MirrorRepoSyncStart, database.MirrorSuccess, types.MirrorRepoSyncFinished, types.SyncStatusInProgress},
+		{"continue from repo_sync_finished", types.MirrorRepoSyncFinished, database.MirrorContinue, types.MirrorLfsSyncStart, types.SyncStatusInProgress},
+		{"pause from lfs_sync_start", types.MirrorLfsSyncStart, database.MirrorPause, types.MirrorRepoSyncFinished, types.SyncStatusInProgress},
+		{"retry from lfs_sync_failed", types.MirrorLfsSyncFailed, database.MirrorRetry, types.MirrorRepoSyncFinished, types.SyncStatusInProgress},
+		{"success from lfs_sync_start", types.MirrorLfsSyncStart, database.MirrorSuccess, types.MirrorLfsSyncFinished, types.SyncStatusCompleted},
+		{"too large from lfs_sync_start", types.MirrorLfsSyncStart, database.MirrorTooLarge, types.MirrorRepoTooLarge, types.SyncStatusFailed},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			task, err := taskStore.Create(ctx, database.MirrorTask{
+				MirrorID: mirror.ID,
+				Status:   tc.initialStatus,
+				Priority: types.HighMirrorPriority,
+				Mirror: &database.Mirror{
+					RepositoryID: repo.ID,
+				},
+			})
+			require.Nil(t, err)
+
+			_, err = db.Core.NewUpdate().
+				Model(&database.Mirror{}).
+				Set("current_task_id = ?", task.ID).
+				Where("id = ?", mirror.ID).
+				Exec(ctx)
+			require.Nil(t, err)
+
+			updatedTask, err := taskStore.UpdateStatusAndRepoSyncStatus(ctx, task, tc.action)
+			require.Nil(t, err)
+			require.Equal(t, tc.expectedStatus, updatedTask.Status)
+
+			var updatedRepo database.Repository
+			err = db.Core.NewSelect().Model(&updatedRepo).Where("id = ?", repo.ID).Scan(ctx)
+			require.Nil(t, err)
+			require.Equal(t, tc.expectedSync, updatedRepo.SyncStatus)
+		})
+	}
+}
+
+// TestMirrorTaskStore_PauseIsIdempotentForNonRunningStatuses verifies pause leaves inactive tasks unchanged.
+func TestMirrorTaskStore_PauseIsIdempotentForNonRunningStatuses(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:         1,
+		Path:           "test/pause-idempotent",
+		GitPath:        "test/pause-idempotent.git",
+		Name:           "pause-idempotent",
+		Nickname:       "Pause Idempotent",
+		DefaultBranch:  "main",
+		RepositoryType: types.ModelRepo,
+		SyncStatus:     types.SyncStatusPending,
+	})
+	require.NoError(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/pause-idempotent.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorQueued,
+	})
+	require.NoError(t, err)
+
+	tests := []struct {
+		status     types.MirrorTaskStatus
+		syncStatus types.RepositorySyncStatus
+	}{
+		{status: types.MirrorQueued, syncStatus: types.SyncStatusPending},
+		{status: types.MirrorRepoSyncFailed, syncStatus: types.SyncStatusFailed},
+		{status: types.MirrorRepoSyncFinished, syncStatus: types.SyncStatusInProgress},
+		{status: types.MirrorRepoSyncFatal, syncStatus: types.SyncStatusFailed},
+		{status: types.MirrorLfsSyncFailed, syncStatus: types.SyncStatusFailed},
+		{status: types.MirrorLfsSyncFinished, syncStatus: types.SyncStatusCompleted},
+		{status: types.MirrorLfsSyncFatal, syncStatus: types.SyncStatusFailed},
+		{status: types.MirrorLfsIncomplete, syncStatus: types.SyncStatusFailed},
+		{status: types.MirrorCanceled, syncStatus: types.SyncStatusCanceled},
+		{status: types.MirrorRepoTooLarge, syncStatus: types.SyncStatusFailed},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.status), func(t *testing.T) {
+			task, err := taskStore.Create(ctx, database.MirrorTask{
+				MirrorID:     mirror.ID,
+				Status:       test.status,
+				Priority:     types.HighMirrorPriority,
+				ErrorMessage: "existing error",
+			})
+			require.NoError(t, err)
+
+			_, err = db.Core.NewUpdate().
+				Model(&database.Mirror{}).
+				Set("current_task_id = ?", task.ID).
+				Set("status = ?", test.status).
+				Where("id = ?", mirror.ID).
+				Exec(ctx)
+			require.NoError(t, err)
+			_, err = db.Core.NewUpdate().
+				Model(&database.Repository{}).
+				Set("sync_status = ?", test.syncStatus).
+				Where("id = ?", repo.ID).
+				Exec(ctx)
+			require.NoError(t, err)
+
+			updatedTask, err := taskStore.UpdateStatusAndRepoSyncStatus(ctx, task, database.MirrorPause)
+			require.NoError(t, err)
+			require.Equal(t, test.status, updatedTask.Status)
+			require.Equal(t, "existing error", updatedTask.ErrorMessage)
+
+			var storedMirror database.Mirror
+			err = db.Core.NewSelect().Model(&storedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+			require.NoError(t, err)
+			require.Equal(t, test.status, storedMirror.Status)
+			require.Equal(t, task.ID, storedMirror.CurrentTaskID)
+
+			var storedRepo database.Repository
+			err = db.Core.NewSelect().Model(&storedRepo).Where("id = ?", repo.ID).Scan(ctx)
+			require.NoError(t, err)
+			require.Equal(t, test.syncStatus, storedRepo.SyncStatus)
+		})
+	}
+}
+
+func TestMirrorTaskStore_UpdateStatusAndRepoSyncStatus_FailedStatus(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/repo3",
+		GitPath:       "test/repo3.git",
+		Name:          "repo3",
+		Nickname:      "Test Repo 3",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusInProgress,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/repo3.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID:     mirror.ID,
+		Status:       types.MirrorRepoSyncStart,
+		Priority:     types.HighMirrorPriority,
+		ErrorMessage: "sync failed",
+		Mirror: &database.Mirror{
+			RepositoryID: repo.ID,
+		},
+	})
+	require.Nil(t, err)
+
+	updatedTask, err := taskStore.UpdateStatusAndRepoSyncStatus(ctx, task, database.MirrorFail)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorRepoSyncFailed, updatedTask.Status)
+
+	var updatedRepo database.Repository
+	err = db.Core.NewSelect().Model(&updatedRepo).Where("id = ?", repo.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.SyncStatusFailed, updatedRepo.SyncStatus)
+}
+
+func TestMirrorTaskStore_UpdateStatusAndRepoSyncStatusRejectsStaleCurrentTask(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/stale-current",
+		GitPath:       "test/stale-current.git",
+		Name:          "stale-current",
+		Nickname:      "Stale Current",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusInProgress,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/stale-current.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorRepoSyncStart,
+	})
+	require.Nil(t, err)
+
+	oldTask, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID: mirror.ID,
+		Status:   types.MirrorRepoSyncStart,
+		Priority: types.HighMirrorPriority,
+	})
+	require.Nil(t, err)
+	newTask, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID: mirror.ID,
+		Status:   types.MirrorQueued,
+		Priority: types.HighMirrorPriority,
+	})
+	require.Nil(t, err)
+
+	_, err = db.Core.NewUpdate().
+		Model(&database.Mirror{}).
+		Set("current_task_id = ?", newTask.ID).
+		Where("id = ?", mirror.ID).
+		Exec(ctx)
+	require.Nil(t, err)
+
+	_, err = taskStore.UpdateStatusAndRepoSyncStatus(ctx, oldTask, database.MirrorSuccess)
+	require.ErrorContains(t, err, "current task")
+
+	var storedMirror database.Mirror
+	err = db.Core.NewSelect().Model(&storedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, newTask.ID, storedMirror.CurrentTaskID)
+
+	var storedTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&storedTask).Where("id = ?", oldTask.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorRepoSyncStart, storedTask.Status)
+}
+
+// TestMirrorTaskStore_UpdateStatusAndRepoSyncStatusRejectsCanceledTask verifies stale workers cannot overwrite a canceled task.
+func TestMirrorTaskStore_UpdateStatusAndRepoSyncStatusRejectsCanceledTask(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/canceled-race",
+		GitPath:       "test/canceled-race.git",
+		Name:          "canceled-race",
+		Nickname:      "Canceled Race",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusInProgress,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/canceled-race.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorRepoSyncStart,
+	})
+	require.Nil(t, err)
+
+	runningTask, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID: mirror.ID,
+		Status:   types.MirrorRepoSyncStart,
+		Priority: types.HighMirrorPriority,
+	})
+	require.Nil(t, err)
+	_, err = db.Core.NewUpdate().
+		Model(&database.Mirror{}).
+		Set("current_task_id = ?", runningTask.ID).
+		Where("id = ?", mirror.ID).
+		Exec(ctx)
+	require.Nil(t, err)
+
+	cancelled, err := taskStore.CancelMirrorTaskByIDWithJobCancel(ctx, runningTask.ID, nil)
+	require.Nil(t, err)
+	require.True(t, cancelled)
+
+	// Simulate a worker that started before cancellation and now tries to
+	// write a successful result with the stale in-memory running task.
+	_, err = taskStore.UpdateStatusAndRepoSyncStatus(ctx, runningTask, database.MirrorSuccess)
+	require.ErrorContains(t, err, "not allow action")
+
+	var storedTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&storedTask).Where("id = ?", runningTask.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorCanceled, storedTask.Status)
+
+	var storedMirror database.Mirror
+	err = db.Core.NewSelect().Model(&storedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorCanceled, storedMirror.Status)
+
+	var storedRepo database.Repository
+	err = db.Core.NewSelect().Model(&storedRepo).Where("id = ?", repo.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.SyncStatusCanceled, storedRepo.SyncStatus)
+}
+
+// TestMirrorTaskStore_CancelMirrorTaskByIDWithJobCancelSynchronizesMirrorAndRepo verifies cancellation uses the canonical aggregate lock order.
+func TestMirrorTaskStore_CancelMirrorTaskByIDWithJobCancelSynchronizesMirrorAndRepo(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/cancel-sync",
+		GitPath:       "test/cancel-sync.git",
+		Name:          "cancel-sync",
+		Nickname:      "Cancel Sync",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusInProgress,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/cancel-sync.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorRepoSyncStart,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID: mirror.ID,
+		Status:   types.MirrorRepoSyncStart,
+		Priority: types.HighMirrorPriority,
+	})
+	require.Nil(t, err)
+
+	_, err = db.Core.NewUpdate().
+		Model(&database.Mirror{}).
+		Set("current_task_id = ?", task.ID).
+		Where("id = ?", mirror.ID).
+		Exec(ctx)
+	require.Nil(t, err)
+
+	lockHook := &mirrorLockOrderHook{}
+	db.BunDB.AddQueryHook(lockHook)
+	cancelled, err := taskStore.CancelMirrorTaskByIDWithJobCancel(ctx, task.ID, nil)
+	require.Nil(t, err)
+	require.True(t, cancelled)
+	require.Equal(t, []string{"mirror", "repository", "mirror_task"}, lockHook.tables)
+
+	var storedTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&storedTask).Where("id = ?", task.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorCanceled, storedTask.Status)
+
+	var storedMirror database.Mirror
+	err = db.Core.NewSelect().Model(&storedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorCanceled, storedMirror.Status)
+	require.Equal(t, task.ID, storedMirror.CurrentTaskID)
+
+	var storedRepo database.Repository
+	err = db.Core.NewSelect().Model(&storedRepo).Where("id = ?", repo.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.SyncStatusCanceled, storedRepo.SyncStatus)
+}
+
+// TestMirrorTaskStore_CancelMirrorTaskByIDWithJobCancelSupportsSoftDeletedRepository verifies
+// asynchronous repository deletion can still cancel mirror work after the repository is hidden.
+func TestMirrorTaskStore_CancelMirrorTaskByIDWithJobCancelSupportsSoftDeletedRepository(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/cancel-soft-deleted",
+		GitPath:       "test/cancel-soft-deleted.git",
+		Name:          "cancel-soft-deleted",
+		Nickname:      "Cancel Soft Deleted",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusInProgress,
+	})
+	require.NoError(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/cancel-soft-deleted.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorRepoSyncStart,
+	})
+	require.NoError(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID: mirror.ID,
+		Status:   types.MirrorRepoSyncStart,
+		Priority: types.HighMirrorPriority,
+	})
+	require.NoError(t, err)
+
+	_, err = db.Core.NewUpdate().
+		Model(&database.Mirror{}).
+		Set("current_task_id = ?", task.ID).
+		Where("id = ?", mirror.ID).
+		Exec(ctx)
+	require.NoError(t, err)
+	_, err = db.Core.NewDelete().Model(repo).WherePK().Exec(ctx)
+	require.NoError(t, err)
+
+	cancelled, err := taskStore.CancelMirrorTaskByIDWithJobCancel(ctx, task.ID, nil)
+	require.NoError(t, err)
+	require.True(t, cancelled)
+
+	var storedTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&storedTask).Where("id = ?", task.ID).Scan(ctx)
+	require.NoError(t, err)
+	require.Equal(t, types.MirrorCanceled, storedTask.Status)
+
+	var storedMirror database.Mirror
+	err = db.Core.NewSelect().Model(&storedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+	require.NoError(t, err)
+	require.Equal(t, types.MirrorCanceled, storedMirror.Status)
+	require.Equal(t, task.ID, storedMirror.CurrentTaskID)
+
+	var storedRepo database.Repository
+	err = db.Core.NewSelect().Model(&storedRepo).WhereAllWithDeleted().Where("id = ?", repo.ID).Scan(ctx)
+	require.NoError(t, err)
+	require.Equal(t, types.SyncStatusInProgress, storedRepo.SyncStatus)
+}
+
+// TestMirrorTaskStore_CancelMirrorTaskByIDWithJobCancelKeepsFinishedTask verifies cancel cannot overwrite completed sync results.
+func TestMirrorTaskStore_CancelMirrorTaskByIDWithJobCancelKeepsFinishedTask(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/cancel-finished",
+		GitPath:       "test/cancel-finished.git",
+		Name:          "cancel-finished",
+		Nickname:      "Cancel Finished",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusCompleted,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/cancel-finished.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorLfsSyncFinished,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID: mirror.ID,
+		Status:   types.MirrorLfsSyncFinished,
+		Priority: types.HighMirrorPriority,
+	})
+	require.Nil(t, err)
+
+	_, err = db.Core.NewUpdate().
+		Model(&database.Mirror{}).
+		Set("current_task_id = ?", task.ID).
+		Where("id = ?", mirror.ID).
+		Exec(ctx)
+	require.Nil(t, err)
+
+	cancelled, err := taskStore.CancelMirrorTaskByIDWithJobCancel(ctx, task.ID, nil)
+	require.Nil(t, err)
+	require.False(t, cancelled)
+
+	var storedTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&storedTask).Where("id = ?", task.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorLfsSyncFinished, storedTask.Status)
+
+	var storedMirror database.Mirror
+	err = db.Core.NewSelect().Model(&storedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorLfsSyncFinished, storedMirror.Status)
+	require.Equal(t, task.ID, storedMirror.CurrentTaskID)
+
+	var storedRepo database.Repository
+	err = db.Core.NewSelect().Model(&storedRepo).Where("id = ?", repo.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.SyncStatusCompleted, storedRepo.SyncStatus)
+}
+
+func TestMirrorTaskStore_CancelMirrorTaskByIDCancelsRiverJobsInTx(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+	cancelClient := &fakeMirrorJobCancelClient{}
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/cancel-jobs",
+		GitPath:       "test/cancel-jobs.git",
+		Name:          "cancel-jobs",
+		Nickname:      "Cancel Jobs",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusInProgress,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/cancel-jobs.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorLfsSyncStart,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID:  mirror.ID,
+		Status:    types.MirrorLfsSyncStart,
+		Priority:  types.HighMirrorPriority,
+		RepoJobID: 101,
+		LFSJobID:  202,
+	})
+	require.Nil(t, err)
+	_, err = db.Core.NewUpdate().
+		Model(&database.Mirror{}).
+		Set("current_task_id = ?", task.ID).
+		Where("id = ?", mirror.ID).
+		Exec(ctx)
+	require.Nil(t, err)
+
+	cancelled, err := taskStore.CancelMirrorTaskByIDWithJobCancel(ctx, task.ID, cancelClient)
+
+	require.Nil(t, err)
+	require.True(t, cancelled)
+	require.Equal(t, []int64{int64(101), int64(202)}, cancelClient.jobIDs)
+}
+
+func TestMirrorTaskStore_CancelMirrorTaskByIDRollsBackWhenRiverCancelFails(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+	cancelClient := &fakeMirrorJobCancelClient{err: errors.New("river cancel failed")}
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/cancel-rollback",
+		GitPath:       "test/cancel-rollback.git",
+		Name:          "cancel-rollback",
+		Nickname:      "Cancel Rollback",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusInProgress,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/cancel-rollback.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorRepoSyncStart,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID:  mirror.ID,
+		Status:    types.MirrorRepoSyncStart,
+		Priority:  types.HighMirrorPriority,
+		RepoJobID: 303,
+	})
+	require.Nil(t, err)
+	_, err = db.Core.NewUpdate().
+		Model(&database.Mirror{}).
+		Set("current_task_id = ?", task.ID).
+		Where("id = ?", mirror.ID).
+		Exec(ctx)
+	require.Nil(t, err)
+
+	cancelled, err := taskStore.CancelMirrorTaskByIDWithJobCancel(ctx, task.ID, cancelClient)
+
+	require.ErrorContains(t, err, "river cancel failed")
+	require.False(t, cancelled)
+	var storedTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&storedTask).Where("id = ?", task.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorRepoSyncStart, storedTask.Status)
+}
+
+func TestMirrorTaskStore_UpdateStatusAndRepoSyncStatus_UpdatesMirrorAndRepoFromStoredRelations(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/repo4",
+		GitPath:       "test/repo4.git",
+		Name:          "repo4",
+		Nickname:      "Test Repo 4",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusPending,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/repo4.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorQueued,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID: mirror.ID,
+		Status:   types.MirrorQueued,
+		Priority: types.HighMirrorPriority,
+	})
+	require.Nil(t, err)
+
+	updatedTask, err := taskStore.UpdateStatusAndRepoSyncStatus(ctx, task, database.MirrorContinue)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorRepoSyncStart, updatedTask.Status)
+
+	var updatedRepo database.Repository
+	err = db.Core.NewSelect().Model(&updatedRepo).Where("id = ?", repo.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.SyncStatusInProgress, updatedRepo.SyncStatus)
+
+	var updatedMirror database.Mirror
+	err = db.Core.NewSelect().Model(&updatedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorRepoSyncStart, updatedMirror.Status)
+}
+
+func TestMirrorTaskStore_UpdateStatusAndRepoSyncStatusReturnsMirrorRepository(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/repo-relation",
+		GitPath:       "test/repo-relation.git",
+		Name:          "repo-relation",
+		Nickname:      "Test Repo Relation",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusFailed,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/repo-relation.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorRepoSyncFailed,
+		CurrentTaskID:  0,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID: mirror.ID,
+		Status:   types.MirrorRepoSyncFailed,
+		Priority: types.ASAPMirrorPriority,
+	})
+	require.Nil(t, err)
+
+	retriedTask, err := taskStore.UpdateStatusAndRepoSyncStatus(ctx, task, database.MirrorRetry)
+	require.Nil(t, err)
+	require.NotNil(t, retriedTask.Mirror)
+	require.NotNil(t, retriedTask.Mirror.Repository)
+	require.Equal(t, repo.ID, retriedTask.Mirror.Repository.ID)
+
+	startedTask, err := taskStore.UpdateStatusAndRepoSyncStatus(ctx, retriedTask, database.MirrorContinue)
+	require.Nil(t, err)
+	require.NotNil(t, startedTask.Mirror)
+	require.NotNil(t, startedTask.Mirror.Repository)
+	require.Equal(t, repo.ID, startedTask.Mirror.Repository.ID)
+}
+
+// TestMirrorTaskFSM_PauseTransitions verifies pause only moves active Repo and LFS work back to waiting.
+func TestMirrorTaskFSM_PauseTransitions(t *testing.T) {
+	tests := []struct {
+		status     types.MirrorTaskStatus
+		allowed    bool
+		wantStatus types.MirrorTaskStatus
+	}{
+		{status: types.MirrorRepoSyncStart, allowed: true, wantStatus: types.MirrorQueued},
+		{status: types.MirrorLfsSyncStart, allowed: true, wantStatus: types.MirrorRepoSyncFinished},
+		{status: types.MirrorQueued, wantStatus: types.MirrorQueued},
+		{status: types.MirrorRepoSyncFailed, wantStatus: types.MirrorRepoSyncFailed},
+		{status: types.MirrorRepoSyncFinished, wantStatus: types.MirrorRepoSyncFinished},
+		{status: types.MirrorRepoSyncFatal, wantStatus: types.MirrorRepoSyncFatal},
+		{status: types.MirrorLfsSyncFailed, wantStatus: types.MirrorLfsSyncFailed},
+		{status: types.MirrorLfsSyncFinished, wantStatus: types.MirrorLfsSyncFinished},
+		{status: types.MirrorLfsSyncFatal, wantStatus: types.MirrorLfsSyncFatal},
+		{status: types.MirrorLfsIncomplete, wantStatus: types.MirrorLfsIncomplete},
+		{status: types.MirrorRepoTooLarge, wantStatus: types.MirrorRepoTooLarge},
+		{status: types.MirrorCanceled, wantStatus: types.MirrorCanceled},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.status), func(t *testing.T) {
+			task := database.MirrorTask{Status: test.status}
+			taskFSM := database.NewMirrorTaskWithFSM(&task)
+
+			allowed := taskFSM.SubmitEvent(context.Background(), database.MirrorPause)
+
+			require.Equal(t, test.allowed, allowed)
+			require.Equal(t, string(test.wantStatus), taskFSM.Current())
+		})
+	}
+}
+
+// TestMirrorTaskFSM_FatalTransitions verifies active Repo and LFS states can become permanently failed.
+func TestMirrorTaskFSM_FatalTransitions(t *testing.T) {
+	tests := []struct {
+		status     types.MirrorTaskStatus
+		allowed    bool
+		wantStatus types.MirrorTaskStatus
+	}{
+		{status: types.MirrorQueued, allowed: true, wantStatus: types.MirrorRepoSyncFatal},
+		{status: types.MirrorRepoSyncStart, allowed: true, wantStatus: types.MirrorRepoSyncFatal},
+		{status: types.MirrorRepoSyncFailed, allowed: true, wantStatus: types.MirrorRepoSyncFatal},
+		{status: types.MirrorRepoSyncFinished, allowed: true, wantStatus: types.MirrorLfsSyncFatal},
+		{status: types.MirrorLfsSyncStart, allowed: true, wantStatus: types.MirrorLfsSyncFatal},
+		{status: types.MirrorLfsSyncFailed, allowed: true, wantStatus: types.MirrorLfsSyncFatal},
+		{status: types.MirrorRepoSyncFatal, wantStatus: types.MirrorRepoSyncFatal},
+		{status: types.MirrorLfsSyncFinished, wantStatus: types.MirrorLfsSyncFinished},
+		{status: types.MirrorLfsSyncFatal, wantStatus: types.MirrorLfsSyncFatal},
+		{status: types.MirrorLfsIncomplete, wantStatus: types.MirrorLfsIncomplete},
+		{status: types.MirrorRepoTooLarge, wantStatus: types.MirrorRepoTooLarge},
+		{status: types.MirrorCanceled, wantStatus: types.MirrorCanceled},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.status), func(t *testing.T) {
+			task := database.MirrorTask{Status: test.status}
+			taskFSM := database.NewMirrorTaskWithFSM(&task)
+
+			allowed := taskFSM.SubmitEvent(context.Background(), database.MirrorFatal)
+
+			require.Equal(t, test.allowed, allowed)
+			require.Equal(t, string(test.wantStatus), taskFSM.Current())
+		})
+	}
+}
+
+func TestMirrorTaskStore_UpdateStatusAndRepoSyncStatusClearsErrorOnSuccess(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:         1,
+		Path:           "test/repo-clear-error",
+		GitPath:        "test/repo-clear-error.git",
+		Name:           "repo-clear-error",
+		Nickname:       "Test Repo Clear Error",
+		DefaultBranch:  "main",
+		Private:        false,
+		RepositoryType: types.ModelRepo,
+		SyncStatus:     types.SyncStatusInProgress,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/repo-clear-error.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorLfsSyncStart,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID:          mirror.ID,
+		Status:            types.MirrorLfsSyncStart,
+		ErrorMessage:      "stale error",
+		Priority:          types.ASAPMirrorPriority,
+		Progress:          100,
+		Mirror:            mirror,
+		FinishedAt:        time.Time{},
+		StartedAt:         time.Now(),
+		RetryCount:        1,
+		AfterLastCommitID: "after",
+	})
+	require.Nil(t, err)
+
+	_, err = db.Core.NewUpdate().
+		Model(&database.Mirror{}).
+		Set("current_task_id = ?", task.ID).
+		Where("id = ?", mirror.ID).
+		Exec(ctx)
+	require.Nil(t, err)
+
+	updatedTask, err := taskStore.UpdateStatusAndRepoSyncStatus(ctx, task, database.MirrorSuccess)
+	require.Nil(t, err)
+	require.Empty(t, updatedTask.ErrorMessage)
+
+	dbTask, err := taskStore.FindByID(ctx, task.ID)
+	require.Nil(t, err)
+	require.Empty(t, dbTask.ErrorMessage)
+}
+
+func TestMirrorTaskStore_CompleteRepoSyncAndInsertLFSJobCommitsRepoResultAndJob(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+	jobClient := &fakeMirrorLFSJobClient{}
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/repo7",
+		GitPath:       "test/repo7.git",
+		Name:          "repo7",
+		Nickname:      "Test Repo 7",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusInProgress,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/repo7.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorRepoSyncStart,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID:           mirror.ID,
+		Status:             types.MirrorRepoSyncStart,
+		Priority:           types.ASAPMirrorPriority,
+		BeforeLastCommitID: "before",
+		AfterLastCommitID:  "after",
+	})
+	require.Nil(t, err)
+
+	updatedTask, err := taskStore.CompleteRepoSyncAndInsertLFSJob(ctx, database.CompleteRepoSyncInput{
+		Task:          task,
+		DefaultBranch: "master",
+		JobClient:     jobClient,
+		JobInput: database.MirrorLFSJobInput{
+			MirrorID:     mirror.ID,
+			RepositoryID: repo.ID,
+			MirrorTaskID: task.ID,
+			SourceURL:    mirror.SourceUrl,
+			Priority:     task.Priority,
+		},
+	})
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorRepoSyncFinished, updatedTask.Status)
+	require.Equal(t, int64(456), updatedTask.LFSJobID)
+	require.Len(t, jobClient.inputs, 1)
+	require.Equal(t, task.ID, jobClient.inputs[0].MirrorTaskID)
+
+	storedTaskJob, err := taskStore.FindByID(ctx, task.ID)
+	require.Nil(t, err)
+	require.Equal(t, int64(456), storedTaskJob.LFSJobID)
+
+	var updatedMirror database.Mirror
+	err = db.Core.NewSelect().Model(&updatedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorRepoSyncFinished, updatedMirror.Status)
+	require.Equal(t, task.ID, updatedMirror.CurrentTaskID)
+	require.False(t, updatedMirror.LastUpdatedAt.IsZero())
+
+	var updatedRepo database.Repository
+	err = db.Core.NewSelect().Model(&updatedRepo).Where("id = ?", repo.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.SyncStatusInProgress, updatedRepo.SyncStatus)
+	require.Equal(t, "master", updatedRepo.DefaultBranch)
+}
+
+func TestMirrorTaskStore_CompleteRepoSyncWithoutLFSFinishesTaskWithoutLFSJob(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/repo9",
+		GitPath:       "test/repo9.git",
+		Name:          "repo9",
+		Nickname:      "Test Repo 9",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusInProgress,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/repo9.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorRepoSyncStart,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID:           mirror.ID,
+		Status:             types.MirrorRepoSyncStart,
+		Priority:           types.ASAPMirrorPriority,
+		BeforeLastCommitID: "before",
+		AfterLastCommitID:  "after",
+	})
+	require.Nil(t, err)
+
+	updatedTask, err := taskStore.CompleteRepoSyncAndInsertLFSJob(ctx, database.CompleteRepoSyncInput{
+		Task:          task,
+		DefaultBranch: "master",
+		SkipLFSJob:    true,
+	})
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorLfsSyncFinished, updatedTask.Status)
+	// No LFS job is enqueued on the no-LFS fast path.
+	require.Equal(t, int64(0), updatedTask.LFSJobID)
+
+	storedTask, err := taskStore.FindByID(ctx, task.ID)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorLfsSyncFinished, storedTask.Status)
+	require.Equal(t, int64(0), storedTask.LFSJobID)
+
+	var updatedMirror database.Mirror
+	err = db.Core.NewSelect().Model(&updatedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorLfsSyncFinished, updatedMirror.Status)
+	require.Equal(t, task.ID, updatedMirror.CurrentTaskID)
+	require.False(t, updatedMirror.LastUpdatedAt.IsZero())
+
+	var updatedRepo database.Repository
+	err = db.Core.NewSelect().Model(&updatedRepo).Where("id = ?", repo.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.SyncStatusCompleted, updatedRepo.SyncStatus)
+	require.Equal(t, "master", updatedRepo.DefaultBranch)
+}
+
+func TestMirrorTaskStore_CompleteRepoSyncAndInsertLFSJobRollsBackRepoResultOnJobInsertError(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	mirrorStore := database.NewMirrorStoreWithDB(db)
+	repoStore := database.NewRepoStoreWithDB(db)
+	jobClient := &fakeMirrorLFSJobClient{err: errors.New("insert lfs job failed")}
+
+	repo, err := repoStore.CreateRepo(ctx, database.Repository{
+		UserID:        1,
+		Path:          "test/repo8",
+		GitPath:       "test/repo8.git",
+		Name:          "repo8",
+		Nickname:      "Test Repo 8",
+		DefaultBranch: "main",
+		Private:       false,
+		SyncStatus:    types.SyncStatusInProgress,
+	})
+	require.Nil(t, err)
+
+	mirror, err := mirrorStore.Create(ctx, &database.Mirror{
+		SourceUrl:      "https://example.com/test/repo8.git",
+		RepositoryID:   repo.ID,
+		MirrorSourceID: 1,
+		Status:         types.MirrorRepoSyncStart,
+	})
+	require.Nil(t, err)
+
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID: mirror.ID,
+		Status:   types.MirrorRepoSyncStart,
+		Priority: types.ASAPMirrorPriority,
+	})
+	require.Nil(t, err)
+
+	_, err = taskStore.CompleteRepoSyncAndInsertLFSJob(ctx, database.CompleteRepoSyncInput{
+		Task:          task,
+		DefaultBranch: "master",
+		JobClient:     jobClient,
+		JobInput: database.MirrorLFSJobInput{
+			MirrorID:     mirror.ID,
+			RepositoryID: repo.ID,
+			MirrorTaskID: task.ID,
+			SourceURL:    mirror.SourceUrl,
+			Priority:     task.Priority,
+		},
+	})
+	require.Error(t, err)
+	require.Len(t, jobClient.inputs, 1)
+
+	var storedTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&storedTask).Where("id = ?", task.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorRepoSyncStart, storedTask.Status)
+
+	var storedMirror database.Mirror
+	err = db.Core.NewSelect().Model(&storedMirror).Where("id = ?", mirror.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, types.MirrorRepoSyncStart, storedMirror.Status)
+	require.True(t, storedMirror.LastUpdatedAt.IsZero())
+
+	var storedRepo database.Repository
+	err = db.Core.NewSelect().Model(&storedRepo).Where("id = ?", repo.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, "main", storedRepo.DefaultBranch)
+}
+
+func TestMirrorTaskStore_UpdateCommitCheckpoint(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	taskStore := database.NewMirrorTaskJobStoreWithDB(db)
+	task, err := taskStore.Create(ctx, database.MirrorTask{
+		MirrorID: 1,
+		Status:   types.MirrorRepoSyncStart,
+		Priority: types.ASAPMirrorPriority,
+	})
+	require.Nil(t, err)
+
+	updatedTask, err := taskStore.UpdateCommitCheckpoint(ctx, task.ID, "before", "")
+	require.Nil(t, err)
+	require.Equal(t, "before", updatedTask.BeforeLastCommitID)
+	require.Empty(t, updatedTask.AfterLastCommitID)
+
+	updatedTask, err = taskStore.UpdateCommitCheckpoint(ctx, task.ID, "", "after")
+	require.Nil(t, err)
+	require.Equal(t, "before", updatedTask.BeforeLastCommitID)
+	require.Equal(t, "after", updatedTask.AfterLastCommitID)
+}
+
+func TestMirrorTaskStore_UpdateProgress(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewMirrorTaskStoreWithDB(db)
+
+	task, err := store.Create(ctx, database.MirrorTask{
+		MirrorID:     1,
+		Status:       types.MirrorLfsSyncStart,
+		Priority:     types.HighMirrorPriority,
+		Progress:     50,
+		ErrorMessage: "previous error",
+	})
+	require.Nil(t, err)
+	require.Greater(t, task.ID, int64(0))
+
+	// Update progress and error message
+	task.Progress = 80
+	task.ErrorMessage = "new error"
+	updatedTask, err := store.UpdateProgress(ctx, task)
+	require.Nil(t, err)
+	require.Equal(t, 80, updatedTask.Progress)
+	require.Equal(t, "new error", updatedTask.ErrorMessage)
+	require.Equal(t, types.MirrorLfsSyncStart, updatedTask.Status)
+
+	// Verify in DB: progress and error_message updated, status preserved
+	var dbTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&dbTask).Where("id = ?", task.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, 80, dbTask.Progress)
+	require.Equal(t, "new error", dbTask.ErrorMessage)
+	require.Equal(t, types.MirrorLfsSyncStart, dbTask.Status,
+		"UpdateProgress must not change the status field")
+}
+
+func TestMirrorTaskStore_UpdateProgress_DoesNotOverwritePriority(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewMirrorTaskStoreWithDB(db)
+
+	task, err := store.Create(ctx, database.MirrorTask{
+		MirrorID: 1,
+		Status:   types.MirrorLfsSyncStart,
+		Priority: types.ASAPMirrorPriority,
+		Progress: 0,
+	})
+	require.Nil(t, err)
+
+	// Simulate: another process changes priority concurrently
+	_, err = db.Core.NewUpdate().
+		Model(&database.MirrorTask{}).
+		Set("priority = ?", types.LowMirrorPriority).
+		Where("id = ?", task.ID).
+		Exec(ctx)
+	require.Nil(t, err)
+
+	// UpdateProgress should NOT overwrite priority
+	task.Progress = 100
+	task.Priority = types.ASAPMirrorPriority // original value in struct
+	_, err = store.UpdateProgress(ctx, task)
+	require.Nil(t, err)
+
+	var dbTask database.MirrorTask
+	err = db.Core.NewSelect().Model(&dbTask).Where("id = ?", task.ID).Scan(ctx)
+	require.Nil(t, err)
+	require.Equal(t, 100, dbTask.Progress)
+	require.Equal(t, types.LowMirrorPriority, dbTask.Priority,
+		"UpdateProgress must not overwrite priority set by another process")
+}
+
+// TestMirrorTaskStore_RequeueMirrorRepoTaskRefreshesMCPMetadata verifies metadata and task state commit together.
+func TestMirrorTaskStore_RequeueMirrorRepoTaskRefreshesMCPMetadata(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	repo, err := database.NewRepoStoreWithDB(db).CreateRepo(ctx, database.Repository{
+		UserID: 1, Path: "test/mcp-refresh", GitPath: "mcpservers_test/mcp-refresh", Name: "mcp-refresh",
+		Nickname: "Old MCP", Description: "old description", License: "old-license", Readme: "old readme",
+		DefaultBranch: "main", StarCount: 1, RepositoryType: types.MCPServerRepo, SyncStatus: types.SyncStatusCompleted,
+	})
+	require.NoError(t, err)
+	mcpStore := database.NewMCPServerStoreWithDB(db)
+	server, err := mcpStore.Create(ctx, database.MCPServer{
+		RepositoryID: repo.ID, ToolsNum: 1, Configuration: `{"command":"old"}`, Schema: `{"tools":[]}`, ProgramLanguage: "python",
+	})
+	require.NoError(t, err)
+	propertiesToSeed := []database.MCPServerProperty{
+		{MCPServerID: server.ID, Kind: types.MCPPropTool, Name: "old-tool", Description: "old tool", Schema: `{}`},
+		{MCPServerID: server.ID, Kind: types.MCPPropPrompt, Name: "saved-prompt", Description: "saved prompt", Schema: `{}`},
+		{MCPServerID: server.ID, Kind: types.MCPPropResource, Name: "saved-resource", Description: "saved resource", Schema: `{}`},
+		{MCPServerID: server.ID, Kind: types.MCPPropresourceTemplate, Name: "saved-template", Description: "saved template", Schema: `{}`},
+	}
+	for _, property := range propertiesToSeed {
+		_, err = mcpStore.AddProperty(ctx, property)
+		require.NoError(t, err)
+	}
+	mirror, err := database.NewMirrorStoreWithDB(db).Create(ctx, &database.Mirror{
+		SourceUrl: "https://opencsg.com/test/mcp-refresh.git", RepositoryID: repo.ID,
+		MirrorSourceID: 1, Status: types.MirrorLfsSyncFinished, Priority: types.LowMirrorPriority,
+	})
+	require.NoError(t, err)
+
+	refreshedRepo := *repo
+	refreshedRepo.Nickname = "Fresh MCP"
+	refreshedRepo.Description = "fresh description"
+	refreshedRepo.License = "MIT"
+	refreshedRepo.Readme = "# Fresh MCP"
+	refreshedRepo.DefaultBranch = "develop"
+	refreshedRepo.StarCount = 9
+	jobClient := &fakeMirrorRepoJobClient{}
+	task, err := database.NewMirrorTaskJobStoreWithDB(db).RequeueMirrorRepoTask(ctx, database.RequeueMirrorRepoTaskInput{
+		MirrorID: mirror.ID, RepositoryID: repo.ID, Priority: types.LowMirrorPriority, JobClient: jobClient,
+		Metadata: &database.MirrorRepoMetadataUpdate{
+			Repository: refreshedRepo,
+			MCPServer: &database.MCPServer{
+				ToolsNum: 1, Configuration: `{"command":"fresh"}`, Schema: `{"tools":[{"name":"search"}]}`,
+				ProgramLanguage: "go", RunMode: "stdio", LaunchCmds: "go run .",
+			},
+			MCPServerProperties: []database.MCPServerProperty{{
+				Kind: types.MCPPropTool, Name: "search", Description: "fresh search", Schema: `{"type":"object"}`,
+			}},
+		},
+	})
+	require.NoError(t, err)
+	require.NotZero(t, task.ID)
+
+	storedRepo, err := database.NewRepoStoreWithDB(db).FindById(ctx, repo.ID)
+	require.NoError(t, err)
+	require.Equal(t, "Fresh MCP", storedRepo.Nickname)
+	require.Equal(t, "fresh description", storedRepo.Description)
+	require.Equal(t, "MIT", storedRepo.License)
+	require.Equal(t, "old readme", storedRepo.Readme)
+	require.Equal(t, "develop", storedRepo.DefaultBranch)
+	require.Equal(t, 9, storedRepo.StarCount)
+	storedServer, err := mcpStore.ByRepoID(ctx, repo.ID)
+	require.NoError(t, err)
+	require.Equal(t, `{"command":"fresh"}`, storedServer.Configuration)
+	require.Equal(t, "go", storedServer.ProgramLanguage)
+	require.Equal(t, "stdio", storedServer.RunMode)
+	var properties []database.MCPServerProperty
+	err = db.Core.NewSelect().
+		Model(&properties).
+		Where("mcp_server_id = ?", storedServer.ID).
+		Order("kind ASC").
+		Scan(ctx)
+	require.NoError(t, err)
+	require.Len(t, properties, 4)
+	propertiesByKind := make(map[types.MCPPropertyKind]database.MCPServerProperty, len(properties))
+	for _, property := range properties {
+		propertiesByKind[property.Kind] = property
+	}
+	require.Equal(t, "search", propertiesByKind[types.MCPPropTool].Name)
+	require.Equal(t, "saved-prompt", propertiesByKind[types.MCPPropPrompt].Name)
+	require.Equal(t, "saved-resource", propertiesByKind[types.MCPPropResource].Name)
+	require.Equal(t, "saved-template", propertiesByKind[types.MCPPropresourceTemplate].Name)
+}
+
+// TestMirrorTaskStore_RequeueMirrorRepoTaskRollsBackSkillMetadata verifies failed task enqueue does not expose refreshed skill metadata.
+func TestMirrorTaskStore_RequeueMirrorRepoTaskRollsBackSkillMetadata(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	oldUpdatedAt := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	repo, err := database.NewRepoStoreWithDB(db).CreateRepo(ctx, database.Repository{
+		UserID: 1, Path: "test/skill-refresh", GitPath: "skills_test/skill-refresh", Name: "skill-refresh",
+		Nickname: "Old Skill", Description: "old description", License: "old-license", Readme: "old readme",
+		DefaultBranch: "main", RepositoryType: types.SkillRepo, SyncStatus: types.SyncStatusCompleted,
+	})
+	require.NoError(t, err)
+	_, err = database.NewSkillStoreWithDB(db).Create(ctx, database.Skill{RepositoryID: repo.ID, LastUpdatedAt: oldUpdatedAt})
+	require.NoError(t, err)
+	mirror, err := database.NewMirrorStoreWithDB(db).Create(ctx, &database.Mirror{
+		SourceUrl: "https://opencsg.com/test/skill-refresh.git", RepositoryID: repo.ID,
+		MirrorSourceID: 1, Status: types.MirrorLfsSyncFinished, Priority: types.LowMirrorPriority,
+	})
+	require.NoError(t, err)
+
+	refreshedRepo := *repo
+	refreshedRepo.Nickname = "Fresh Skill"
+	refreshedRepo.Description = "fresh description"
+	refreshedRepo.License = "Apache-2.0"
+	refreshedRepo.Readme = "# Fresh Skill"
+	refreshedRepo.DefaultBranch = "develop"
+	freshUpdatedAt := time.Date(2026, time.August, 18, 8, 0, 0, 0, time.UTC)
+	_, err = database.NewMirrorTaskJobStoreWithDB(db).RequeueMirrorRepoTask(ctx, database.RequeueMirrorRepoTaskInput{
+		MirrorID: mirror.ID, RepositoryID: repo.ID, Priority: types.LowMirrorPriority,
+		JobClient: &fakeMirrorRepoJobClient{err: errors.New("insert job failed")},
+		Metadata: &database.MirrorRepoMetadataUpdate{
+			Repository: refreshedRepo, SkillLastUpdatedAt: &freshUpdatedAt,
+		},
+	})
+	require.ErrorContains(t, err, "insert job failed")
+
+	storedRepo, err := database.NewRepoStoreWithDB(db).FindById(ctx, repo.ID)
+	require.NoError(t, err)
+	require.Equal(t, "Old Skill", storedRepo.Nickname)
+	require.Equal(t, "old description", storedRepo.Description)
+	require.Equal(t, "old-license", storedRepo.License)
+	require.Equal(t, "old readme", storedRepo.Readme)
+	require.Equal(t, "main", storedRepo.DefaultBranch)
+	storedSkill, err := database.NewSkillStoreWithDB(db).ByRepoID(ctx, repo.ID)
+	require.NoError(t, err)
+	require.True(t, storedSkill.LastUpdatedAt.Equal(oldUpdatedAt))
+}

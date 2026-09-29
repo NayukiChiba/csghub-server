@@ -1,0 +1,325 @@
+package rpc
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/url"
+
+	"opencsg.com/csghub-server/api/httpbase"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/errorx"
+	"opencsg.com/csghub-server/common/types"
+)
+
+type UserSvcClient interface {
+	GetNameSpaceInfo(ctx context.Context, path string) (*Namespace, error)
+	GetNameSpaceInfoByUUID(ctx context.Context, uuid string) (*Namespace, error)
+	GetUserInfo(ctx context.Context, userName, visitorName string) (*User, error)
+	GetOrCreateFirstAvaiTokens(ctx context.Context, userName, visitorName, app, tokenName string) (string, error)
+	// GetOrCreateBuiltinAPIKey returns the builtin (aigateway) API key token for a user namespace.
+	GetOrCreateBuiltinAPIKey(ctx context.Context, userName, nsUUID string) (string, error)
+	VerifyByAccessToken(ctx context.Context, token string) (*types.CheckAccessTokenResp, error)
+	// OAuthExchangeToken exchanges an OAuth access token for a locally issued JWT.
+	OAuthExchangeToken(ctx context.Context, req *types.OAuthExchangeTokenReq) (*types.OAuthExchangeTokenResp, error)
+	GetUserByName(ctx context.Context, userName string) (*types.User, error)
+	GetUserByUUID(ctx context.Context, userUUID string) (*types.User, error)
+	GetOrgByName(ctx context.Context, orgName string) (*types.Organization, error)
+	FindByUUIDs(ctx context.Context, uuids []string) (map[string]*types.User, error)
+	GetUserUUIDs(ctx context.Context, per, page int) ([]string, int, error)
+	GetAdminUserUUIDs(ctx context.Context) ([]string, int, error)
+	GetAdminEmails(ctx context.Context) ([]string, int, error)
+	GetEmails(ctx context.Context, per, page int) ([]string, int, error)
+	GetTokenQuotas(ctx context.Context, keyName string) ([]database.AccountAccessTokenQuota, error)
+}
+
+//go:generate mockgen -destination=mocks/client.go -package=mocks . Client
+
+type UserSvcHttpClient struct {
+	hc *HttpClient
+}
+
+func NewUserSvcHttpClient(endpoint string, opts ...RequestOption) UserSvcClient {
+	return &UserSvcHttpClient{
+		hc: NewHttpClient(endpoint, opts...),
+	}
+}
+
+func (c *UserSvcHttpClient) GetNameSpaceInfo(ctx context.Context, path string) (*Namespace, error) {
+	// write code to call user service api "/api/v1/namespace/{path}"
+	url := fmt.Sprintf("/api/v1/namespace/%s", path)
+	var r httpbase.R
+	r.Data = &Namespace{}
+	err := c.hc.Get(ctx, url, &r)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get namespace info").
+				Set("path", path))
+	}
+
+	return r.Data.(*Namespace), nil
+}
+
+func (c *UserSvcHttpClient) GetNameSpaceInfoByUUID(ctx context.Context, uuid string) (*Namespace, error) {
+	url := fmt.Sprintf("/api/v1/namespace/uuid/%s", uuid)
+	var r httpbase.R
+	r.Data = &Namespace{}
+	err := c.hc.Get(ctx, url, &r)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get namespace info by uuid").
+				Set("uuid", uuid))
+	}
+
+	return r.Data.(*Namespace), nil
+}
+
+func (c *UserSvcHttpClient) GetUserInfo(ctx context.Context, userName, visitorName string) (*User, error) {
+	url := fmt.Sprintf("/api/v1/user/%s?current_user=%s", userName, visitorName)
+	var r httpbase.R
+	r.Data = &User{}
+	err := c.hc.Get(ctx, url, &r)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get user info").
+				Set("userName", userName).
+				Set("visitorName", visitorName))
+	}
+
+	return r.Data.(*User), nil
+}
+
+func (c *UserSvcHttpClient) GetOrCreateFirstAvaiTokens(ctx context.Context, userName, visitorName, app, tokenName string) (string, error) {
+	url := fmt.Sprintf("/api/v1/user/%s/tokens/first?current_user=%s&app=%s&token_name=%s", userName, visitorName, app, tokenName)
+	var r httpbase.R
+	r.Data = interface{}("")
+	err := c.hc.Get(ctx, url, &r)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return "", errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get or create tokens").
+				Set("userName", userName).
+				Set("app", app))
+	}
+	return r.Data.(string), nil
+}
+
+func (c *UserSvcHttpClient) GetOrCreateBuiltinAPIKey(ctx context.Context, userName, nsUUID string) (string, error) {
+	url := fmt.Sprintf("/api/v1/namespaces/%s/apikeys/builtin?current_user=%s", nsUUID, url.QueryEscape(userName))
+	var r httpbase.R
+	r.Data = &types.CheckAccessTokenResp{}
+	err := c.hc.Get(ctx, url, &r)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return "", errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get or create builtin api key").
+				Set("userName", userName))
+	}
+	return r.Data.(*types.CheckAccessTokenResp).Token, nil
+}
+
+func (c *UserSvcHttpClient) VerifyByAccessToken(ctx context.Context, token string) (*types.CheckAccessTokenResp, error) {
+	url := fmt.Sprintf("/api/v1/token/%s", token)
+	var r httpbase.R
+	r.Data = &types.CheckAccessTokenResp{}
+	err := c.hc.Get(ctx, url, &r)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "verify access token"))
+	}
+
+	return r.Data.(*types.CheckAccessTokenResp), nil
+}
+
+func (c *UserSvcHttpClient) GetUserByName(ctx context.Context, userName string) (*types.User, error) {
+	url := fmt.Sprintf("/api/v1/user/%s", userName)
+	var r httpbase.R
+	r.Data = &types.User{}
+	err := c.hc.Get(ctx, url, &r)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get user by name").
+				Set("userName", userName))
+	}
+
+	return r.Data.(*types.User), nil
+}
+
+func (c *UserSvcHttpClient) GetUserByUUID(ctx context.Context, userUUID string) (*types.User, error) {
+	url := fmt.Sprintf("/api/v1/user/%s?type=uuid", userUUID)
+	var r httpbase.R
+	r.Data = &types.User{}
+	err := c.hc.Get(ctx, url, &r)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get user by uuid").
+				Set("userUUID", userUUID))
+	}
+	return r.Data.(*types.User), nil
+}
+
+func (c *UserSvcHttpClient) GetOrgByName(ctx context.Context, orgName string) (*types.Organization, error) {
+	url := fmt.Sprintf("/api/v1/organization/%s", orgName)
+	var r httpbase.R
+	r.Data = &types.Organization{}
+	err := c.hc.Get(ctx, url, &r)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get org by name").
+				Set("orgName", orgName))
+	}
+
+	return r.Data.(*types.Organization), nil
+}
+
+func (c *UserSvcHttpClient) FindByUUIDs(ctx context.Context, uuids []string) (map[string]*types.User, error) {
+	params := url.Values{}
+	for _, uuid := range uuids {
+		params.Add("uuids", uuid)
+	}
+	getURL := fmt.Sprintf("/api/v1/users/by-uuids?%s", params.Encode())
+	var resp struct {
+		Msg  string        `json:"msg"`
+		Data []*types.User `json:"data"`
+	}
+	err := c.hc.Get(ctx, getURL, &resp)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "find users by uuids").
+				Set("uuidCount", len(uuids)))
+	}
+	result := make(map[string]*types.User)
+	if resp.Data != nil {
+		for _, user := range resp.Data {
+			if user != nil && user.UUID != "" {
+				result[user.UUID] = user
+			}
+		}
+	}
+	return result, nil
+}
+
+func (c *UserSvcHttpClient) GetUserUUIDs(ctx context.Context, per, page int) ([]string, int, error) {
+	getURL := fmt.Sprintf("/api/v1/user/user_uuids?per=%d&page=%d", per, page)
+	var resp struct {
+		Data struct {
+			UserUUIDs []string `json:"data"`
+			Total     int      `json:"total"`
+		} `json:"data"`
+	}
+	err := c.hc.Get(ctx, getURL, &resp)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, 0, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get user uuids").
+				Set("per", per).
+				Set("page", page))
+	}
+	return resp.Data.UserUUIDs, resp.Data.Total, nil
+}
+
+func (c *UserSvcHttpClient) GetAdminUserUUIDs(ctx context.Context) ([]string, int, error) {
+	getURL := "/api/v1/user/admin_uuids"
+	var resp struct {
+		Data struct {
+			UserUUIDs []string `json:"data"`
+			Total     int      `json:"total"`
+		} `json:"data"`
+	}
+	err := c.hc.Get(ctx, getURL, &resp)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, 0, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get admin user uuids"))
+	}
+	return resp.Data.UserUUIDs, resp.Data.Total, nil
+}
+
+func (c *UserSvcHttpClient) GetAdminEmails(ctx context.Context) ([]string, int, error) {
+	getURL := "/api/v1/user/admin_emails"
+	var resp struct {
+		Data struct {
+			Emails []string `json:"data"`
+			Total  int      `json:"total"`
+		} `json:"data"`
+	}
+	err := c.hc.Get(ctx, getURL, &resp)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, 0, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get admin emails"))
+	}
+	return resp.Data.Emails, resp.Data.Total, nil
+}
+
+func (c *UserSvcHttpClient) GetEmails(ctx context.Context, per, page int) ([]string, int, error) {
+	getURL := fmt.Sprintf("/api/v1/internal/user/emails?per=%d&page=%d", per, page)
+	var resp struct {
+		Msg   string   `json:"msg"`
+		Data  []string `json:"data"`
+		Total int      `json:"total"`
+	}
+	err := c.hc.Get(ctx, getURL, &resp)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, 0, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get user emails").
+				Set("per", per).
+				Set("page", page))
+	}
+	return resp.Data, resp.Total, nil
+}
+
+func (c *UserSvcHttpClient) GetTokenQuotas(ctx context.Context, keyName string) ([]database.AccountAccessTokenQuota, error) {
+	getURL := fmt.Sprintf("/api/v1/token/%s/quotas", keyName)
+	var resp struct {
+		Msg  string                             `json:"msg"`
+		Data []database.AccountAccessTokenQuota `json:"data"`
+	}
+	err := c.hc.Get(ctx, getURL, &resp)
+	if err != nil {
+		slog.ErrorContext(ctx, "call user service failed", slog.String("error", err.Error()))
+		return nil, errorx.RemoteSvcFail(err,
+			errorx.Ctx().
+				Set("service", "user service").
+				Set("action", "get API key quotas").
+				Set("keyName", keyName))
+	}
+	return resp.Data, nil
+}

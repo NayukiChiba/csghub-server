@@ -1,0 +1,96 @@
+package database_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"opencsg.com/csghub-server/builder/store/database"
+	"opencsg.com/csghub-server/common/tests"
+)
+
+func TestNamespaceStore_All(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewNamespaceStoreWithDB(db)
+
+	_, err := db.Core.NewInsert().Model(&database.Namespace{
+		Path: "foo/bar",
+		UUID: "test-uuid-123",
+	}).Exec(ctx)
+	require.Nil(t, err)
+
+	exist, err := store.Exists(ctx, "foo/bar")
+	require.Nil(t, err)
+	require.True(t, exist)
+	exist, err = store.Exists(ctx, "foo/bar2")
+	require.Nil(t, err)
+	require.False(t, exist)
+
+	ns, err := store.FindByPath(ctx, "FOO/BAR")
+	require.Nil(t, err)
+	require.Equal(t, "foo/bar", ns.Path)
+	_, err = store.FindByPath(ctx, "foo/bar2")
+	require.NotNil(t, err)
+
+	exist, err = store.ExistsByUUID(ctx, "test-uuid-123")
+	require.Nil(t, err)
+	require.True(t, exist)
+	exist, err = store.ExistsByUUID(ctx, "non-existent-uuid")
+	require.Nil(t, err)
+	require.False(t, exist)
+
+	nsByUUID, err := store.FindByUUID(ctx, "test-uuid-123")
+	require.Nil(t, err)
+	require.Equal(t, "foo/bar", nsByUUID.Path)
+	require.Equal(t, "test-uuid-123", nsByUUID.UUID)
+	_, err = store.FindByUUID(ctx, "non-existent-uuid")
+	require.NotNil(t, err)
+}
+
+func TestNamespaceStoreFindByPathCaseConflicts(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+
+	store := database.NewNamespaceStoreWithDB(db)
+	namespaces := []database.Namespace{
+		{Path: "AIWizards", UUID: "namespace-upper"},
+		{Path: "aiwizards", UUID: "namespace-lower"},
+	}
+	_, err := db.Core.NewInsert().Model(&namespaces).Exec(ctx)
+	require.NoError(t, err)
+
+	ns, err := store.FindByPath(ctx, "aiwizards")
+	require.NoError(t, err)
+	require.Equal(t, "aiwizards", ns.Path)
+
+	ns, err = store.FindByPath(ctx, "AiWizards")
+	require.NoError(t, err)
+	require.Equal(t, "AIWizards", ns.Path)
+}
+
+// TestNamespaceStore_FindByPathWithDeleted verifies soft-deleted namespaces remain available for tuple cleanup.
+func TestNamespaceStore_FindByPathWithDeleted(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+	ctx := context.TODO()
+	store := database.NewNamespaceStoreWithDB(db)
+	namespace := database.Namespace{
+		Path: "deleted-user", UUID: "deleted-user-namespace-uuid", NamespaceType: database.UserNamespace,
+	}
+
+	_, err := db.Core.NewInsert().Model(&namespace).Exec(ctx)
+	require.NoError(t, err)
+	_, err = db.Core.NewDelete().Model(&namespace).WherePK().Exec(ctx)
+	require.NoError(t, err)
+
+	_, err = store.FindByPath(ctx, namespace.Path)
+	require.Error(t, err)
+	got, err := store.FindByPathWithDeleted(ctx, namespace.Path)
+	require.NoError(t, err)
+	require.Equal(t, namespace.UUID, got.UUID)
+	require.Equal(t, namespace.Path, got.Path)
+}

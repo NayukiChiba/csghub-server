@@ -1,0 +1,20 @@
+{
+    "error.ORG-ERR-0": {
+        "other": "組織成員不存在"
+    },
+    "error.ORG-ERR-1": {
+        "other": "組織不存在"
+    },
+    "error.ORG-ERR-2": {
+        "other": "無權管理該組織"
+    },
+    "error.ORG-ERR-3": {
+        "other": "無權訪問該組織"
+    },
+    "error.ORG-ERR-4": {
+        "other": "當前架構不支持查看該組織，請遷移組織"
+    },
+    "error.ORG-ERR-5": {
+        "other": "當前系統已存在組織，不能再建立新的組織"
+    }
+}

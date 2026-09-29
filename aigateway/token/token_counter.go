@@ -1,0 +1,56 @@
+package token
+
+import "context"
+
+type CreateParam struct {
+	Endpoint string
+	Host     string
+	Model    string
+	ImageID  string
+	Provider string
+}
+
+type CounterFactory interface {
+	NewChat(param CreateParam) ChatTokenCounter
+	NewEmbedding(param CreateParam) EmbeddingTokenCounter
+}
+
+func NewCounterFactory() CounterFactory {
+	return &counterFactoryImpl{}
+}
+
+type counterFactoryImpl struct{}
+
+func (f *counterFactoryImpl) NewChat(param CreateParam) ChatTokenCounter {
+	tokenizer := NewTokenizerImpl(param.Endpoint, param.Host, param.Model, param.ImageID, param.Provider)
+	return NewLLMTokenCounter(tokenizer)
+}
+
+func (f *counterFactoryImpl) NewEmbedding(param CreateParam) EmbeddingTokenCounter {
+	tokenizer := NewTokenizerImpl(param.Endpoint, param.Host, param.Model, param.ImageID, param.Provider)
+	return NewEmbeddingTokenCounter(tokenizer)
+}
+
+type Counter interface {
+	Usage(context.Context) (*Usage, error)
+}
+
+type Usage struct {
+	TotalTokens               int64
+	PromptTokens              int64
+	CompletionTokens          int64
+	CachedPromptTokens        int64
+	CacheCreationPromptTokens int64
+	ReasoningTokens           int64
+	// multi-modal usage metadata
+	DataType   string
+	Resolution string
+	Duration   float64
+	// Completion resource count for multi-modal
+	CompletionRC   int64
+	CompletionDesc string
+	// Usage source metadata. Empty means usage came from the upstream response
+	// or the normal tokenizer path.
+	Source       string
+	SourceReason string
+}

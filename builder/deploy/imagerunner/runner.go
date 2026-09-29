@@ -1,0 +1,39 @@
+package imagerunner
+
+import (
+	"context"
+
+	"opencsg.com/csghub-server/api/httpbase"
+	"opencsg.com/csghub-server/common/types"
+	runnerTypes "opencsg.com/csghub-server/runner/types"
+)
+
+type Runner interface {
+	SandboxV2Runner
+	Run(context.Context, *types.RunRequest) (*types.RunResponse, error)
+	Stop(context.Context, *types.StopRequest) (*types.StopResponse, error)
+	Purge(context.Context, *types.PurgeRequest) (*types.PurgeResponse, error)
+	Status(context.Context, *types.StatusRequest) (*types.StatusResponse, error)
+	Logs(context.Context, *types.LogsRequest) (<-chan string, error)
+	Exist(context.Context, *types.CheckRequest) (*types.StatusResponse, error)
+	GetReplica(context.Context, *types.StatusRequest) (*types.ReplicaResponse, error)
+	InstanceLogs(context.Context, *types.InstanceLogsRequest) (<-chan string, error)
+	ListCluster(ctx context.Context) ([]types.ClusterRes, error)
+	GetClusterById(ctx context.Context, clusterId string) (*types.ClusterRes, error)
+	UpdateCluster(ctx context.Context, data *types.ClusterRequest) (*types.UpdateClusterResponse, error)
+	SubmitWorkFlow(context.Context, *types.ArgoWorkFlowReq) (*types.ArgoWorkFlowRes, error)
+	DeleteWorkFlow(context.Context, types.ArgoWorkFlowDeleteReq) (*httpbase.R, error)
+	GetWorkFlow(context.Context, types.ArgoWorkFlowDeleteReq) (*types.ArgoWorkFlowRes, error)
+	SubmitFinetuneJob(context.Context, *types.ArgoWorkFlowReq) (*types.ArgoWorkFlowRes, error)
+	SetVersionsTraffic(ctx context.Context, clusterID, svcName string, req []types.TrafficReq) error
+	CreateRevisions(context.Context, *types.CreateRevisionReq) error
+	ListKsvcVersions(ctx context.Context, clusterID, svcName string) ([]types.KsvcRevisionInfo, error)
+	DeleteKsvcVersion(ctx context.Context, clusterID, svcName, commitID string) error
+	LabelNode(ctx context.Context, req *types.NodeLabel) error
+	CreateSandbox(ctx context.Context, req *runnerTypes.SandboxRequest) (*runnerTypes.Sandbox, error)
+	DeleteSandbox(ctx context.Context, req *runnerTypes.SandboxDeleteRequest) error
+	GetSandbox(ctx context.Context, clusterID, sandboxName string) (*runnerTypes.SandboxDetail, error)
+	CreateDataflowWorkflow(ctx context.Context, req *types.DataflowArgoJobReq) (*types.DataflowArgoJobResp, error)
+	DeleteDataflowWorkflow(ctx context.Context, req *types.DataflowArgoReq) error
+	BatchStatus(ctx context.Context, req *runnerTypes.BatchStatusRequest) (*runnerTypes.BatchStatusResponse, error)
+}

@@ -1,0 +1,915 @@
+package types
+
+import (
+	"encoding/json"
+	"regexp"
+	"time"
+)
+
+const (
+	CSGBotHeaderUserUUID  = "X-CSG-User-UUID"
+	CSGBotHeaderUserName  = "X-CSG-User-Name"
+	CSGBotHeaderUserToken = "X-CSG-User-Token"
+	CSGBotHeaderRequestID = "X-CSG-Request-Id"
+	CSGBotHeaderAgentName = "X-CSG-Agent-Name"
+	CSGBotHeaderSessionID = "X-CSG-Session-Id"
+)
+
+// LLM-Wiki trust headers injected by CSGHub when proxying to llmservice.
+const HeaderCSGHubActorID = "X-CSGHub-Actor-ID"
+const HeaderCSGHubActorName = "X-CSGHub-Actor-Name"
+const HeaderCSGHubDecisionID = "X-CSGHub-Decision-ID"
+const HeaderCSGHubPolicyVersion = "X-CSGHub-Policy-Version"
+
+// AgentKnowledgeBaseIDPattern matches agent knowledge base content IDs used in
+// LLM-Wiki management proxy and MCP proxy paths.
+var AgentKnowledgeBaseIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+// AgentichubSkillsTagName is the tag name for platform/built-in agent skills.
+const AgentichubSkillsTagName = "agentichub-skills"
+
+// AgentConfig represents the agent system configuration
+type AgentConfig struct {
+	ID        int64          `json:"id"`
+	Name      string         `json:"name"`
+	Config    map[string]any `json:"config"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+}
+
+// CreateAgentConfigReq represents a request to create agent configuration
+type CreateAgentConfigReq struct {
+	Name   string         `json:"name" binding:"required"`
+	Config map[string]any `json:"config" binding:"required"`
+}
+
+// UpdateAgentConfigReq represents a request to update agent configuration
+type UpdateAgentConfigReq struct {
+	Name   *string         `json:"name,omitempty"`
+	Config *map[string]any `json:"config,omitempty"`
+}
+
+// AgentTemplate represents the template for an agent
+type AgentTemplate struct {
+	ID          int64           `json:"id"`
+	Type        *string         `json:"type" binding:"required"`                 // Possible values: langflow, agno, code, etc.
+	UserUUID    *string         `json:"-"`                                       // Will be set from HTTP header using httpbase.GetCurrentUserUUID
+	Name        *string         `json:"name" binding:"required,max=255"`         // Agent template name
+	Description *string         `json:"description" binding:"omitempty,max=500"` // Agent template description
+	Content     *string         `json:"content,omitempty"`                       // Used to store the complete content of the template
+	Public      *bool           `json:"public,omitempty"`                        // Whether the template is public
+	Editable    bool            `json:"editable"`                                // Whether the template is editable (only the owner can delete)
+	Metadata    *map[string]any `json:"metadata,omitempty"`                      // Template metadata
+	IsPinned    bool            `json:"is_pinned"`                               // Whether the template is pinned by the user
+	CreatedAt   time.Time       `json:"created_at"`                              // When the template was created
+	UpdatedAt   time.Time       `json:"updated_at"`                              // When the template was last updated
+}
+
+type AgentTemplateFilter struct {
+	Search   string
+	Type     string
+	Editable *bool
+}
+
+// UpdateAgentTemplateRequest is a partial update for an agent template.
+// Name and type are optional so a visibility-only update does not modify them.
+type UpdateAgentTemplateRequest struct {
+	Type        *string         `json:"type,omitempty"`
+	Name        *string         `json:"name,omitempty" binding:"omitempty,max=255"`
+	Description *string         `json:"description,omitempty" binding:"omitempty,max=500"`
+	Content     *string         `json:"content,omitempty"`
+	Public      *bool           `json:"public,omitempty"`
+	Metadata    *map[string]any `json:"metadata,omitempty"`
+}
+
+// AgentInstance represents an instance created from an agent template
+type AgentInstance struct {
+	ID          int64           `json:"id"`
+	TemplateID  *int64          `json:"template_id" binding:"omitempty,gte=1"` // Associated with the id in the template table
+	UserUUID    *string         `json:"-"`                                     // Will be set from HTTP header using httpbase.GetCurrentUserUUID
+	Name        *string         `json:"name"`                                  // Instance name
+	Description *string         `json:"description" binding:"omitempty"`       // Instance description
+	Type        *string         `json:"type"`                                  // Possible values: langflow, agno, code, etc.
+	ContentID   *string         `json:"content_id" binding:"omitempty"`        // Used to specify the unique id of the instance resource
+	Public      *bool           `json:"public"`                                // Whether the instance is public
+	Editable    bool            `json:"editable"`                              // Whether the instance is editable
+	IsRunning   bool            `json:"is_running"`                            // Whether the instance is running
+	BuiltIn     bool            `json:"built_in"`                              // Whether the instance is built-in
+	IsPinned    bool            `json:"is_pinned"`                             // Whether the instance is pinned by the user
+	IsShared    bool            `json:"is_shared"`                             // Whether the instance has been shared via agent_shares
+	Config      map[string]any  `json:"config,omitempty"`                      // Per-user instance configuration from user preferences
+	Metadata    *map[string]any `json:"metadata,omitempty"`                    // Instance metadata
+	Data        json.RawMessage `json:"-"`                                     // Request-only flow data; excluded from responses
+	CreatedAt   time.Time       `json:"created_at"`                            // When the instance was created
+	UpdatedAt   time.Time       `json:"updated_at"`                            // When the instance was last updated
+}
+
+// CreateAgentInstanceRequest represents a request to create an agent instance.
+type CreateAgentInstanceRequest struct {
+	Name        *string         `json:"name"`
+	Description *string         `json:"description,omitempty"`
+	Type        *string         `json:"type"`
+	ContentID   *string         `json:"content_id,omitempty"`
+	Public      *bool           `json:"public"`
+	Metadata    *map[string]any `json:"metadata,omitempty"`
+	TemplateID  *int64          `json:"template_id" binding:"omitempty,gte=1"`
+	Data        json.RawMessage `json:"data,omitempty"`
+}
+
+type AgentType string
+
+const (
+	AgentTypeLangflow AgentType = "langflow"
+	AgentTypeCode     AgentType = "code"
+	AgentTypeOpenClaw AgentType = "openclaw"
+)
+
+func (t AgentType) String() string {
+	return string(t)
+}
+
+type AgentInstanceFilter struct {
+	Search     string
+	Type       string
+	TemplateID *int64 `json:"template_id,omitempty"`
+	BuiltIn    *bool  `json:"built_in"`
+	Public     *bool  `json:"public"`
+	Editable   *bool  `json:"editable"`
+}
+
+type UpdateAgentInstanceRequest struct {
+	Name        *string         `json:"name,omitempty"`
+	Description *string         `json:"description,omitempty"`
+	Public      *bool           `json:"public,omitempty"`
+	Metadata    *map[string]any `json:"metadata,omitempty"`
+}
+
+type AgentInstanceCreationResult struct {
+	ID          string
+	Name        string
+	Description string
+	Metadata    map[string]any // Additional metadata for the agent instance
+}
+
+// LangFlowChatRequest represents a chat request to an agent instance
+type LangflowChatRequest struct {
+	SessionID  *string                   `json:"session_id,omitempty"`           // Optional session ID (client-provided)
+	InputValue string                    `json:"input_value" binding:"required"` // Input value for the agent
+	InputType  string                    `json:"input_type" binding:"required"`  // Type of input (e.g., "chat")
+	OutputType string                    `json:"output_type" binding:"required"` // Type of output (e.g., "chat")
+	Tweaks     json.RawMessage           `json:"tweaks,omitempty"`               // Optional parameter tweaks
+	Files      []LangflowChatRequestFile `json:"files,omitempty"`                // Optional files to upload
+}
+
+type LangflowChatRequestFile struct {
+	URL  string `json:"url"`
+	Name string `json:"name"`
+}
+
+// AgentChatResponse represents the response from an agent chat
+type AgentChatResponse struct {
+	SessionID  string `json:"session_id"`  // Session ID used for this conversation
+	OutputType string `json:"output_type"` // Output type from the request
+	Message    string `json:"message"`     // Agent's response message
+	InstanceID int64  `json:"instance_id"` // Agent instance ID
+	ContentID  string `json:"content_id"`  // Agent instance content ID
+	Type       string `json:"type"`        // Agent instance type
+	Timestamp  string `json:"timestamp"`   // When the response was generated
+	Sender     string `json:"sender"`      // Which Agent sent the message
+}
+
+// AgentChatSession represents a chat session
+type AgentInstanceSession struct {
+	ID          int64     `json:"id"`
+	SessionUUID string    `json:"session_uuid"`
+	Name        string    `json:"name"`
+	Type        string    `json:"type"` // Possible values: langflow, agno, code, etc.
+	InstanceID  int64     `json:"instance_id"`
+	UserUUID    string    `json:"user_uuid"`
+	LastTurn    int64     `json:"last_turn"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type AgentInstanceSessionFilter struct {
+	InstanceID *int64
+	Search     string
+}
+
+type CreateAgentInstanceSessionRequest struct {
+	SessionUUID *string `json:"session_uuid,omitempty"`
+	Name        *string `json:"name,omitempty" binding:"omitempty,max=255"`
+	Type        string  `json:"-"` // Possible values: langflow, agno, code, etc.
+	InstanceID  *int64  `json:"-"`
+	ContentID   *string `json:"-"`
+}
+
+type CreateAgentInstanceSessionResponse struct {
+	SessionUUID string `json:"session_uuid"`
+}
+
+type UpdateAgentInstanceSessionRequest struct {
+	Name string `json:"name" binding:"required,max=255"`
+}
+
+type RecordAgentInstanceSessionHistoryRequest struct {
+	SessionUUID string `json:"session_uuid"`
+	Request     bool   `json:"request"`
+	Content     string `json:"content"`
+}
+
+type CreateSessionHistoryRequest struct {
+	SessionUUID      string                  `json:"-"`
+	PostHogSessionID string                  `json:"-"`
+	Messages         []SessionHistoryMessage `json:"messages" binding:"required"`
+}
+
+type SessionHistoryMessage struct {
+	Request bool   `json:"request"`           // true: request, false: response
+	Content string `json:"content,omitempty"` // message content
+}
+
+type CreateSessionHistoryResponse struct {
+	MsgUUIDs []string `json:"msg_uuids"`
+}
+
+type SessionHistoryMessageType string
+
+const (
+	SessionHistoryMessageTypeCreate         SessionHistoryMessageType = "create"
+	SessionHistoryMessageTypeUpdateFeedback SessionHistoryMessageType = "update_feedback"
+	SessionHistoryMessageTypeRewrite        SessionHistoryMessageType = "rewrite"
+)
+
+// SessionHistoryMessageEnvelope is a unified message structure for all session history operations
+type SessionHistoryMessageEnvelope struct {
+	// Common fields
+	MessageType      SessionHistoryMessageType `json:"message_type"`
+	MsgUUID          string                    `json:"msg_uuid"`
+	SessionID        int64                     `json:"session_id"`
+	SessionUUID      string                    `json:"session_uuid"`
+	Request          bool                      `json:"request"` // true: request, false: response
+	InstanceID       int64                     `json:"instance_id,omitempty"`
+	UserUUID         string                    `json:"user_uuid,omitempty"`
+	AgentType        string                    `json:"agent_type,omitempty"`
+	PostHogSessionID string                    `json:"posthog_session_id,omitempty"`
+
+	// Create/Rewrite fields
+	Content     string `json:"content,omitempty"`      // message content
+	IsRewritten *bool  `json:"is_rewritten,omitempty"` // true: rewritten by user's request
+
+	// UpdateFeedback field
+	Feedback       *AgentSessionHistoryFeedback `json:"feedback,omitempty"`        // feedback: none, like, dislike
+	FeedbackReason *string                      `json:"feedback_reason,omitempty"` // optional reason supplied with the feedback
+
+	// Rewrite field
+	OriginalMsgUUID string `json:"original_msg_uuid,omitempty"` // original message UUID when rewriting
+}
+
+// AgentInstanceSessionHistory represents a session history
+type AgentInstanceSessionHistory struct {
+	ID             int64                       `json:"id"`
+	MsgUUID        string                      `json:"msg_uuid"`
+	SessionID      int64                       `json:"session_id"`
+	SessionUUID    string                      `json:"session_uuid"`
+	Request        bool                        `json:"request"`
+	Content        string                      `json:"content"`
+	Feedback       AgentSessionHistoryFeedback `json:"feedback"`
+	FeedbackReason string                      `json:"feedback_reason"`
+	IsRewritten    bool                        `json:"is_rewritten"`
+	CreatedAt      time.Time                   `json:"created_at"`
+	UpdatedAt      time.Time                   `json:"updated_at"`
+}
+
+type AgentInstanceSessionResponse struct {
+	SessionUUID string   `json:"session_uuid"`
+	Histories   []string `json:"histories"` // list of history contents
+}
+
+// AgentSessionShareResponse represents the response for creating a shared session.
+type AgentSessionShareResponse struct {
+	ShareUUID string `json:"share_uuid"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
+// AgentSessionShareTokenResponse represents the response for creating a share token.
+type AgentSessionShareTokenResponse struct {
+	Token string `json:"token"`
+}
+
+type AgentInstanceShareResponse struct {
+	ShareUUID string `json:"share_uuid"`
+	ShareName string `json:"share_name"`
+	Type      string `json:"type"`
+}
+
+// GuestUsageLimitMode describes how guest (anonymous) chat usage is limited on a
+// shared instance.
+type GuestUsageLimitMode string
+
+const (
+	GuestUsageLimitUnlimited GuestUsageLimitMode = "unlimited"
+	GuestUsageLimitLimited   GuestUsageLimitMode = "limited"
+)
+
+// GuestUsageLimit describes the guest chat usage policy surfaced on the shared page.
+type GuestUsageLimit struct {
+	Mode     GuestUsageLimitMode `json:"mode"`
+	MaxCount int64               `json:"max_count,omitempty"`
+}
+
+type AgentSharedInstanceResponse struct {
+	ID                int64             `json:"id"`
+	InstanceID        int64             `json:"instance_id"`
+	Type              string            `json:"type"`
+	Name              string            `json:"name"`
+	Description       string            `json:"description"`
+	AgentName         string            `json:"agent_name"`
+	SharedSandboxName string            `json:"shared_sandbox_name"`
+	CustomUI          map[string]string `json:"custom_ui,omitempty"`
+	GuestUsageLimit   *GuestUsageLimit  `json:"guest_usage_limit,omitempty"`
+}
+
+// AgentSharedSessionResponse represents the public shared session response.
+type AgentSharedSessionResponse struct {
+	Session   *AgentSharedSession            `json:"session"`
+	Histories []*AgentInstanceSessionHistory `json:"histories"`
+}
+
+// AgentSharedSession represents the minimal shared session view.
+type AgentSharedSession struct {
+	SessionUUID string `json:"session_uuid"`
+	InstanceID  int64  `json:"instance_id"`
+	MaxTurn     int64  `json:"max_turn"`
+	UserUUID    string `json:"user_uuid"`
+	Name        string `json:"name"`
+}
+
+type AgentSessionHistoryFeedback string
+
+const (
+	AgentSessionHistoryFeedbackNone    AgentSessionHistoryFeedback = "none"
+	AgentSessionHistoryFeedbackLike    AgentSessionHistoryFeedback = "like"
+	AgentSessionHistoryFeedbackDislike AgentSessionHistoryFeedback = "dislike"
+)
+
+type FeedbackSessionHistoryRequest struct {
+	MsgUUID  string                      `json:"-"`
+	Feedback AgentSessionHistoryFeedback `json:"feedback" binding:"required,oneof=none like dislike"`
+	Reason   string                      `json:"reason,omitempty" binding:"max=500"`
+}
+
+type RewriteSessionHistoryRequest struct {
+	OriginalMsgUUID string `json:"-"`
+	Content         string `json:"content" binding:"required"`
+}
+
+type RewriteSessionHistoryResponse struct {
+	MsgUUID string `json:"msg_uuid"`
+}
+
+type AgentTaskType string
+
+const (
+	AgentTaskTypeFinetuneJob AgentTaskType = "finetuneJob"
+	AgentTaskTypeInference   AgentTaskType = "inference"
+)
+
+func (t AgentTaskType) String() string {
+	return string(t)
+}
+
+// AgentInfo represents the agent information parsed from JSON string
+// e.g. {"type": "code", "id": "123", "request_id": "123"}
+type AgentInfo struct {
+	Type      string `json:"type"`       // Agent type (e.g., "code", "langflow")
+	ID        string `json:"id"`         // Agent content ID
+	RequestID string `json:"request_id"` // request ID (session uuid)
+}
+
+type AgentInstanceTaskReq struct {
+	TaskID   string        `json:"task_id"`  // Task ID from argo_workflows
+	Agent    string        `json:"agent"`    // Agent JSON string, e.g. {"type": "code", "id": "123"}
+	Type     AgentTaskType `json:"type"`     // Agent task type (e.g., "finetune", "inference")
+	Username string        `json:"username"` // Username
+}
+
+type AgentStreamEvent struct {
+	Event string          `json:"event"`
+	Data  json.RawMessage `json:"data"`
+}
+
+type CodeAgentSyncOperation string
+
+const (
+	CodeAgentSyncOperationUpdate     CodeAgentSyncOperation = "update"
+	CodeAgentSyncOperationDelete     CodeAgentSyncOperation = "delete"
+	CodeAgentSyncOperationVisibility CodeAgentSyncOperation = "visibility"
+)
+
+func (o CodeAgentSyncOperation) String() string {
+	return string(o)
+}
+
+// AgentInstanceStatusRequest represents a request to get status for an agent instance
+type AgentInstanceStatusRequest struct {
+	Type      string `json:"type" binding:"required"`       // Agent type (e.g., "code", "langflow")
+	ContentID string `json:"content_id" binding:"required"` // Content ID of the instance
+}
+
+// AgentInstanceStatusResponse represents the status response for an agent instance
+type AgentInstanceStatusResponse struct {
+	ID        int64  `json:"id"`               // Instance ID
+	Type      string `json:"type"`             // Agent type
+	ContentID string `json:"content_id"`       // Content ID of the instance
+	Status    string `json:"status,omitempty"` // Full status string (e.g., "Running", "Stopped", "Building", etc.)
+	Error     string `json:"error,omitempty"`  // Error message if status check failed
+}
+
+// AgentInstanceStatusResult represents the status result for a single instance from adapter
+type AgentInstanceStatusResult struct {
+	Status string
+	Error  error
+}
+
+// AgentTaskStatus represents the unified task status
+type AgentTaskStatus string
+
+const (
+	AgentTaskStatusInProgress AgentTaskStatus = "in_progress"
+	AgentTaskStatusCompleted  AgentTaskStatus = "completed"
+	AgentTaskStatusFailed     AgentTaskStatus = "failed"
+)
+
+// AgentTaskFilter represents the filter for listing agent tasks
+type AgentTaskFilter struct {
+	Search      string          `json:"search,omitempty"`       // Search by task name
+	TaskType    AgentTaskType   `json:"task_type,omitempty"`    // Filter by task type (finetuneJob, inference)
+	Status      AgentTaskStatus `json:"status,omitempty"`       // Filter by status (in_progress, completed, failed)
+	InstanceID  *int64          `json:"instance_id,omitempty"`  // Filter by instance ID
+	SessionUUID string          `json:"session_uuid,omitempty"` // Filter by session UUID
+}
+
+// AgentTaskListItem represents a task item in the list
+type AgentTaskListItem struct {
+	ID          int64           `json:"id"`
+	TaskID      string          `json:"task_id"`
+	TaskName    string          `json:"task_name"`
+	TaskType    AgentTaskType   `json:"task_type"`
+	TaskStatus  AgentTaskStatus `json:"task_status"`
+	InstanceID  int64           `json:"instance_id"`
+	SessionUUID string          `json:"session_uuid"`
+	IsPinned    bool            `json:"is_pinned"` // Whether the task is pinned by the user
+	PinnedAt    *time.Time      `json:"pinned_at"` // When the task was pinned (from LEFT JOIN)
+	UpdatedAt   time.Time       `json:"updated_at"`
+	CreatedAt   time.Time       `json:"created_at"`
+}
+
+// AgentTaskListItemResponse represents a task item in the API response (without PinnedAt)
+type AgentTaskListItemResponse struct {
+	ID          int64           `json:"id"`
+	TaskID      string          `json:"task_id"`
+	TaskName    string          `json:"task_name"`
+	TaskType    AgentTaskType   `json:"task_type"`
+	TaskStatus  AgentTaskStatus `json:"task_status"`
+	InstanceID  int64           `json:"instance_id"`
+	SessionUUID string          `json:"session_uuid"`
+	IsPinned    bool            `json:"is_pinned"` // Whether the task is pinned by the user
+	UpdatedAt   time.Time       `json:"updated_at"`
+	CreatedAt   time.Time       `json:"created_at"`
+}
+
+// AgentTaskDetail represents detailed task information
+type AgentTaskDetail struct {
+	ID           int64           `json:"id"`
+	TaskID       string          `json:"task_id"`
+	TaskName     string          `json:"task_name"`
+	TaskDesc     string          `json:"task_desc"`
+	TaskType     AgentTaskType   `json:"task_type"`
+	Status       AgentTaskStatus `json:"status"`
+	InstanceID   int64           `json:"instance_id"`
+	InstanceType string          `json:"instance_type"`
+	InstanceName string          `json:"instance_name"`
+	SessionUUID  string          `json:"session_uuid"`
+	SessionName  string          `json:"session_name"`
+	Username     string          `json:"username"`
+	Backend      string          `json:"backend"`            // Backend system of the task (argo_workflow, deploy)
+	Metadata     map[string]any  `json:"metadata,omitempty"` // Backend-specific fields (argo_workflow or deploy)
+	CreatedAt    time.Time       `json:"created_at"`
+	UpdatedAt    time.Time       `json:"updated_at"`
+}
+
+type AgentMonitorRequest struct {
+	MonitorID   string  `json:"monitor_id" binding:"required"`
+	InstanceIDs []int64 `json:"instance_ids" binding:"required"`
+}
+
+type AgentMCPServerMonitorRequest struct {
+	MonitorID    string   `json:"monitor_id" binding:"required"`
+	MCPServerIDs []string `json:"mcp_server_ids" binding:"required,min=1"`
+}
+
+type AgentMCPServerStatusResponse struct {
+	ID     string `json:"id"`               // MCP server ID (format: "builtin:{id}" or "user:{id}")
+	Status string `json:"status,omitempty"` // Status: "connected" or "error"
+	Error  string `json:"error,omitempty"`  // Error message if status check failed
+}
+
+// AgentMCPServerConnectionType represents the connection type for MCP servers
+type AgentMCPServerConnectionType string
+
+const (
+	AgentMCPServerConnectionTypeJSON AgentMCPServerConnectionType = "json"
+	AgentMCPServerConnectionTypeSSE  AgentMCPServerConnectionType = "sse"
+)
+
+func (t AgentMCPServerConnectionType) String() string {
+	return string(t)
+}
+
+// AgentMCPServer represents an MCP server configuration for an agent (API layer)
+type AgentMCPServer struct {
+	ID          int64           `json:"id"`
+	UserUUID    string          `json:"user_uuid"`
+	Name        string          `json:"name"`
+	Description *string         `json:"description,omitempty"`
+	Protocol    string          `json:"protocol"` // streamable or sse
+	URL         string          `json:"url"`
+	Headers     *map[string]any `json:"headers,omitempty"`
+	Env         *map[string]any `json:"env,omitempty"`
+	CreatedAt   time.Time       `json:"created_at"`
+	UpdatedAt   time.Time       `json:"updated_at"`
+}
+
+// AgentMCPServerFilter represents the filter for listing agent MCP servers
+type AgentMCPServerFilter struct {
+	Search      string  `json:"search,omitempty"`       // Search term for name field
+	UserUUID    string  `json:"user_uuid"`              // Filter by user UUID (always set, includes built-in servers)
+	BuiltIn     *bool   `json:"built_in,omitempty"`     // Filter by built-in status
+	Protocol    *string `json:"protocol,omitempty"`     // Filter by protocol (streamable, sse)
+	NeedInstall *bool   `json:"need_install,omitempty"` // Filter by need_install status
+	Status      *string `json:"status,omitempty"`       // Filter by status (connected, disconnected, error)
+	Installed   *bool   `json:"installed,omitempty"`    // Filter by installed status
+}
+
+// CreateAgentMCPServerRequest represents a request to create an agent MCP server
+type CreateAgentMCPServerRequest struct {
+	Name        string         `json:"name" binding:"required,max=255"`
+	Description string         `json:"description,omitempty"`
+	Protocol    string         `json:"protocol" binding:"required,oneof=streamable sse"`
+	URL         string         `json:"url" binding:"required"`
+	Headers     map[string]any `json:"headers,omitempty"`
+	Env         map[string]any `json:"env,omitempty"`
+	UserUUID    string         `json:"-"` // Will be set from HTTP header
+}
+
+// UpdateAgentMCPServerRequest represents a request to update an agent MCP server
+type UpdateAgentMCPServerRequest struct {
+	Name        *string         `json:"name,omitempty" binding:"omitempty,max=255"`
+	Description *string         `json:"description,omitempty"`
+	Protocol    *string         `json:"protocol,omitempty" binding:"omitempty,oneof=streamable sse"`
+	URL         *string         `json:"url,omitempty"`
+	Headers     *map[string]any `json:"headers,omitempty"`
+	Env         *map[string]any `json:"env,omitempty"`
+}
+
+// InspectMCPServerRequest represents a request to inspect an MCP server directly.
+type InspectMCPServerRequest struct {
+	Protocol string         `json:"protocol" binding:"required,oneof=streamable sse"`
+	URL      string         `json:"url" binding:"required"`
+	Headers  map[string]any `json:"headers,omitempty"`
+}
+
+// AgentMCPServerListItem represents an MCP server in list responses
+type AgentMCPServerListItem struct {
+	ID           string         `json:"id"` // String ID (format: "builtin:{id}" or "user:{id}")
+	Name         string         `json:"name"`
+	Description  string         `json:"description"`
+	URL          string         `json:"url"`
+	Owner        string         `json:"owner"`
+	Avatar       string         `json:"avatar"`
+	Protocol     string         `json:"protocol,omitempty"`
+	BuiltIn      bool           `json:"built_in"`
+	NeedInstall  bool           `json:"need_install"`
+	Installed    bool           `json:"installed"`
+	Status       string         `json:"status,omitempty"` // Connection status: 'connected'，'error'
+	Capabilities map[string]any `json:"capabilities,omitempty"`
+	IsPinned     bool           `json:"is_pinned"` // Whether the MCP server is pinned by the user
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
+}
+
+// AgentMCPServerDetail represents a complete MCP server with all configuration details
+type AgentMCPServerDetail struct {
+	ID              string         `json:"id"` // String ID (format: "builtin:{id}" or "user:{id}")
+	Name            string         `json:"name"`
+	Description     string         `json:"description"`
+	UserUUID        string         `json:"user_uuid"`
+	Owner           string         `json:"owner"`
+	Avatar          string         `json:"avatar"`
+	Protocol        string         `json:"protocol,omitempty"`
+	URL             string         `json:"url,omitempty"`
+	Headers         map[string]any `json:"headers,omitempty"`
+	Env             map[string]any `json:"env,omitempty"`
+	BuiltIn         bool           `json:"built_in"`
+	NeedInstall     bool           `json:"need_install"`
+	Installed       bool           `json:"installed"`
+	Status          string         `json:"status,omitempty"`            // Connection status: 'connected', 'error'
+	Capabilities    map[string]any `json:"capabilities,omitempty"`      // Cached capabilities from capabilities table
+	LastInspectedAt *time.Time     `json:"last_inspected_at,omitempty"` // Last inspection time
+	IsPinned        bool           `json:"is_pinned"`                   // Whether the MCP server is pinned by the user
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+}
+
+// AgentMCPServerStatus represents cached status for an MCP server
+type AgentMCPServerStatus struct {
+	ID              int64          `json:"id"`
+	ServerID        string         `json:"server_id"` // "builtin:{id}" or "user:{id}"
+	UserUUID        string         `json:"user_uuid,omitempty"`
+	Status          string         `json:"status"` // 'connected', 'error'
+	Error           string         `json:"error,omitempty"`
+	Capabilities    map[string]any `json:"capabilities"` // tools, resources, prompts, resource_templates
+	LastInspectedAt *time.Time     `json:"last_inspected_at,omitempty"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+}
+
+type AgentMCPServerInspectTarget struct {
+	ServerID string         `json:"server_id"`
+	UserUUID string         `json:"user_uuid,omitempty"`
+	Protocol string         `json:"protocol"`
+	URL      string         `json:"url"`
+	Headers  map[string]any `json:"headers,omitempty"`
+}
+
+type AgentMCPServerInspectAllRequest struct {
+	Page int `json:"page"`
+	Per  int `json:"per"`
+}
+
+type AgentMCPServerInspectAllResponse struct {
+	Targets  []AgentMCPServerInspectTarget `json:"targets"`
+	NextPage int                           `json:"next_page"`
+	Done     bool                          `json:"done"`
+}
+
+type AgentMCPServerInspectBatchRequest struct {
+	Targets []AgentMCPServerInspectTarget `json:"targets"`
+}
+
+type InspectMCPServerResponse struct {
+	Status       string         `json:"status"`                 // Status: 'connected' or 'error'
+	Capabilities map[string]any `json:"capabilities,omitempty"` // Fetched capabilities (tools, resources, prompts, resource_templates)
+}
+
+type AgentMCPServerIDPrefix string
+
+const (
+	AgentMCPServerIDPrefixBuiltin AgentMCPServerIDPrefix = "builtin:"
+	AgentMCPServerIDPrefixUser    AgentMCPServerIDPrefix = "user:"
+)
+
+func (p AgentMCPServerIDPrefix) String() string {
+	return string(p)
+}
+
+// AgentKnowledgeBase represents a knowledge base configuration for an agent (API layer)
+type AgentKnowledgeBaseType string
+
+const (
+	AgentKnowledgeBaseTypeLangflow              AgentKnowledgeBaseType = "langflow"
+	AgentKnowledgeBaseTypeLLMWiki               AgentKnowledgeBaseType = "llmwiki"
+	AgentKnowledgeBaseMetadataResourceStateKey                         = "resource_state"
+	AgentKnowledgeBaseMetadataBaseURLKey                               = "base_url"
+	AgentKnowledgeBaseMetadataMCPEndpointURLKey                        = "mcp_endpoint_url"
+	// AgentKnowledgeBaseMetadataManagedKey marks a knowledge base whose
+	// lifecycle is owned by the backend (auto-provisioned), as opposed to a
+	// manually registered MCP endpoint.
+	AgentKnowledgeBaseMetadataManagedKey = "backend_managed"
+)
+
+type AgentKnowledgeBaseActor struct {
+	Username      string
+	UserUUID      string
+	NamespaceUUID string
+}
+
+type AgentKnowledgeBaseAccessMode string
+
+const (
+	AgentKnowledgeBaseAccessModeRead  AgentKnowledgeBaseAccessMode = "read"
+	AgentKnowledgeBaseAccessModeWrite AgentKnowledgeBaseAccessMode = "write"
+	AgentKnowledgeBaseAccessModeAdmin AgentKnowledgeBaseAccessMode = "admin"
+)
+
+type LLMWikiManagementAccessRequest struct {
+	KBID  string
+	Actor AgentKnowledgeBaseActor
+	Mode  AgentKnowledgeBaseAccessMode
+}
+
+type AgentKnowledgeBase struct {
+	ID          int64                  `json:"id"`
+	Name        string                 `json:"name" binding:"required,max=50"`
+	Description string                 `json:"description,omitempty" binding:"omitempty,max=500"`
+	ContentID   string                 `json:"content_id"` // Used to specify the unique id of the knowledge base resource
+	Public      bool                   `json:"public"`     // Whether the knowledge base is public
+	Type        AgentKnowledgeBaseType `json:"type"`
+	Metadata    map[string]any         `json:"metadata,omitempty"`
+	CreatedAt   time.Time              `json:"created_at"`
+	UpdatedAt   time.Time              `json:"updated_at"`
+	UserUUID    string                 `json:"-"`
+}
+
+// CreateAgentKnowledgeBaseReq represents a request to create an agent knowledge base
+type CreateAgentKnowledgeBaseReq struct {
+	Name          string                 `json:"name" binding:"required,max=50"`
+	Description   string                 `json:"description,omitempty" binding:"omitempty,max=500"`
+	ContentID     string                 `json:"content_id,omitempty"`
+	Type          AgentKnowledgeBaseType `json:"type,omitempty"`
+	Namespace     string                 `json:"namespace,omitempty"`
+	Public        *bool                  `json:"public,omitempty"`
+	Metadata      map[string]any         `json:"metadata,omitempty"`
+	UserUUID      string                 `json:"-"`
+	NamespaceUUID string                 `json:"-"`
+}
+
+type AgentKnowledgeBaseCreationResult struct {
+	ContentID   string
+	Name        string
+	Description string
+	Metadata    map[string]any
+}
+
+type AgentKnowledgeBaseBackendTarget struct {
+	ContentID string
+	// BackendManaged is true when the knowledge base backend owns the resource
+	// lifecycle (auto-provisioned), false for manually registered backends.
+	BackendManaged bool
+}
+
+type AgentKnowledgeBaseResourceState map[string]json.RawMessage
+
+// AgentKnowledgeBaseFilter represents the filter for listing agent knowledge bases
+type AgentKnowledgeBaseFilter struct {
+	Search        string                 `json:"search,omitempty"`   // Search term for name field
+	Type          AgentKnowledgeBaseType `json:"type,omitempty"`     // Filter by knowledge base type
+	NsUUID        string                 `json:"-"`                  // Filter by namespace UUID
+	AuthorizedIDs []int64                `json:"-"`                  // ReBAC-authorized knowledge base IDs
+	Public        *bool                  `json:"public,omitempty"`   // Filter by public status
+	Editable      *bool                  `json:"editable,omitempty"` // Filter by editable status (true = owned by user, false = not owned by user)
+}
+
+// UpdateAgentKnowledgeBaseRequest represents a request to update an agent knowledge base
+type UpdateAgentKnowledgeBaseRequest struct {
+	Name        *string         `json:"name,omitempty" binding:"omitempty,max=50"`
+	Description *string         `json:"description,omitempty" binding:"omitempty,max=500"`
+	Public      *bool           `json:"public,omitempty"`
+	Metadata    *map[string]any `json:"metadata,omitempty"`
+}
+
+// AgentKnowledgeBaseListItem represents a knowledge base in list responses
+type AgentKnowledgeBaseListItem struct {
+	ID          int64                  `json:"id"`
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	ContentID   string                 `json:"content_id"`
+	Public      bool                   `json:"public"`
+	Type        AgentKnowledgeBaseType `json:"type"`
+	Editable    bool                   `json:"editable"`
+	// CanWrite reports whether the caller may write KB content through the
+	// management proxy (ReBAC can_write).
+	CanWrite bool `json:"can_write"`
+	// CanManage reports whether the caller may update or delete the KB record
+	// (ReBAC can_admin, same value as editable).
+	CanManage bool `json:"can_manage"`
+	IsPinned  bool `json:"is_pinned"` // Whether the knowledge base is pinned by the user
+	// Owner is the namespace path (username or organization path) that owns the KB.
+	Owner string `json:"owner"`
+	// NamespaceUUID is the personal or organization namespace that owns the KB.
+	NamespaceUUID string `json:"namespace_uuid"`
+	// NamespaceType is the trusted namespace type: "user" or "organization".
+	NamespaceType string         `json:"namespace_type"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
+	CreatedAt     time.Time      `json:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
+}
+
+// AgentPromptListItem represents a prompt in list responses
+type AgentPromptListItem struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	Path        string    `json:"path"`
+	Public      bool      `json:"public"`
+	IsPinned    bool      `json:"is_pinned"` // Whether the prompt is pinned by the user
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// AgentPromptOptimizeRequest represents a request to optimize a prompt.
+type AgentPromptOptimizeRequest struct {
+	Prompt string `json:"prompt" binding:"required"`
+}
+
+// AgentPromptOptimizeResponse represents an optimized prompt response.
+type AgentPromptOptimizeResponse struct {
+	OptimizedPrompt string `json:"optimized_prompt"`
+}
+
+// AgentKnowledgeBaseDetail represents a complete knowledge base with all configuration details
+type AgentKnowledgeBaseDetail struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	UserUUID    string `json:"user_uuid"`
+	Owner       string `json:"owner"`
+	Avatar      string `json:"avatar"`
+	// NamespaceUUID is the personal or organization namespace that owns the KB.
+	NamespaceUUID string `json:"namespace_uuid"`
+	// NamespaceType is the trusted namespace type: "user" or "organization".
+	NamespaceType string                 `json:"namespace_type"`
+	ContentID     string                 `json:"content_id"`
+	Public        bool                   `json:"public"`
+	Type          AgentKnowledgeBaseType `json:"type"`
+	Editable      bool                   `json:"editable"`
+	// CanWrite reports whether the caller may write KB content through the
+	// management proxy (ReBAC can_write).
+	CanWrite bool `json:"can_write"`
+	// CanManage reports whether the caller may update or delete the KB record
+	// (ReBAC can_admin, same value as editable).
+	CanManage bool           `json:"can_manage"`
+	IsPinned  bool           `json:"is_pinned"` // Whether the knowledge base is pinned by the user
+	Metadata  map[string]any `json:"metadata,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+}
+
+type LangflowTargetType string
+
+const (
+	LangflowTargetTypeInstance LangflowTargetType = "instance"
+	LangflowTargetTypeRAG      LangflowTargetType = "rag"
+)
+
+type LangflowTarget struct {
+	Type LangflowTargetType `json:"type"`
+	ID   string             `json:"id"`
+}
+
+// AgentUserPreferenceEntityType represents the type of entity that can have preferences
+const (
+	AgentUserPreferenceEntityTypeAgentInstance      = "agent_instance"
+	AgentUserPreferenceEntityTypeAgentKnowledgeBase = "agent_knowledge_base"
+	AgentUserPreferenceEntityTypeAgentTemplate      = "agent_template"
+	AgentUserPreferenceEntityTypeAgentMCPServer     = "agent_mcp_server"
+	AgentUserPreferenceEntityTypeAgentTask          = "agent_task"
+	AgentUserPreferenceEntityTypePrompt             = "agent_prompt"
+	AgentUserPreferenceEntityTypeAgentModel         = "agent_model"
+	AgentUserPreferenceEntityTypeAgentSkill         = "agent_skill"
+)
+
+// AgentUserPreferenceAction represents the type of preference action
+const (
+	AgentUserPreferenceActionPin            = "pin"
+	AgentUserPreferenceActionConfigInstance = "config-instance"
+)
+
+// AgentUserPreferenceRequest represents a request to set or remove a preference
+type AgentUserPreferenceRequest struct {
+	EntityType string         `json:"entity_type" binding:"required,oneof=agent_instance agent_knowledge_base agent_template agent_mcp_server agent_task agent_prompt agent_model agent_skill"`
+	EntityID   string         `json:"entity_id" binding:"required"`
+	Preference string         `json:"preference" binding:"required,oneof=pin config-instance"`
+	Value      map[string]any `json:"value,omitempty"` // JSON value for config-instance preferences
+}
+
+// AgentSkillListItem represents a skill in the agent skills list response.
+// Used for both bun scan (List query) and API JSON; Private is scan-only, Public is set after scan.
+type AgentSkillListItem struct {
+	ID            int64      `bun:",scanonly" json:"id"`
+	RepositoryID  int64      `bun:",scanonly" json:"repository_id"`
+	Name          string     `bun:",scanonly" json:"name"`
+	Description   string     `bun:",scanonly" json:"description"`
+	Path          string     `bun:",scanonly" json:"path"`
+	DefaultBranch string     `bun:",scanonly" json:"-"`
+	DownloadURL   string     `json:"download_url"`
+	Repository    Repository `json:"repository"`
+	Private       bool       `bun:",scanonly" json:"-"`                   // from DB; Public is derived as !Private
+	Public        bool       `json:"public"`                              // set after scan
+	IsPinned      bool       `bun:",scanonly" json:"is_pinned"`           // true if pinned by user
+	PinnedAt      time.Time  `bun:",scanonly" json:"pinned_at,omitempty"` // when pinned (optional in API)
+	BuiltIn       bool       `bun:",scanonly" json:"built_in"`            // true if platform skill (has agentichub-skills tag)
+	Owner         string     `bun:",scanonly" json:"owner,omitempty"`
+	OwnerAvatar   string     `bun:",scanonly" json:"owner_avatar,omitempty"`
+	CreatedAt     time.Time  `bun:",scanonly" json:"created_at"`
+	UpdatedAt     time.Time  `bun:",scanonly" json:"updated_at"`
+}
+
+// AgentSkillFilter for list filtering
+type AgentSkillFilter struct {
+	Search     string `json:"search,omitempty" form:"search"`
+	UserUUID   string `json:"user_uuid"`
+	PinEnabled bool   `json:"pin_enabled,omitempty"`
+	BuiltIn    *bool  `json:"built_in,omitempty" form:"built_in"` // nil = all, true = built-in only, false = user-created only
+}
