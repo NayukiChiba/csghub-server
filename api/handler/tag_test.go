@@ -35,6 +35,7 @@ func TestTagHandler_AllTags(t *testing.T) {
 		values := url.Values{}
 		values.Add("category", "task")
 		values.Add("scope", "model")
+		values.Add("used", "true")
 		req := httptest.NewRequest("get", "/api/v1/tags?"+values.Encode(), nil)
 
 		hr := httptest.NewRecorder()
@@ -46,6 +47,7 @@ func TestTagHandler_AllTags(t *testing.T) {
 			Scopes:     []types.TagScope{types.TagScope("model")},
 			Categories: []string{"task"},
 			BuiltIn:    nil,
+			UsedOnly:   true,
 		}, 0, 0).Return(tags, 1, nil)
 
 		tagHandler, err := NewTestTagHandler(tagComp)

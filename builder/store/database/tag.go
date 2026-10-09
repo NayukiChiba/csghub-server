@@ -112,6 +112,13 @@ func (ts *tagStoreImpl) buildTagQuery(filter *types.TagFilter) *bun.SelectQuery 
 			searchName := "%" + filter.Search + "%"
 			q = q.Where("name like ? OR show_name like ?", searchName, searchName)
 		}
+		if filter.UsedOnly {
+			q = q.Where(`EXISTS (
+				SELECT 1 FROM repository_tags AS rt
+				JOIN repositories AS r ON r.id = rt.repository_id
+				WHERE rt.tag_id = tag.id AND rt.count > 0 AND r.deleted_at IS NULL
+			)`)
+		}
 	}
 
 	return q
