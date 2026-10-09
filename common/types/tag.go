@@ -86,4 +86,5 @@ type TagFilter struct {
 	Categories []string   `form:"category" binding:"omitempty,dive"`
 	BuiltIn    *bool      `form:"built_in" binding:"omitnil"`
 	Search     string     `form:"search" binding:"omitempty"`
+	UsedOnly   bool       `form:"used" binding:"omitempty"`
 }

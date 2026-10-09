@@ -40,6 +40,7 @@ type TagsHandler struct {
 // @Param		 scope query string false "scope name" Enums(model, dataset, code, space, prompt, skill)
 // @Param		 built_in query bool false "built_in"
 // @Param		 search query string false "search on name and show_name fields"
+// @Param		 used query bool false "only return tags used by an active repository"
 // @Param		 per query int false "Page size, default 50, max 100. When omitted and scope is set, all tags are returned without pagination" default(50)
 // @Param		 page query int false "Page number, default 1" default(1)
 // @Success      200  {object}  types.Response{data=[]types.RepoTag} "tags"

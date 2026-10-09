@@ -179,6 +179,60 @@ func TestTagStore_AllTags(t *testing.T) {
 	require.Equal(t, mcpTag.Name, mcpTags[0].Name)
 }
 
+func TestTagStore_AllTags_UsedOnly(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, err := db.Core.NewDelete().Model(&database.Tag{}).Where("1=1").Exec(ctx)
+	require.NoError(t, err)
+
+	ts := database.NewTagStoreWithDB(db)
+	usedTag, err := ts.CreateTag(ctx, database.Tag{
+		Category: "task",
+		Name:     "used_" + uuid.NewString(),
+		Scope:    types.DatasetTagScope,
+	})
+	require.NoError(t, err)
+	unusedTag, err := ts.CreateTag(ctx, database.Tag{
+		Category: "task",
+		Name:     "unused_" + uuid.NewString(),
+		Scope:    types.DatasetTagScope,
+	})
+	require.NoError(t, err)
+	depletedTag, err := ts.CreateTag(ctx, database.Tag{
+		Category: "framework",
+		Name:     "depleted_" + uuid.NewString(),
+		Scope:    types.DatasetTagScope,
+	})
+	require.NoError(t, err)
+
+	repo := &database.Repository{
+		Path:           "owner/used-tags",
+		GitPath:        "datasets_owner/used-tags",
+		Name:           "used-tags",
+		RepositoryType: types.DatasetRepo,
+	}
+	_, err = db.Core.NewInsert().Model(repo).Exec(ctx)
+	require.NoError(t, err)
+	_, err = db.Core.NewInsert().Model(&[]database.RepositoryTag{
+		{RepositoryID: repo.ID, TagID: usedTag.ID, Count: 1},
+		{RepositoryID: repo.ID, TagID: depletedTag.ID, Count: 0},
+	}).Exec(ctx)
+	require.NoError(t, err)
+
+	tags, err := ts.AllTags(ctx, &types.TagFilter{
+		Scopes:   []types.TagScope{types.DatasetTagScope},
+		UsedOnly: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, tags, 1)
+	require.Equal(t, usedTag.ID, tags[0].ID)
+	require.NotEqual(t, unusedTag.ID, tags[0].ID)
+}
+
 func TestTagStore_AllTagsWithPagination(t *testing.T) {
 	db := tests.InitTestDB()
 	defer db.Close()
