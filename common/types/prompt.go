@@ -42,6 +42,38 @@ type ConversationTitleReq struct {
 type LLMMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// ToolCalls is set on assistant messages that request tool invocations.
+	ToolCalls []LLMToolCall `json:"tool_calls,omitempty"`
+	// ToolCallID is set on role="tool" messages to reference the call being answered.
+	ToolCallID string `json:"tool_call_id,omitempty"`
+}
+
+// LLMToolFunction describes one callable function for OpenAI-style tool calling.
+type LLMToolFunction struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	// Parameters is a JSON Schema object describing the function arguments.
+	Parameters any `json:"parameters,omitempty"`
+}
+
+// LLMTool is one tool definition in a chat completion request.
+type LLMTool struct {
+	Type     string          `json:"type"` // always "function"
+	Function LLMToolFunction `json:"function"`
+}
+
+// LLMToolCallFunction is the function invocation requested by the model.
+type LLMToolCallFunction struct {
+	Name string `json:"name"`
+	// Arguments is a JSON-encoded string per the OpenAI tool calling spec.
+	Arguments string `json:"arguments"`
+}
+
+// LLMToolCall is one tool invocation requested by the model.
+type LLMToolCall struct {
+	ID       string              `json:"id"`
+	Type     string              `json:"type"`
+	Function LLMToolCallFunction `json:"function"`
 }
 
 type LLMReqBody struct {
@@ -50,7 +82,9 @@ type LLMReqBody struct {
 	Stream      bool         `json:"stream"`
 	Temperature float64      `json:"temperature"`
 	MaxTokens   int          `json:"max_tokens,omitempty"`
-	RawJSON     string       `json:"-"`
+	// Tools lists the functions the model may call; empty disables tool calling.
+	Tools   []LLMTool `json:"tools,omitempty"`
+	RawJSON string    `json:"-"`
 }
 
 type LLMCheckRequest struct {
@@ -206,8 +240,9 @@ type Choice struct {
 }
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string        `json:"role"`
+	Content   string        `json:"content"`
+	ToolCalls []LLMToolCall `json:"tool_calls,omitempty"`
 }
 
 type Usage struct {

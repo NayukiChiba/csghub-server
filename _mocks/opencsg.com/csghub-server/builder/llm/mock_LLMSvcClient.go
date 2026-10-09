@@ -86,6 +86,68 @@ func (_c *MockLLMSvcClient_Chat_Call) RunAndReturn(run func(context.Context, str
 	return _c
 }
 
+// ChatCompletion provides a mock function with given fields: ctx, endpoint, host, headers, data
+func (_m *MockLLMSvcClient) ChatCompletion(ctx context.Context, endpoint string, host string, headers map[string]string, data types.LLMReqBody) (*types.ChatCompletion, error) {
+	ret := _m.Called(ctx, endpoint, host, headers, data)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ChatCompletion")
+	}
+
+	var r0 *types.ChatCompletion
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, string, string, map[string]string, types.LLMReqBody) (*types.ChatCompletion, error)); ok {
+		return rf(ctx, endpoint, host, headers, data)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, string, string, map[string]string, types.LLMReqBody) *types.ChatCompletion); ok {
+		r0 = rf(ctx, endpoint, host, headers, data)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*types.ChatCompletion)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, string, string, map[string]string, types.LLMReqBody) error); ok {
+		r1 = rf(ctx, endpoint, host, headers, data)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockLLMSvcClient_ChatCompletion_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'ChatCompletion'
+type MockLLMSvcClient_ChatCompletion_Call struct {
+	*mock.Call
+}
+
+// ChatCompletion is a helper method to define mock.On call
+//   - ctx context.Context
+//   - endpoint string
+//   - host string
+//   - headers map[string]string
+//   - data types.LLMReqBody
+func (_e *MockLLMSvcClient_Expecter) ChatCompletion(ctx interface{}, endpoint interface{}, host interface{}, headers interface{}, data interface{}) *MockLLMSvcClient_ChatCompletion_Call {
+	return &MockLLMSvcClient_ChatCompletion_Call{Call: _e.mock.On("ChatCompletion", ctx, endpoint, host, headers, data)}
+}
+
+func (_c *MockLLMSvcClient_ChatCompletion_Call) Run(run func(ctx context.Context, endpoint string, host string, headers map[string]string, data types.LLMReqBody)) *MockLLMSvcClient_ChatCompletion_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(string), args[2].(string), args[3].(map[string]string), args[4].(types.LLMReqBody))
+	})
+	return _c
+}
+
+func (_c *MockLLMSvcClient_ChatCompletion_Call) Return(_a0 *types.ChatCompletion, _a1 error) *MockLLMSvcClient_ChatCompletion_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockLLMSvcClient_ChatCompletion_Call) RunAndReturn(run func(context.Context, string, string, map[string]string, types.LLMReqBody) (*types.ChatCompletion, error)) *MockLLMSvcClient_ChatCompletion_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // ChatStream provides a mock function with given fields: ctx, endpoint, host, headers, data
 func (_m *MockLLMSvcClient) ChatStream(ctx context.Context, endpoint string, host string, headers map[string]string, data types.LLMReqBody) (<-chan string, error) {
 	ret := _m.Called(ctx, endpoint, host, headers, data)

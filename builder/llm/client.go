@@ -20,6 +20,9 @@ import (
 type LLMSvcClient interface {
 	WithLLMConfig(llmConfig *database.LLMConfig) LLMSvcClient
 	Chat(ctx context.Context, endpoint, host string, headers map[string]string, data types.LLMReqBody) (string, error)
+	// ChatCompletion returns the full chat completion response, including tool
+	// calls requested by the model when data.Tools is non-empty.
+	ChatCompletion(ctx context.Context, endpoint, host string, headers map[string]string, data types.LLMReqBody) (*types.ChatCompletion, error)
 	ChatStream(ctx context.Context, endpoint, host string, headers map[string]string, data types.LLMReqBody) (<-chan string, error)
 	Tokenize(ctx context.Context, endpoint, host string, req interface{}) ([]byte, error)
 	EmbeddingTokenize(ctx context.Context, endpoint, host string, req interface{}) ([]byte, error)
@@ -144,16 +147,27 @@ func (c *Client) readToChannel(rc io.ReadCloser) <-chan string {
 }
 
 func (c *Client) Chat(ctx context.Context, endpoint, host string, headers map[string]string, data types.LLMReqBody) (string, error) {
+	resp, err := c.ChatCompletion(ctx, endpoint, host, headers, data)
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Choices) == 0 || len(resp.Choices[0].Message.Content) == 0 {
+		return "", fmt.Errorf("summary of conversation is invalid")
+	}
+	return resp.Choices[0].Message.Content, nil
+}
+
+func (c *Client) ChatCompletion(ctx context.Context, endpoint, host string, headers map[string]string, data types.LLMReqBody) (*types.ChatCompletion, error) {
 	endpoint, host, headers, data = c.resolveLLMConfig(endpoint, host, headers, data)
 	slog.Debug("chat with llm", slog.Any("endpoint", endpoint), slog.Any("data", data))
 	rc, err := c.doRequest(ctx, http.MethodPost, endpoint, host, headers, data)
 	if err != nil {
-		return "", fmt.Errorf("do llm request, error: %w", err)
+		return nil, fmt.Errorf("do llm request, error: %w", err)
 	}
 
 	bodyBytes, err := io.ReadAll(rc)
 	if err != nil {
-		return "", fmt.Errorf("read llm response body, error: %w", err)
+		return nil, fmt.Errorf("read llm response body, error: %w", err)
 	}
 	defer rc.Close()
 
@@ -164,14 +178,10 @@ func (c *Client) Chat(ctx context.Context, endpoint, host string, headers map[st
 
 	err = json.Unmarshal(bodyBytes, &chatCompletion)
 	if err != nil {
-		return "", fmt.Errorf("decode llm response, error: %w", err)
+		return nil, fmt.Errorf("decode llm response, error: %w", err)
 	}
 
-	if len(chatCompletion.Choices) == 0 || len(chatCompletion.Choices[0].Message.Content) == 0 {
-		return "", fmt.Errorf("summary of conversation is invalid")
-	}
-
-	return chatCompletion.Choices[0].Message.Content, nil
+	return &chatCompletion, nil
 }
 
 func (c *Client) Tokenize(ctx context.Context, endpoint, host string, req interface{}) ([]byte, error) {
