@@ -14,6 +14,7 @@ const (
 	RepoParquetData   dvCom.RepoDataType = "parquet"
 	RepoJsonData      dvCom.RepoDataType = "json"
 	RepoCsvData       dvCom.RepoDataType = "csv"
+	RepoMediaData     dvCom.RepoDataType = "media"
 	DataSizePerThread                    = 804857600
 )
 
@@ -47,6 +48,23 @@ func IsValidJsonFile(entryName string) bool {
 
 func IsValidCSVFile(entryName string) bool {
 	return strings.HasSuffix(strings.ToLower(entryName), FileExtName.Csv)
+}
+
+// mediaExtensions lists previewable multimedia file extensions (image, audio, video).
+var mediaExtensions = []string{
+	".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp",
+	".aac", ".flac", ".m4a", ".mp3", ".oga", ".ogg", ".opus", ".wav",
+	".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".ogv", ".webm",
+}
+
+func IsValidMediaFile(entryName string) bool {
+	entryName = strings.ToLower(entryName)
+	for _, ext := range mediaExtensions {
+		if strings.HasSuffix(entryName, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 func IsTrainFile(fileName string) bool {
@@ -126,11 +144,11 @@ func appendFile(file *types.File, fileClass *dvCom.RepoFilesClass, limitSize int
 		DownloadSize: file.Size,
 	}
 
-	if fileClass.TotalParquetSize >= limitSize || fileClass.TotalJsonSize >= limitSize || fileClass.TotalCsvSize >= limitSize {
+	if fileClass.TotalParquetSize >= limitSize || fileClass.TotalJsonSize >= limitSize || fileClass.TotalCsvSize >= limitSize || fileClass.TotalMediaSize >= limitSize {
 		return
 	}
 
-	if IsValidParquetFile(file.Name) || IsValidJsonFile(file.Name) || IsValidCSVFile(file.Name) {
+	if IsValidParquetFile(file.Name) || IsValidJsonFile(file.Name) || IsValidCSVFile(file.Name) || IsValidMediaFile(file.Name) {
 		fileClass.AllFiles[file.Path] = repoFile
 	}
 
@@ -179,6 +197,22 @@ func appendFile(file *types.File, fileClass *dvCom.RepoFilesClass, limitSize int
 			fileClass.CsvFiles[file.Path] = repoFile
 		}
 		fileClass.TotalCsvSize += fileClass.CsvFiles[file.Path].DownloadSize
+		return
+	}
+
+	if IsValidMediaFile(file.Name) {
+		if fileClass.TotalMediaSize >= limitSize {
+			return
+		}
+		if fileClass.TotalMediaSize+file.Size > limitSize {
+			fileClass.MediaFiles[file.Path] = &dvCom.RepoFile{
+				File:         file,
+				DownloadSize: limitSize - fileClass.TotalMediaSize,
+			}
+		} else {
+			fileClass.MediaFiles[file.Path] = repoFile
+		}
+		fileClass.TotalMediaSize += fileClass.MediaFiles[file.Path].DownloadSize
 		return
 	}
 }

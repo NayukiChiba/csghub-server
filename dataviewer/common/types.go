@@ -91,9 +91,11 @@ type RepoFilesClass struct {
 	ParquetFiles     map[string]*RepoFile
 	JsonlFiles       map[string]*RepoFile
 	CsvFiles         map[string]*RepoFile
+	MediaFiles       map[string]*RepoFile
 	TotalParquetSize int64
 	TotalJsonSize    int64
 	TotalCsvSize     int64
+	TotalMediaSize   int64
 }
 
 type DownloadCard struct {

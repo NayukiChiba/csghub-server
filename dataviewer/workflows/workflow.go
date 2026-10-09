@@ -32,6 +32,7 @@ func BuildDataViewerRunWorker(tc temporal.Client, cfg *config.Config, act DataVi
 	wr.RegisterActivity(act.CreateParquetBranch)
 	wr.RegisterActivity(act.CopyParquetFiles)
 	wr.RegisterActivity(act.DownloadSplitFiles)
+	wr.RegisterActivity(act.WriteMediaIndexFiles)
 	wr.RegisterActivity(act.ConvertToParquetFiles)
 	wr.RegisterActivity(act.UploadParquetFiles)
 	wr.RegisterActivity(act.UpdateCardData)
@@ -120,6 +121,8 @@ func runWorkFlow(sessionCtx workflow.Context, updateWorkflow dvCom.WorkflowUpdat
 		repoDataType = RepoJsonData
 	} else if len(repoFileClass.CsvFiles) > 0 {
 		repoDataType = RepoCsvData
+	} else if len(repoFileClass.MediaFiles) > 0 {
+		repoDataType = RepoMediaData
 	}
 
 	var computedCardData dvCom.CardData
@@ -186,6 +189,39 @@ func runWorkFlow(sessionCtx workflow.Context, updateWorkflow dvCom.WorkflowUpdat
 		).Get(sessionCtx, &downloadCard)
 		if err != nil {
 			return false, fmt.Errorf("run data viewer activity DownloadSplitFiles error: %w", err)
+		}
+
+		err = workflow.ExecuteActivity(sessionCtx, DataViewerActivity.ConvertToParquetFiles,
+			dvCom.ConvertReq{
+				Req:          updateWorkflow.Req,
+				DownloadCard: downloadCard,
+				RepoDataType: repoDataType,
+			},
+		).Get(sessionCtx, nil)
+		if err != nil {
+			return false, fmt.Errorf("run data viewer activity ConvertToParquetFiles error: %w", err)
+		}
+
+		err = workflow.ExecuteActivity(sessionCtx, DataViewerActivity.UploadParquetFiles,
+			dvCom.UploadParquetReq{
+				Req:          updateWorkflow.Req,
+				DownloadCard: downloadCard,
+				NewBranch:    newBranch,
+			},
+		).Get(sessionCtx, &finalCardData)
+		if err != nil {
+			return false, fmt.Errorf("run data viewer activity UploadParquetFiles error: %w", err)
+		}
+	case RepoMediaData:
+		var downloadCard dvCom.DownloadCard
+		err = workflow.ExecuteActivity(sessionCtx, DataViewerActivity.WriteMediaIndexFiles,
+			dvCom.DownloadFileReq{
+				Req:  updateWorkflow.Req,
+				Card: computedCardData,
+			},
+		).Get(sessionCtx, &downloadCard)
+		if err != nil {
+			return false, fmt.Errorf("run data viewer activity WriteMediaIndexFiles error: %w", err)
 		}
 
 		err = workflow.ExecuteActivity(sessionCtx, DataViewerActivity.ConvertToParquetFiles,

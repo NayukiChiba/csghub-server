@@ -36,17 +36,10 @@ func TestDatasetViewerComponent_ViewParquetFile(t *testing.T) {
 		LfsSHA256:       "c5185c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836",
 	}, nil)
 
-	dc.mocks.preader.EXPECT().RowCount(mock.Anything, []string{"lfs/c5/18/5c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836"}, types.QueryReq{
-		PageSize:  10,
-		PageIndex: 1,
-	}, true).Return(100, nil)
-
-	dc.mocks.preader.EXPECT().FetchRows(mock.Anything, []string{"lfs/c5/18/5c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836"}, types.QueryReq{
-		PageSize:  10,
-		PageIndex: 1,
-	}, true).Return([]string{"a", "b"}, []string{"c", "d"}, [][]interface{}{
+	dc.mocks.limitOffsetReader.EXPECT().RowsWithCount(ctx, []string{"lfs/c5/18/5c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836"},
+		int64(10), int64(0)).Return([]string{"a", "b"}, []string{"c", "d"}, [][]any{
 		{1, 2, 3},
-	}, nil)
+	}, int64(100), nil)
 
 	resp, err := dc.ViewParquetFile(ctx, &dvCom.ViewParquetFileReq{
 		Namespace:   "ns",
@@ -439,12 +432,9 @@ func TestDatasetViewerComponent_GetCatalog(t *testing.T) {
 			LfsRelativePath: "a/b",
 			LfsSHA256:       "c5185c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836",
 		}, nil)
-		dc.mocks.preader.EXPECT().RowCount(mock.Anything,
+		dc.mocks.limitOffsetReader.EXPECT().RowsWithCount(mock.Anything,
 			[]string{"lfs/c5/18/5c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836"},
-			types.QueryReq{
-				PageSize:  10,
-				PageIndex: 1,
-			}, true).Return(100, nil)
+			int64(0), int64(0)).Return(nil, nil, nil, int64(100), nil)
 
 		dc.mocks.gitServer.EXPECT().GetTree(
 			mock.Anything, types.GetTreeRequest{Namespace: "ns", Name: "repo", RepoType: "dataset", Ref: "main", Limit: 500, Recursive: true},
