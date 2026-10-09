@@ -42,7 +42,7 @@ func NewDatasetToolExecutor(cfg *config.Config) (*mcpserver.ToolExecutor, error)
 	if err != nil {
 		return nil, fmt.Errorf("create repo component: %w", err)
 	}
-	return mcpserver.NewToolExecutor(dsComp, repoComp, database.NewTagStore(), llm.NewClient(), cfg), nil
+	return mcpserver.NewToolExecutor(dsComp, repoComp, database.NewTagStore(), llm.NewClient(), cfg, database.NewAgentConfigStore()), nil
 }
 
 func NewAISearchComponent(cfg *config.Config) (AISearchComponent, error) {
@@ -81,7 +81,8 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		return fmt.Errorf("message is required")
 	}
 
-	if c.cfg.AISearch.LLMEndpoint == "" {
+	llmEndpoint, llmModel, llmAPIKey := c.exec.ResolveLLMConfig(ctx)
+	if llmEndpoint == "" {
 		slog.Info("ai search llm not configured, fallback to keyword search")
 		return c.keywordFallback(ctx, message, emit)
 	}
@@ -105,8 +106,8 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		timeout = 30 * time.Second
 	}
 	headers := map[string]string{}
-	if c.cfg.AISearch.LLMAPIKey != "" {
-		headers["Authorization"] = "Bearer " + c.cfg.AISearch.LLMAPIKey
+	if llmAPIKey != "" {
+		headers["Authorization"] = "Bearer " + llmAPIKey
 	}
 
 	// found tracks datasets actually returned by search_datasets, so the final
@@ -116,8 +117,8 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 
 	for range maxIter {
 		llmCtx, cancel := context.WithTimeout(ctx, timeout)
-		resp, err := c.llm.ChatCompletion(llmCtx, c.cfg.AISearch.LLMEndpoint, "", headers, types.LLMReqBody{
-			Model:    c.cfg.AISearch.LLMModel,
+		resp, err := c.llm.ChatCompletion(llmCtx, llmEndpoint, "", headers, types.LLMReqBody{
+			Model:    llmModel,
 			Messages: messages,
 			Tools:    c.tools,
 		})

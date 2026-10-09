@@ -41,7 +41,7 @@ func (f *aiSearchFakeTags) AllDatasetTags(ctx context.Context) ([]*database.Tag,
 
 func newAISearchTestComponent(cfg *config.Config, datasets []*types.Dataset, total int, llmClient *mockllm.MockLLMSvcClient) AISearchComponent {
 	exec := mcpserver.NewToolExecutor(&aiSearchFakeDatasets{datasets: datasets, total: total},
-		&aiSearchFakeRepo{}, &aiSearchFakeTags{}, llmClient, cfg)
+		&aiSearchFakeRepo{}, &aiSearchFakeTags{}, llmClient, cfg, nil)
 	return NewAISearchComponentWithDeps(cfg, exec, llmClient)
 }
 

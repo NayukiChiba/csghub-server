@@ -59,21 +59,62 @@ var modalityKeywords = map[string]string{
 // ToolExecutor executes the dataset search tools. It is shared by the MCP
 // server and the in-process chat agent loop.
 type ToolExecutor struct {
-	datasets DatasetSearcher
-	repo     RepoFileReader
-	tags     DatasetTagLister
-	llm      llm.LLMSvcClient
-	cfg      *config.Config
+	datasets     DatasetSearcher
+	repo         RepoFileReader
+	tags         DatasetTagLister
+	llm          llm.LLMSvcClient
+	cfg          *config.Config
+	agentConfigs database.AgentConfigStore
 }
 
-func NewToolExecutor(datasets DatasetSearcher, repo RepoFileReader, tags DatasetTagLister, llmClient llm.LLMSvcClient, cfg *config.Config) *ToolExecutor {
+func NewToolExecutor(datasets DatasetSearcher, repo RepoFileReader, tags DatasetTagLister, llmClient llm.LLMSvcClient, cfg *config.Config, agentConfigs database.AgentConfigStore) *ToolExecutor {
 	return &ToolExecutor{
-		datasets: datasets,
-		repo:     repo,
-		tags:     tags,
-		llm:      llmClient,
-		cfg:      cfg,
+		datasets:     datasets,
+		repo:         repo,
+		tags:         tags,
+		llm:          llmClient,
+		cfg:          cfg,
+		agentConfigs: agentConfigs,
 	}
+}
+
+// AISearchLLMConfigName is the agent_configs row holding the admin-editable
+// LLM settings for dataset AI search. Values present there override the
+// env/toml AISearch config.
+const AISearchLLMConfigName = "ai_search_llm"
+
+const (
+	llmConfigKeyEndpoint = "llm_endpoint"
+	llmConfigKeyModel    = "llm_model"
+	llmConfigKeyAPIKey   = "llm_api_key"
+)
+
+// ResolveLLMConfig returns the effective LLM settings for AI search: values
+// stored in agent_configs (set via the admin API) override the static
+// env/toml configuration field by field.
+func (e *ToolExecutor) ResolveLLMConfig(ctx context.Context) (endpoint, model, apiKey string) {
+	endpoint, model, apiKey = e.cfg.AISearch.LLMEndpoint, e.cfg.AISearch.LLMModel, e.cfg.AISearch.LLMAPIKey
+	if e.agentConfigs == nil {
+		return endpoint, model, apiKey
+	}
+	row, err := e.agentConfigs.GetByName(ctx, AISearchLLMConfigName)
+	if err != nil {
+		slog.Warn("ai search llm config lookup failed, using static config", slog.Any("error", err))
+		return endpoint, model, apiKey
+	}
+	if row == nil {
+		return endpoint, model, apiKey
+	}
+	if v, ok := row.Config[llmConfigKeyEndpoint].(string); ok && v != "" {
+		endpoint = v
+	}
+	if v, ok := row.Config[llmConfigKeyModel].(string); ok && v != "" {
+		model = v
+	}
+	if v, ok := row.Config[llmConfigKeyAPIKey].(string); ok && v != "" {
+		apiKey = v
+	}
+	return endpoint, model, apiKey
 }
 
 // ToolNames lists all registered tool names.
@@ -280,7 +321,8 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	if query == "" {
 		return nil, fmt.Errorf("query is required")
 	}
-	if e.cfg.AISearch.LLMEndpoint == "" {
+	endpoint, model, apiKey := e.ResolveLLMConfig(ctx)
+	if endpoint == "" {
 		return &ParseDatasetQueryResult{Keywords: query, Fallback: true, Reason: "LLM not configured"}, nil
 	}
 
@@ -292,11 +334,11 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	defer cancel()
 
 	headers := map[string]string{}
-	if e.cfg.AISearch.LLMAPIKey != "" {
-		headers["Authorization"] = "Bearer " + e.cfg.AISearch.LLMAPIKey
+	if apiKey != "" {
+		headers["Authorization"] = "Bearer " + apiKey
 	}
-	content, err := e.llm.Chat(llmCtx, e.cfg.AISearch.LLMEndpoint, "", headers, types.LLMReqBody{
-		Model: e.cfg.AISearch.LLMModel,
+	content, err := e.llm.Chat(llmCtx, endpoint, "", headers, types.LLMReqBody{
+		Model: model,
 		Messages: []types.LLMMessage{
 			{Role: "system", Content: parseQueryPrompt},
 			{Role: "user", Content: query},

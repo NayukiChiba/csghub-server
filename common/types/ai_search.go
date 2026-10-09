@@ -39,3 +39,23 @@ type AIChatEvent struct {
 	Text     string           `json:"text,omitempty"`
 	Datasets []DatasetSummary `json:"datasets,omitempty"`
 }
+
+// AISearchLLMConfig is the admin-editable LLM configuration for dataset AI
+// search. It is persisted in agent_configs and overrides the static
+// env/toml configuration field by field.
+type AISearchLLMConfig struct {
+	// LLMEndpoint is the full chat/completions URL of an OpenAI-compatible service.
+	LLMEndpoint string `json:"llm_endpoint"`
+	// LLMModel is the model name sent in chat requests.
+	LLMModel string `json:"llm_model"`
+	// LLMAPIKey is sent as "Authorization: Bearer <key>" when non-empty.
+	LLMAPIKey string `json:"llm_api_key"`
+}
+
+// AISearchLLMTestRequest optionally overrides the saved configuration for a
+// connectivity test; empty fields fall back to the saved/static values.
+type AISearchLLMTestRequest struct {
+	LLMEndpoint string `json:"llm_endpoint,omitempty"`
+	LLMModel    string `json:"llm_model,omitempty"`
+	LLMAPIKey   string `json:"llm_api_key,omitempty"`
+}

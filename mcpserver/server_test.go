@@ -29,7 +29,7 @@ func connectInMemory(t *testing.T, exec *ToolExecutor) *mcp.ClientSession {
 
 func TestMCPServer_ListTools(t *testing.T) {
 	exec, _, _, _ := newTestExecutor()
-	session := connectInMemory(t, exec)       
+	session := connectInMemory(t, exec)
 
 	result, err := session.ListTools(context.Background(), nil)
 	require.NoError(t, err)

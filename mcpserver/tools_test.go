@@ -58,7 +58,7 @@ func newTestExecutor() (*ToolExecutor, *fakeDatasetSearcher, *fakeRepoFileReader
 	ds := &fakeDatasetSearcher{}
 	repo := &fakeRepoFileReader{}
 	tags := &fakeTagLister{}
-	exec := NewToolExecutor(ds, repo, tags, nil, &config.Config{})
+	exec := NewToolExecutor(ds, repo, tags, nil, &config.Config{}, nil)
 	return exec, ds, repo, tags
 }
 

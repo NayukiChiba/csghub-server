@@ -251,6 +251,13 @@ func NewRouter(config *config.Config, enableSwagger bool) (*gin.Engine, error) {
 		component.NewAISearchComponentWithDeps(config, toolExec, llm.NewClient()))
 	apiGroup.POST("/ai/dataset_chat", aiSearchHandler.DatasetChat)
 
+	// admin-editable LLM configuration for dataset AI search
+	aiSearchConfigHandler := handler.NewAISearchConfigHandler(
+		component.NewAISearchConfigComponent(config, toolExec))
+	adminGrp.GET("/ai_search/config", aiSearchConfigHandler.GetLLMConfig)
+	adminGrp.PUT("/ai_search/config", aiSearchConfigHandler.UpdateLLMConfig)
+	adminGrp.POST("/ai_search/test", aiSearchConfigHandler.TestLLMConfig)
+
 	// TODO:use middleware to handle common response
 	//
 	memoryStore := persist.NewMemoryStore(1 * time.Minute)
