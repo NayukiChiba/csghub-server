@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	cache "github.com/chenyahui/gin-cache"
@@ -15,6 +16,8 @@ import (
 	"github.com/go-playground/validator/v10"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 	"opencsg.com/csghub-server/api/handler"
@@ -25,6 +28,7 @@ import (
 	"opencsg.com/csghub-server/builder/analytics"
 	"opencsg.com/csghub-server/builder/deploy"
 	"opencsg.com/csghub-server/builder/instrumentation"
+	"opencsg.com/csghub-server/builder/llm"
 	bldmq "opencsg.com/csghub-server/builder/mq"
 	bldprometheus "opencsg.com/csghub-server/builder/prometheus"
 	"opencsg.com/csghub-server/builder/store/database"
@@ -33,6 +37,7 @@ import (
 	"opencsg.com/csghub-server/common/i18n"
 	"opencsg.com/csghub-server/common/types"
 	"opencsg.com/csghub-server/component"
+	"opencsg.com/csghub-server/mcpserver"
 )
 
 func RunServer(config *config.Config, enableSwagger bool) {
@@ -229,6 +234,22 @@ func NewRouter(config *config.Config, enableSwagger bool) (*gin.Engine, error) {
 
 	versionHandler := handler.NewVersionHandler()
 	apiGroup.GET("/version", versionHandler.Version)
+
+	// dataset AI search: MCP endpoint for external agent frameworks and the
+	// SSE chat endpoint for the portal floating assistant; both are read-only
+	// over public datasets and need no login
+	toolExec, err := component.NewDatasetToolExecutor(config)
+	if err != nil {
+		return nil, fmt.Errorf("error creating dataset tool executor: %w", err)
+	}
+	if config.AISearch.MCPEnabled {
+		mcpHTTPHandler := mcpsdk.NewStreamableHTTPHandler(
+			func(*http.Request) *mcpsdk.Server { return mcpserver.NewDatasetMCPServer(toolExec) }, nil)
+		r.Any("/mcp", gin.WrapH(mcpHTTPHandler))
+	}
+	aiSearchHandler := handler.NewAISearchHandlerWithComponent(
+		component.NewAISearchComponentWithDeps(config, toolExec, llm.NewClient()))
+	apiGroup.POST("/ai/dataset_chat", aiSearchHandler.DatasetChat)
 
 	// TODO:use middleware to handle common response
 	//
