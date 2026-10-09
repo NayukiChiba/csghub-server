@@ -120,16 +120,26 @@ func TestDatasetViewerHandler_Rows(t *testing.T) {
 				tp.Orderby = "c"
 			}
 
-			tester.mocks.datasetViewer.EXPECT().Rows(
-				tester.Gctx().Request.Context(),
-				&common.ViewParquetFileReq{
-					Namespace:   "u",
-					RepoName:    "r",
-					CurrentUser: "u",
-					Per:         12,
-					Page:        6,
-				}, tp,
-			).Return(&common.ViewParquetFileResp{Total: 12}, nil)
+			req := &common.ViewParquetFileReq{
+				Namespace:   "u",
+				RepoName:    "r",
+				CurrentUser: "u",
+				Per:         12,
+				Page:        6,
+			}
+			if param == "search" {
+				tester.mocks.datasetViewer.EXPECT().LimitOffsetRows(
+					tester.Gctx().Request.Context(),
+					req,
+					tp,
+				).Return(&common.ViewParquetFileResp{Total: 12}, nil)
+			} else {
+				tester.mocks.datasetViewer.EXPECT().Rows(
+					tester.Gctx().Request.Context(),
+					req,
+					tp,
+				).Return(&common.ViewParquetFileResp{Total: 12}, nil)
+			}
 			tester.AddPagination(6, 12).WithQuery("config", "a").WithQuery("split", "b")
 			tester.WithQuery(param, "c").WithUser().Execute()
 			tester.ResponseEq(t, 200, tester.OKText, &common.ViewParquetFileResp{Total: 12})

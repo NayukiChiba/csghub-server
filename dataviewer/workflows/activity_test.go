@@ -9,7 +9,9 @@ import (
 	"github.com/mcuadros/go-defaults"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
 	"opencsg.com/csghub-server/builder/git/gitserver"
+	"opencsg.com/csghub-server/builder/parquet"
 	"opencsg.com/csghub-server/builder/store/database"
 	"opencsg.com/csghub-server/builder/store/s3"
 	"opencsg.com/csghub-server/common/config"
@@ -22,11 +24,14 @@ import (
 )
 
 func NewTestDataViewerActivity(cfg *config.Config, gs gitserver.GitServer, s3Client s3.Client, viewerStore database.DataviewerStore) (DataViewerActivity, error) {
+	workflowTracer := otel.Tracer("dataviewer-workflow-test")
 	return &dataViewerActivityImpl{
-		gitServer:   gs,
-		s3Client:    s3Client,
-		cfg:         cfg,
-		viewerStore: viewerStore,
+		gitServer:          gs,
+		s3Client:           s3Client,
+		cfg:                cfg,
+		viewerStore:        viewerStore,
+		parquetS3Reader:    parquet.NewParquetGoReader(parquet.NewMinIOClient(s3Client), workflowTracer, cfg.S3.Bucket),
+		parquetLocalReader: parquet.NewParquetGoReader(&parquet.OSFileClient{}, workflowTracer, ""),
 	}, nil
 }
 

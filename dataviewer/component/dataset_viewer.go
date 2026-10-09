@@ -88,11 +88,6 @@ func (c *datasetViewerComponentImpl) lazyInit(ctx context.Context) error {
 }
 
 func (c *datasetViewerComponentImpl) ViewParquetFile(ctx context.Context, req *dvCom.ViewParquetFileReq) (*dvCom.ViewParquetFileResp, error) {
-	err := c.lazyInit(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to init parquet reader, %w", err)
-	}
-
 	r, err := c.repoStore.FindByPath(ctx, types.DatasetRepo, req.Namespace, req.RepoName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find dataset, error: %w", err)
@@ -111,31 +106,20 @@ func (c *datasetViewerComponentImpl) ViewParquetFile(ctx context.Context, req *d
 		return nil, fmt.Errorf("no valid parquet file in request, %w", err)
 	}
 
-	sqlReq := types.QueryReq{
-		PageSize:  req.Per,
-		PageIndex: req.Page,
-		Search:    "",
-		Where:     "",
-		Orderby:   "",
-	}
-
-	total, err := c.preader.RowCount(ctx, []string{objName}, sqlReq, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get total count of parquet file, %w", err)
-	}
-
-	columns, columnsType, rows, err := c.preader.FetchRows(ctx, []string{objName}, sqlReq, true)
+	offset := max(int64(req.Page-1)*int64(req.Per), 0)
+	columns, columnsType, rows, total, err := c.limitOffsetCountReader.RowsWithCount(
+		ctx, []string{objName}, int64(req.Per), offset,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to view parquet rows, %w", err)
 	}
 
-	resp := &dvCom.ViewParquetFileResp{
+	return &dvCom.ViewParquetFileResp{
 		Columns:     columns,
 		ColumnsType: columnsType,
 		Rows:        rows,
-		Total:       total,
-	}
-	return resp, nil
+		Total:       int(total),
+	}, nil
 }
 
 func (c *datasetViewerComponentImpl) getFilesFromDatasetCard(ctx context.Context, req *dvCom.ViewParquetFileReq, config, split string) ([]string, error) {
@@ -173,8 +157,8 @@ func (c *datasetViewerComponentImpl) getFilesFromDatasetCard(ctx context.Context
 
 }
 
-// Retrieves rows quickly using the parquet-go client. This endpoint only supports limit and offset parameters.
-// For search or sorting, use the Rows method instead. Note that the Rows method performs poorly when only limit/offset is used, especially with large offsets.
+// LimitOffsetRows retrieves rows using parquet-go and echoes the client-side search term.
+// Queries containing server-side filters or sorting use Rows instead.
 func (c *datasetViewerComponentImpl) LimitOffsetRows(ctx context.Context, req *dvCom.ViewParquetFileReq, viewerReq types.DataViewerReq) (*dvCom.ViewParquetFileResp, error) {
 	r, err := c.repoStore.FindByPath(ctx, types.DatasetRepo, req.Namespace, req.RepoName)
 	if err != nil {
@@ -232,6 +216,9 @@ func (c *datasetViewerComponentImpl) LimitOffsetRows(ctx context.Context, req *d
 		ColumnsType: columnTypes,
 		Rows:        rows,
 		Total:       int(total),
+		Orderby:     viewerReq.Orderby,
+		Where:       viewerReq.Where,
+		Search:      viewerReq.Search,
 	}, nil
 
 }
@@ -358,11 +345,6 @@ func (c *datasetViewerComponentImpl) GetCatalog(ctx context.Context, req *dvCom.
 	req.Branch = r.DefaultBranch
 	req.RepoID = r.ID
 	req.Migrated = r.Migrated
-
-	err = c.lazyInit(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to init parquet reader, %w", err)
-	}
 
 	viewerCardData, _, err := c.getViewerCardData(ctx, req, nil)
 	if err != nil {
@@ -753,18 +735,12 @@ func (c *datasetViewerComponentImpl) getFilesRowCount(ctx context.Context, req *
 	if len(parquetObjs) < 1 {
 		return 0
 	}
-	sqlReq := types.QueryReq{
-		PageSize:  10,
-		PageIndex: 1,
-		Search:    "",
-		Orderby:   "",
-	}
 
-	total, err := c.preader.RowCount(ctx, parquetObjs, sqlReq, true)
+	_, _, _, total, err := c.limitOffsetCountReader.RowsWithCount(ctx, parquetObjs, 0, 0)
 	if err != nil {
 		slog.Warn("failed to get parquet row counts", slog.Any("parquetObjs", parquetObjs), slog.Any("error", err))
 	}
-	return total
+	return int(total)
 }
 
 func (c *datasetViewerComponentImpl) getFilesOBJs(ctx context.Context, req *dvCom.ViewParquetFileReq, files []string) []string {

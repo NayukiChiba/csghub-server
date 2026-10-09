@@ -2,10 +2,13 @@ package parquet
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"slices"
+	"strings"
 
 	"github.com/go-pay/errgroup"
 	"github.com/minio/minio-go/v7"
@@ -25,6 +28,7 @@ type ParquetGoReader struct {
 
 type groupReader struct {
 	reader *parquet.GenericReader[row]
+	schema *parquet.Schema
 	limit  int64
 	offset int64
 }
@@ -100,6 +104,7 @@ func (p *ParquetGoReader) build(ctx context.Context, files []*pfile, limit, offs
 				}
 				readers = append(readers, groupReader{
 					reader: parquet.NewGenericRowGroupReader[row](rg),
+					schema: f.pf.Schema(),
 					limit:  groupLimit,
 					offset: groupOffset,
 				})
@@ -144,15 +149,7 @@ func (p *ParquetGoReader) loader(ctx context.Context, paths []string, limit, off
 
 	var total int64
 	rc := []io.Closer{}
-	columns := []string{}
-	columnTypes := []string{}
-	for _, schema := range files[0].pf.Metadata().Schema {
-		if schema.Type == nil {
-			continue
-		}
-		columns = append(columns, schema.Name)
-		columnTypes = append(columnTypes, schema.Type.String())
-	}
+	columns, columnTypes := parquetColumns(files)
 
 	for _, f := range files {
 		total += f.pf.NumRows()
@@ -167,6 +164,40 @@ func (p *ParquetGoReader) loader(ctx context.Context, paths []string, limit, off
 		columnTypes:  columnTypes,
 	}, nil
 
+}
+
+func parquetColumns(files []*pfile) ([]string, []string) {
+	columns := make([]string, 0)
+	columnTypes := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, file := range files {
+		for _, field := range file.pf.Schema().Fields() {
+			if _, ok := seen[field.Name()]; ok {
+				continue
+			}
+			seen[field.Name()] = struct{}{}
+			columns = append(columns, field.Name())
+			columnTypes = append(columnTypes, previewColumnType(field))
+		}
+	}
+	return columns, columnTypes
+}
+
+func previewColumnType(field parquet.Field) string {
+	if field.Leaf() {
+		return field.Type().Kind().String()
+	}
+	if field.Type().String() == "LIST" {
+		return "LIST"
+	}
+	fieldType := field.GoType()
+	for fieldType.Kind() == reflect.Pointer {
+		fieldType = fieldType.Elem()
+	}
+	if fieldType.Kind() == reflect.Slice || fieldType.Kind() == reflect.Array {
+		return "LIST"
+	}
+	return "STRUCT"
 }
 
 func (p *ParquetGoReader) parquetFile(ctx context.Context, path string) (*pfile, error) {
@@ -249,22 +280,85 @@ func (p *ParquetGoReader) RowsWithCount(ctx context.Context, paths []string, lim
 			if i < int(reader.offset) {
 				continue
 			}
-			rr := []any{}
-			for _, cell := range row {
-				if cell.Kind() == parquet.FixedLenByteArray {
-					bytes := cell.ByteArray()
-					if len(bytes) == UUIDLength {
-						uuid := convertUUID(bytes)
-						rr = append(rr, uuid)
-					} else {
-						rr = append(rr, fmt.Sprintf("%x", bytes))
-					}
-				} else {
-					rr = append(rr, cell.String())
-				}
+			var value any
+			if err := reader.schema.Reconstruct(&value, row); err != nil {
+				return nil, nil, nil, 0, fmt.Errorf("reconstruct parquet row: %w", err)
 			}
-			data = append(data, rr)
+			record, ok := value.(map[string]any)
+			if !ok {
+				return nil, nil, nil, 0, fmt.Errorf("reconstruct parquet row: expected object, got %T", value)
+			}
+			values := make([]any, len(loader.columns))
+			for index, column := range loader.columns {
+				values[index] = normalizePreviewValue(record[column], column, loader.columnTypes[index])
+			}
+			data = append(data, values)
 		}
 	}
 	return loader.columns, loader.columnTypes, data, loader.total, nil
+}
+
+func normalizePreviewValue(value any, fieldName, columnType string) any {
+	switch typed := value.(type) {
+	case string:
+		if strings.EqualFold(fieldName, "bytes") {
+			return base64.StdEncoding.EncodeToString([]byte(typed))
+		}
+		if columnType == parquet.ByteArray.String() && isMediaColumn(fieldName) && !isMediaPath(typed) {
+			return base64.StdEncoding.EncodeToString([]byte(typed))
+		}
+		return typed
+	case []byte:
+		if columnType == parquet.FixedLenByteArray.String() && len(typed) == UUIDLength {
+			return convertUUID(typed)
+		}
+		return base64.StdEncoding.EncodeToString(typed)
+	case map[string]any:
+		result := make(map[string]any, len(typed))
+		for key, item := range typed {
+			result[key] = normalizePreviewValue(item, key, "")
+		}
+		return result
+	case []any:
+		result := make([]any, len(typed))
+		for index, item := range typed {
+			result[index] = normalizePreviewValue(item, fieldName, "")
+		}
+		return result
+	}
+
+	reflected := reflect.ValueOf(value)
+	if reflected.IsValid() && reflected.Kind() == reflect.Array && reflected.Type().Elem().Kind() == reflect.Uint8 {
+		bytes := make([]byte, reflected.Len())
+		reflect.Copy(reflect.ValueOf(bytes), reflected)
+		if columnType == parquet.FixedLenByteArray.String() && len(bytes) == UUIDLength {
+			return convertUUID(bytes)
+		}
+		return base64.StdEncoding.EncodeToString(bytes)
+	}
+	return value
+}
+
+func isMediaColumn(name string) bool {
+	normalized := strings.ToLower(name)
+	for _, suffix := range []string{"image", "images", "audio", "video", "videos"} {
+		if normalized == suffix || strings.HasSuffix(normalized, "_"+suffix) || strings.HasSuffix(normalized, "-"+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isMediaPath(value string) bool {
+	cleanValue := strings.ToLower(strings.SplitN(strings.SplitN(value, "?", 2)[0], "#", 2)[0])
+	for _, extension := range []string{
+		".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp",
+		".aac", ".flac", ".m4a", ".mp3", ".oga", ".ogg", ".opus", ".wav",
+		".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".ogv", ".webm",
+	} {
+		if strings.HasSuffix(cleanValue, extension) {
+			return true
+		}
+	}
+	return false
 }

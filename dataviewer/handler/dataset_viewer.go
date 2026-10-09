@@ -193,7 +193,7 @@ func (h *DatasetViewerHandler) Rows(ctx *gin.Context) {
 
 	var rows *dvCom.ViewParquetFileResp
 	// simple limit offset request, use the fast RowsLimited method
-	if viewReq.Orderby == "" && viewReq.Search == "" && viewReq.Where == "" {
+	if viewReq.Orderby == "" && viewReq.Where == "" {
 		rows, err = h.viewer.LimitOffsetRows(ctx.Request.Context(), req, viewReq)
 	} else {
 		rows, err = h.viewer.Rows(ctx.Request.Context(), req, viewReq)

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/minio/minio-go/v7"
+	"go.opentelemetry.io/otel"
 	"go.temporal.io/sdk/activity"
 	"gopkg.in/yaml.v2"
 	"opencsg.com/csghub-server/builder/git/gitserver"
@@ -39,6 +40,7 @@ type DataViewerActivity interface {
 	CreateParquetBranch(ctx context.Context, req types.UpdateViewerReq) (string, error)
 	CopyParquetFiles(ctx context.Context, copyReq dvCom.CopyParquetReq) (*dvCom.CardData, error)
 	DownloadSplitFiles(ctx context.Context, downloadReq dvCom.DownloadFileReq) (*dvCom.DownloadCard, error)
+	WriteMediaIndexFiles(ctx context.Context, downloadReq dvCom.DownloadFileReq) (*dvCom.DownloadCard, error)
 	ConvertToParquetFiles(ctx context.Context, convertReq dvCom.ConvertReq) error
 	UploadParquetFiles(ctx context.Context, uploadReq dvCom.UploadParquetReq) (*dvCom.CardData, error)
 	UpdateCardData(ctx context.Context, cardReq dvCom.UpdateCardReq) error
@@ -49,11 +51,13 @@ type DataViewerActivity interface {
 }
 
 type dataViewerActivityImpl struct {
-	gitServer    gitserver.GitServer
-	s3Client     s3.Client
-	cfg          *config.Config
-	viewerStore  database.DataviewerStore
-	lfsMetaStore database.LfsMetaObjectStore
+	gitServer          gitserver.GitServer
+	s3Client           s3.Client
+	cfg                *config.Config
+	viewerStore        database.DataviewerStore
+	lfsMetaStore       database.LfsMetaObjectStore
+	parquetS3Reader    parquet.LimitOffsetCountReader
+	parquetLocalReader parquet.LimitOffsetCountReader
 }
 
 func NewDataViewerActivity(cfg *config.Config, gs gitserver.GitServer) (DataViewerActivity, error) {
@@ -61,12 +65,15 @@ func NewDataViewerActivity(cfg *config.Config, gs gitserver.GitServer) (DataView
 	if err != nil {
 		return nil, fmt.Errorf("fail to init s3 client for data viewer, error: %w", err)
 	}
+	workflowTracer := otel.Tracer("dataviewer-workflow")
 	return &dataViewerActivityImpl{
-		gitServer:    gs,
-		s3Client:     s3Client,
-		cfg:          cfg,
-		viewerStore:  database.NewDataviewerStore(),
-		lfsMetaStore: database.NewLfsMetaObjectStore(),
+		gitServer:          gs,
+		s3Client:           s3Client,
+		cfg:                cfg,
+		viewerStore:        database.NewDataviewerStore(),
+		lfsMetaStore:       database.NewLfsMetaObjectStore(),
+		parquetS3Reader:    parquet.NewParquetGoReader(parquet.NewMinIOClient(s3Client), workflowTracer, cfg.S3.Bucket),
+		parquetLocalReader: parquet.NewParquetGoReader(&parquet.OSFileClient{}, workflowTracer, ""),
 	}, nil
 }
 
@@ -134,9 +141,11 @@ func (dva *dataViewerActivityImpl) ScanRepoFiles(ctx context.Context, scanParam 
 		ParquetFiles:     make(map[string]*dvCom.RepoFile),
 		JsonlFiles:       make(map[string]*dvCom.RepoFile),
 		CsvFiles:         make(map[string]*dvCom.RepoFile),
+		MediaFiles:       make(map[string]*dvCom.RepoFile),
 		TotalParquetSize: 0,
 		TotalJsonSize:    0,
 		TotalCsvSize:     0,
+		TotalMediaSize:   0,
 	}
 
 	var cursor string
@@ -280,6 +289,8 @@ func (dva *dataViewerActivityImpl) DetermineCardData(ctx context.Context, determ
 		scopeFiles = determineParam.Class.JsonlFiles
 	case RepoCsvData:
 		scopeFiles = determineParam.Class.CsvFiles
+	case RepoMediaData:
+		scopeFiles = determineParam.Class.MediaFiles
 	}
 	if len(scopeFiles) < 1 {
 		slog.Warn("no valid target files found", slog.Any("card", determineParam.Card))
@@ -442,10 +453,6 @@ func (dva *dataViewerActivityImpl) CreateParquetBranch(ctx context.Context, req 
 }
 
 func (dva *dataViewerActivityImpl) CopyParquetFiles(ctx context.Context, copyReq dvCom.CopyParquetReq) (*dvCom.CardData, error) {
-	r, err := parquet.NewS3Reader(ctx, dva.cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create duckdb reader, cause: %w", err)
-	}
 	var paths []string
 	for _, info := range copyReq.ComputedCardData.DatasetInfos {
 		for _, split := range info.Splits {
@@ -542,7 +549,8 @@ func (dva *dataViewerActivityImpl) CopyParquetFiles(ctx context.Context, copyReq
 					objectNames = append(objectNames, objectKey)
 					// objectNames = append(objectNames, filepath.Join("lfs", orginfile.LfsRelativePath))
 				}
-				count, err = r.RowCount(ctx, objectNames, types.QueryReq{}, true)
+				_, _, _, rowCount, countErr := dva.parquetS3Reader.RowsWithCount(ctx, objectNames, 0, 0)
+				count, err = int(rowCount), countErr
 				if err != nil {
 					slog.Error("get S3 row count error", slog.Any("req", copyReq.Req),
 						slog.Any("config", info.ConfigName), slog.Any("split", split.Name),
@@ -650,6 +658,83 @@ func (dva *dataViewerActivityImpl) DownloadSplitFiles(ctx context.Context, downl
 		subsets = append(subsets, newSubset)
 	}
 	return &dvCom.DownloadCard{Configs: downloadReq.Card.Configs, Subsets: subsets}, nil
+}
+
+// WriteMediaIndexFiles builds local JSONL index files listing the repo-relative paths of
+// media files (image/audio/video) for each config split, so the follow-up
+// ConvertToParquetFiles activity can turn them into previewable parquet rows
+// without downloading the media binaries.
+func (dva *dataViewerActivityImpl) WriteMediaIndexFiles(ctx context.Context, downloadReq dvCom.DownloadFileReq) (*dvCom.DownloadCard, error) {
+	var subsets []dvCom.DownloadSubset
+	cacheRepoPath := GetCacheRepoPath(ctx, dva.cfg.DataViewer.CacheDir, downloadReq.Req)
+	if _, err := os.Stat(cacheRepoPath); err == nil {
+		if err := os.RemoveAll(cacheRepoPath); err != nil {
+			return nil, fmt.Errorf("failed to remove cache repo path %s for media index file, cause: %w", cacheRepoPath, err)
+		}
+	}
+	if err := os.MkdirAll(cacheRepoPath, os.ModePerm); err != nil {
+		return nil, fmt.Errorf("failed to create cache repo path %s for media index file, cause: %w", cacheRepoPath, err)
+	}
+
+	for _, info := range downloadReq.Card.DatasetInfos {
+		newSplits := []dvCom.DownloadSplit{}
+		for _, split := range info.Splits {
+			if len(split.Origins) < 1 {
+				continue
+			}
+			splitPath := fmt.Sprintf("%s/%s/%s", cacheRepoPath, info.ConfigName, split.Name)
+			if err := os.MkdirAll(splitPath, os.ModePerm); err != nil {
+				return nil, fmt.Errorf("failed to create cache split path %s for media index file, cause: %w", splitPath, err)
+			}
+			localFileName := fmt.Sprintf("00000%s", FileExtName.Jsonl)
+			localFileFullPath := fmt.Sprintf("%s/%s", splitPath, localFileName)
+			size, err := writeMediaIndexFile(localFileFullPath, split.Origins)
+			if err != nil {
+				return nil, fmt.Errorf("failed to write media index file %s for repo %s/%s, cause: %w",
+					localFileFullPath, downloadReq.Req.Namespace, downloadReq.Req.Name, err)
+			}
+			newFiles := []dvCom.FileObject{{
+				RepoFile:      localFileFullPath,
+				Size:          size,
+				DownloadSize:  size,
+				LocalRepoPath: cacheRepoPath,
+				LocalFileName: localFileName,
+				SubsetName:    info.ConfigName,
+				SplitName:     split.Name,
+			}}
+			exportPath := fmt.Sprintf("%s_export", splitPath)
+			newSplits = append(newSplits, dvCom.DownloadSplit{Name: split.Name, LocalPath: splitPath, ExportPath: exportPath, Files: newFiles})
+		}
+		subsets = append(subsets, dvCom.DownloadSubset{ConfigName: info.ConfigName, Splits: newSplits})
+	}
+	return &dvCom.DownloadCard{Configs: downloadReq.Card.Configs, Subsets: subsets}, nil
+}
+
+// writeMediaIndexFile writes one JSON object per media file, using duckdb's
+// read_json_auto friendly lines format to avoid the header-sniffing ambiguity
+// of single-column CSV files.
+func writeMediaIndexFile(localFileFullPath string, origins []dvCom.FileObject) (int64, error) {
+	writeFile, err := os.Create(localFileFullPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create local file %s, error: %w", localFileFullPath, err)
+	}
+	defer writeFile.Close()
+
+	for _, origin := range origins {
+		line, err := json.Marshal(map[string]string{"file": origin.RepoFile})
+		if err != nil {
+			return 0, fmt.Errorf("failed to marshal media file path %s, error: %w", origin.RepoFile, err)
+		}
+		if _, err := writeFile.Write(append(line, '\n')); err != nil {
+			return 0, fmt.Errorf("failed to write row to file %s, error: %w", localFileFullPath, err)
+		}
+	}
+
+	fileInfo, err := os.Stat(localFileFullPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat file %s, error: %w", localFileFullPath, err)
+	}
+	return fileInfo.Size(), nil
 }
 
 func (dva *dataViewerActivityImpl) downloadFile(ctx context.Context, req types.UpdateViewerReq, orginFile dvCom.FileObject, loadFile *dvCom.FileObject, fileExtName string) (*dvCom.FileObject, error) {
@@ -806,7 +891,7 @@ func (dva *dataViewerActivityImpl) ConvertToParquetFiles(ctx context.Context, co
 			}
 			method := ""
 			switch convertReq.RepoDataType {
-			case RepoJsonData:
+			case RepoJsonData, RepoMediaData:
 				method = "read_json_auto"
 			case RepoCsvData:
 				method = "read_csv_auto"
@@ -861,10 +946,6 @@ func collectUploadParquetPaths(uploadReq dvCom.UploadParquetReq) ([]string, erro
 }
 
 func (dva *dataViewerActivityImpl) UploadParquetFiles(ctx context.Context, uploadReq dvCom.UploadParquetReq) (*dvCom.CardData, error) {
-	r, err := parquet.NewS3Reader(ctx, dva.cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create duckdb reader, cause: %w", err)
-	}
 	paths, err := collectUploadParquetPaths(uploadReq)
 	if err != nil {
 		return nil, err
@@ -937,7 +1018,8 @@ func (dva *dataViewerActivityImpl) UploadParquetFiles(ctx context.Context, uploa
 					objectNames = append(objectNames, realFile)
 				}
 			}
-			count, err := r.RowCount(ctx, objectNames, types.QueryReq{}, false)
+			_, _, _, rowCount, err := dva.parquetLocalReader.RowsWithCount(ctx, objectNames, 0, 0)
+			count := int(rowCount)
 			if err != nil {
 				slog.Error("get row count error", slog.Any("req", uploadReq.Req),
 					slog.Any("config", subset.ConfigName), slog.Any("split", split.Name),

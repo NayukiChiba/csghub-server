@@ -2,15 +2,31 @@ package parquet_test
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	parquetgo "github.com/parquet-go/parquet-go"
 	"github.com/spf13/cast"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	"opencsg.com/csghub-server/builder/parquet"
 )
+
+type mediaValue struct {
+	Bytes []byte `parquet:"bytes"`
+	Path  string `parquet:"path"`
+}
+
+type multimodalRow struct {
+	ID     int64      `parquet:"id"`
+	Image  mediaValue `parquet:"image"`
+	Audio  mediaValue `parquet:"audio"`
+	Video  []byte     `parquet:"video"`
+	Labels []string   `parquet:"labels,list"`
+}
 
 func initReader() *parquet.ParquetGoReader {
 	return parquet.NewParquetGoReader(&parquet.OSFileClient{}, otel.Tracer("test"), "")
@@ -104,4 +120,49 @@ func TestGoReader_UUID(t *testing.T) {
 
 	})
 
+}
+
+func TestGoReader_MultimodalNestedColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "multimodal.parquet")
+	imageBytes := []byte("sixteen-byte-img")
+	audioBytes := []byte("audio-content")
+	videoBytes := []byte("video-content")
+	err := parquetgo.WriteFile(path, []multimodalRow{{
+		ID: 1,
+		Image: mediaValue{
+			Bytes: imageBytes,
+			Path:  "images/example.png",
+		},
+		Audio: mediaValue{
+			Bytes: audioBytes,
+			Path:  "audio/example.wav",
+		},
+		Video:  videoBytes,
+		Labels: []string{"cat", "speech"},
+	}})
+	require.NoError(t, err)
+
+	columns, columnTypes, data, total, err := initReader().RowsWithCount(
+		context.Background(),
+		[]string{path},
+		10,
+		0,
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{"id", "image", "audio", "video", "labels"}, columns)
+	require.Equal(t, []string{"INT64", "STRUCT", "STRUCT", "BYTE_ARRAY", "LIST"}, columnTypes)
+	require.Equal(t, int64(1), total)
+	require.Len(t, data, 1)
+
+	image, ok := data[0][1].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, base64.StdEncoding.EncodeToString(imageBytes), image["bytes"])
+	require.Equal(t, "images/example.png", image["path"])
+
+	audio, ok := data[0][2].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, base64.StdEncoding.EncodeToString(audioBytes), audio["bytes"])
+	require.Equal(t, "audio/example.wav", audio["path"])
+	require.Equal(t, base64.StdEncoding.EncodeToString(videoBytes), data[0][3])
+	require.Equal(t, []any{"cat", "speech"}, data[0][4])
 }
