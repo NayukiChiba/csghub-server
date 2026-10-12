@@ -44,18 +44,6 @@ const (
 	defaultPerPage     = 10
 )
 
-// modalityKeywords augments keyword search for a requested data modality. Tags
-// are the precise filter (AND semantics in the store layer), so modality terms
-// are added as keywords instead; agents can combine list_dataset_tags with the
-// tags parameter for exact task-tag matching.
-var modalityKeywords = map[string]string{
-	"image": "image",
-	"audio": "audio speech voice sound",
-	"video": "video",
-	"text":  "text nlp language",
-	"3d":    "3d point cloud",
-}
-
 // ToolExecutor executes the dataset search tools. It is shared by the MCP
 // server and the in-process chat agent loop.
 type ToolExecutor struct {
@@ -129,10 +117,10 @@ type TagArg struct {
 }
 
 type SearchDatasetsArgs struct {
-	Keywords     string   `json:"keywords,omitempty" jsonschema:"search keywords matched against dataset name and description; multiple words are space-separated"`
+	Keywords     string   `json:"keywords,omitempty" jsonschema:"search terms matched against dataset name and description; space-separated, chinese or english; synonyms are expanded automatically"`
 	Tags         []TagArg `json:"tags,omitempty" jsonschema:"exact tag filters (AND-combined); discover valid values with list_dataset_tags"`
-	Modality     string   `json:"modality,omitempty" jsonschema:"data modality filter: image, audio, video, text or 3d; augments keywords"`
-	Language     string   `json:"language,omitempty" jsonschema:"natural language of the dataset content, e.g. chinese, english; augments keywords"`
+	Modality     string   `json:"modality,omitempty" jsonschema:"data modality filter: image, audio, video, text, 3d or multimodal; expanded to synonyms and matched against name and description"`
+	Language     string   `json:"language,omitempty" jsonschema:"natural language of the dataset content, e.g. chinese, english, 中文; expanded to synonyms"`
 	MinSizeBytes *int64   `json:"min_size_bytes,omitempty" jsonschema:"minimum repository size in bytes"`
 	MaxSizeBytes *int64   `json:"max_size_bytes,omitempty" jsonschema:"maximum repository size in bytes"`
 	Sort         string   `json:"sort,omitempty" jsonschema:"sort order: trending, recently_update, most_download, most_favorite or most_star"`
@@ -143,6 +131,10 @@ type SearchDatasetsArgs struct {
 type SearchDatasetsResult struct {
 	Total    int                    `json:"total"`
 	Datasets []types.DatasetSummary `json:"datasets"`
+	// Relaxed is true when the strict term-group search found nothing and the
+	// result comes from the OR-combined fallback (lower precision, ranked by
+	// relevance). Agents should mention this when presenting results.
+	Relaxed bool `json:"relaxed,omitempty"`
 }
 
 func summarize(ds *types.Dataset) types.DatasetSummary {
@@ -167,26 +159,39 @@ func summarize(ds *types.Dataset) types.DatasetSummary {
 }
 
 func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsArgs) (*SearchDatasetsResult, error) {
-	keywords := strings.TrimSpace(args.Keywords)
-	if kw, ok := modalityKeywords[strings.ToLower(args.Modality)]; ok {
-		keywords = strings.TrimSpace(keywords + " " + kw)
+	kwGroups := buildKeywordGroups(args.Keywords)
+	var auxGroups [][]string
+	if m := strings.ToLower(strings.TrimSpace(args.Modality)); m != "" {
+		auxGroups = append(auxGroups, expandToken(m))
 	}
-	if lang := strings.TrimSpace(args.Language); lang != "" {
-		keywords = strings.TrimSpace(keywords + " " + lang)
+	if lang := strings.ToLower(strings.TrimSpace(args.Language)); lang != "" {
+		auxGroups = append(auxGroups, expandToken(lang))
 	}
 
-	filter := &types.RepoFilter{
-		Search:      keywords,
-		RepoSizeMin: args.MinSizeBytes,
-		RepoSizeMax: args.MaxSizeBytes,
-		Sort:        args.Sort,
-	}
-	for _, t := range args.Tags {
-		filter.Tags = append(filter.Tags, types.TagReq{
-			Category: t.Category,
-			Name:     t.Name,
-			Group:    t.Group,
-		})
+	newFilter := func(groups [][]string, any bool) *types.RepoFilter {
+		// Search mirrors the raw query text: it keeps the store layer on the
+		// full-text branch (which requires a non-empty Search) and
+		// participates in the cache key alongside the groups.
+		search := strings.ToLower(strings.TrimSpace(args.Keywords))
+		if search == "" && len(groups) > 0 {
+			search = strings.ToLower(strings.TrimSpace(args.Modality + " " + args.Language))
+		}
+		filter := &types.RepoFilter{
+			Search:       search,
+			SearchGroups: groups,
+			SearchAny:    any,
+			RepoSizeMin:  args.MinSizeBytes,
+			RepoSizeMax:  args.MaxSizeBytes,
+			Sort:         args.Sort,
+		}
+		for _, t := range args.Tags {
+			filter.Tags = append(filter.Tags, types.TagReq{
+				Category: t.Category,
+				Name:     t.Name,
+				Group:    t.Group,
+			})
+		}
+		return filter
 	}
 
 	per := args.Per
@@ -201,15 +206,44 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		page = 1
 	}
 
-	datasets, total, err := e.datasets.Index(ctx, filter, per, page, false)
-	if err != nil {
-		return nil, fmt.Errorf("search datasets: %w", err)
+	allGroups := append(append([][]string{}, kwGroups...), auxGroups...)
+
+	// Precision-to-recall cascade:
+	//  1. strict AND over keyword + modality/language groups
+	//  2. strict AND over keyword groups only (auxiliary groups dropped)
+	//  3. relaxed OR over all groups, ranked by relevance
+	type attempt struct {
+		groups  [][]string
+		any     bool
+		relaxed bool
 	}
-	result := &SearchDatasetsResult{Total: total}
-	for _, ds := range datasets {
-		result.Datasets = append(result.Datasets, summarize(ds))
+	var attempts []attempt
+	if len(allGroups) > 0 {
+		attempts = append(attempts, attempt{groups: allGroups})
+		if len(auxGroups) > 0 && len(kwGroups) > 0 {
+			attempts = append(attempts, attempt{groups: kwGroups})
+		}
+		attempts = append(attempts, attempt{groups: allGroups, any: true, relaxed: true})
+	} else {
+		attempts = append(attempts, attempt{})
 	}
-	return result, nil
+
+	for i, att := range attempts {
+		filter := newFilter(att.groups, att.any)
+		datasets, total, err := e.datasets.Index(ctx, filter, per, page, false)
+		if err != nil {
+			return nil, fmt.Errorf("search datasets: %w", err)
+		}
+		if total == 0 && i < len(attempts)-1 {
+			continue
+		}
+		result := &SearchDatasetsResult{Total: total, Relaxed: att.relaxed && total > 0}
+		for _, ds := range datasets {
+			result.Datasets = append(result.Datasets, summarize(ds))
+		}
+		return result, nil
+	}
+	return &SearchDatasetsResult{}, nil
 }
 
 // ---------- list_dataset_tags ----------

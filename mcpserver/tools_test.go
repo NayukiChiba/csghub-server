@@ -18,10 +18,18 @@ type fakeDatasetSearcher struct {
 	err      error
 	// lastFilter records the filter of the most recent Index call
 	lastFilter *types.RepoFilter
+	// filters records every Index call, for cascade tests
+	filters []*types.RepoFilter
+	// indexFn, when set, overrides the static datasets/total response
+	indexFn func(filter *types.RepoFilter) ([]*types.Dataset, int, error)
 }
 
 func (f *fakeDatasetSearcher) Index(ctx context.Context, filter *types.RepoFilter, per, page int, needOpWeight bool) ([]*types.Dataset, int, error) {
 	f.lastFilter = filter
+	f.filters = append(f.filters, filter)
+	if f.indexFn != nil {
+		return f.indexFn(filter)
+	}
 	return f.datasets, f.total, f.err
 }
 
@@ -85,11 +93,71 @@ func TestSearchDatasets_BuildsFilter(t *testing.T) {
 	require.Len(t, result.Datasets, 1)
 	require.Equal(t, "root", result.Datasets[0].Namespace)
 	require.Equal(t, "speech-zh", result.Datasets[0].Name)
+	require.False(t, result.Relaxed)
 
-	// modality and language augment the keyword string
-	require.Equal(t, "speech audio speech voice sound chinese", ds.lastFilter.Search)
+	// strict attempt: keyword, modality and language become AND-combined
+	// synonym groups; Search keeps the raw keywords
+	require.Equal(t, "speech", ds.lastFilter.Search)
+	require.False(t, ds.lastFilter.SearchAny)
+	require.Len(t, ds.lastFilter.SearchGroups, 3)
+	require.Contains(t, ds.lastFilter.SearchGroups[0], "speech")
+	require.Contains(t, ds.lastFilter.SearchGroups[1], "音频")
+	require.Contains(t, ds.lastFilter.SearchGroups[2], "中文")
 	require.Equal(t, &maxSize, ds.lastFilter.RepoSizeMax)
 	require.Equal(t, "trending", ds.lastFilter.Sort)
+}
+
+func TestSearchDatasets_CascadeDropsAuxGroups(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	// strict with modality finds nothing; keyword-only strict hits
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if len(filter.SearchGroups) == 1 {
+			return []*types.Dataset{{Path: "root/speech-zh", Name: "speech-zh"}}, 1, nil
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "speech",
+		Modality: "audio",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.False(t, result.Relaxed)
+	require.Len(t, ds.filters, 2)
+	require.Len(t, ds.filters[0].SearchGroups, 2)
+	require.Len(t, ds.filters[1].SearchGroups, 1)
+}
+
+func TestSearchDatasets_RelaxedFallback(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if filter.SearchAny {
+			return []*types.Dataset{{Path: "root/speech-zh", Name: "speech-zh"}}, 1, nil
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "speech",
+		Modality: "audio",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.True(t, result.Relaxed)
+	require.True(t, ds.lastFilter.SearchAny)
+	// strict, aux-dropped, relaxed
+	require.Len(t, ds.filters, 3)
+}
+
+func TestSearchDatasets_ModalityOnlySynthesizesSearch(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Modality: "image"})
+	require.NoError(t, err)
+	// the store layer's full-text branch requires a non-empty Search
+	require.NotEmpty(t, ds.lastFilter.Search)
+	require.Len(t, ds.lastFilter.SearchGroups, 1)
+	require.Contains(t, ds.lastFilter.SearchGroups[0], "图像")
 }
 
 func TestSearchDatasets_TagsAndPaginationCaps(t *testing.T) {
