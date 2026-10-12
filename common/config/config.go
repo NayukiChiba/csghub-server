@@ -266,15 +266,13 @@ type Config struct {
 
 	// AISearch holds the dataset natural-language search settings: the MCP
 	// server exposing dataset search tools, and the LLM used by the AI chat
-	// agent loop and the server-side NL parse tool. When LLMEndpoint is empty,
-	// the AI chat falls back to plain keyword search.
+	// query parsing. When LLMEndpoint is empty, the AI chat falls back to
+	// plain keyword search.
 	AISearch struct {
 		// MCPEnabled exposes the dataset search MCP endpoint at /mcp.
 		MCPEnabled bool `env:"STARHUB_SERVER_AI_SEARCH_MCP_ENABLED" default:"true"`
-		// TimeoutMS bounds a single LLM call in the chat agent loop.
+		// TimeoutMS bounds a single LLM call.
 		TimeoutMS int `env:"STARHUB_SERVER_AI_SEARCH_TIMEOUT_MS" default:"30000"`
-		// MaxToolIter caps tool-calling rounds of the chat agent loop.
-		MaxToolIter int `env:"STARHUB_SERVER_AI_SEARCH_MAX_TOOL_ITER" default:"8"`
 		// LLMEndpoint is the full chat/completions URL of an OpenAI-compatible service.
 		LLMEndpoint string `env:"STARHUB_SERVER_AI_SEARCH_LLM_ENDPOINT" default:""`
 		// LLMModel is the model name sent in chat requests.

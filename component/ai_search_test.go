@@ -3,6 +3,7 @@ package component
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/mock"
@@ -17,9 +18,12 @@ import (
 type aiSearchFakeDatasets struct {
 	datasets []*types.Dataset
 	total    int
+	// lastFilter records the filter of the most recent Index call
+	lastFilter *types.RepoFilter
 }
 
 func (f *aiSearchFakeDatasets) Index(ctx context.Context, filter *types.RepoFilter, per, page int, needOpWeight bool) ([]*types.Dataset, int, error) {
+	f.lastFilter = filter
 	return f.datasets, f.total, nil
 }
 
@@ -39,10 +43,10 @@ func (f *aiSearchFakeTags) AllDatasetTags(ctx context.Context) ([]*database.Tag,
 	return nil, nil
 }
 
-func newAISearchTestComponent(cfg *config.Config, datasets []*types.Dataset, total int, llmClient *mockllm.MockLLMSvcClient) AISearchComponent {
-	exec := mcpserver.NewToolExecutor(&aiSearchFakeDatasets{datasets: datasets, total: total},
-		&aiSearchFakeRepo{}, &aiSearchFakeTags{}, llmClient, cfg, nil)
-	return NewAISearchComponentWithDeps(cfg, exec, llmClient)
+func newAISearchTestComponent(cfg *config.Config, datasets []*types.Dataset, total int, llmClient *mockllm.MockLLMSvcClient) (AISearchComponent, *aiSearchFakeDatasets) {
+	ds := &aiSearchFakeDatasets{datasets: datasets, total: total}
+	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, &aiSearchFakeTags{}, llmClient, cfg, nil)
+	return NewAISearchComponentWithDeps(cfg, exec), ds
 }
 
 func collectEvents(t *testing.T, comp AISearchComponent, req *types.AIChatRequest) []types.AIChatEvent {
@@ -58,101 +62,95 @@ func collectEvents(t *testing.T, comp AISearchComponent, req *types.AIChatReques
 
 func TestAISearchChat_FallbackWhenLLMNotConfigured(t *testing.T) {
 	cfg := &config.Config{}
-	comp := newAISearchTestComponent(cfg, []*types.Dataset{{Path: "root/demo", Name: "demo"}}, 1, nil)
+	comp, _ := newAISearchTestComponent(cfg, []*types.Dataset{{Path: "root/demo", Name: "demo"}}, 1, nil)
 
 	events := collectEvents(t, comp, &types.AIChatRequest{Message: "demo"})
 	require.Len(t, events, 2)
 	require.Equal(t, types.AIChatEventText, events[0].Type)
-	require.Contains(t, events[0].Text, "关键词")
+	require.Contains(t, events[0].Text, "AI 解析暂不可用")
+	require.Contains(t, events[0].Text, "为您找到 1 个")
 	require.Equal(t, types.AIChatEventDatasets, events[1].Type)
 	require.Equal(t, "root/demo", events[1].Datasets[0].Namespace+"/"+events[1].Datasets[0].Name)
 }
 
-func TestAISearchChat_FallbackZeroResults(t *testing.T) {
+func TestAISearchChat_ZeroResults(t *testing.T) {
 	cfg := &config.Config{}
-	comp := newAISearchTestComponent(cfg, nil, 0, nil)
+	comp, _ := newAISearchTestComponent(cfg, nil, 0, nil)
 
 	events := collectEvents(t, comp, &types.AIChatRequest{Message: "火星土壤样本"})
 	require.Len(t, events, 1)
 	require.Contains(t, events[0].Text, "没有找到")
 }
 
-func TestAISearchChat_AgentLoopWithToolCall(t *testing.T) {
+func TestAISearchChat_SingleParseThenSearch(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
 	cfg.AISearch.LLMModel = "test-model"
 	llmClient := mockllm.NewMockLLMSvcClient(t)
-	comp := newAISearchTestComponent(cfg,
+	comp, ds := newAISearchTestComponent(cfg,
 		[]*types.Dataset{{Path: "root/speech-zh", Name: "speech-zh"}}, 1, llmClient)
 
-	// first round: model requests search_datasets
-	llmClient.EXPECT().ChatCompletion(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return(&types.ChatCompletion{Choices: []types.Choice{{Message: types.Message{
-			Role: "assistant",
-			ToolCalls: []types.LLMToolCall{{
-				ID:   "call-1",
-				Type: "function",
-				Function: types.LLMToolCallFunction{
-					Name:      "search_datasets",
-					Arguments: `{"keywords":"speech"}`,
-				},
-			}},
-		}}}}, nil).Once()
-	// second round: model answers with final text
-	llmClient.EXPECT().ChatCompletion(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return(&types.ChatCompletion{Choices: []types.Choice{{Message: types.Message{
-			Role:    "assistant",
-			Content: "找到一个中文语音数据集：root/speech-zh",
-		}}}}, nil).Once()
+	// exactly one LLM call: parse the query into structured filters
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"speech","modality":"audio","language":"chinese","reason":"中文语音数据集"}`, nil).Once()
 
 	events := collectEvents(t, comp, &types.AIChatRequest{Message: "有没有中文语音数据集"})
 	require.Len(t, events, 2)
-	require.Equal(t, types.AIChatEventText, events[0].Type)
-	require.Contains(t, events[0].Text, "root/speech-zh")
+	require.Contains(t, events[0].Text, "中文语音数据集")
+	require.Contains(t, events[0].Text, "为您找到 1 个")
 	require.Equal(t, types.AIChatEventDatasets, events[1].Type)
 	require.Len(t, events[1].Datasets, 1)
+
+	// parsed filters are forwarded to the search
+	require.Equal(t, "speech", ds.lastFilter.Search)
+	require.Len(t, ds.lastFilter.SearchGroups, 3)
 }
 
 func TestAISearchChat_FallbackWhenLLMFails(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
 	llmClient := mockllm.NewMockLLMSvcClient(t)
-	comp := newAISearchTestComponent(cfg, nil, 0, llmClient)
+	comp, ds := newAISearchTestComponent(cfg, nil, 0, llmClient)
 
-	llmClient.EXPECT().ChatCompletion(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return(nil, errors.New("llm unavailable")).Once()
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return("", errors.New("llm unavailable")).Once()
 
 	events := collectEvents(t, comp, &types.AIChatRequest{Message: "语音"})
 	require.Len(t, events, 1)
-	require.Equal(t, types.AIChatEventText, events[0].Type)
-	require.Contains(t, events[0].Text, "关键词")
+	require.Contains(t, events[0].Text, "AI 解析暂不可用")
+	// raw message used as keywords
+	require.Equal(t, "语音", ds.lastFilter.Search)
 }
 
-func TestAISearchChat_MaxToolIterTruncation(t *testing.T) {
+func TestAISearchChat_HistoryFoldedIntoParseQuery(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
-	cfg.AISearch.MaxToolIter = 2
 	llmClient := mockllm.NewMockLLMSvcClient(t)
-	comp := newAISearchTestComponent(cfg, nil, 0, llmClient)
+	comp, _ := newAISearchTestComponent(cfg, nil, 0, llmClient)
 
-	// model keeps requesting tools without ever producing a final answer
-	llmClient.EXPECT().ChatCompletion(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return(&types.ChatCompletion{Choices: []types.Choice{{Message: types.Message{
-			Role: "assistant",
-			ToolCalls: []types.LLMToolCall{{
-				ID:       "call-x",
-				Type:     "function",
-				Function: types.LLMToolCallFunction{Name: "list_dataset_tags", Arguments: `{}`},
-			}},
-		}}}}, nil)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.MatchedBy(func(req types.LLMReqBody) bool {
+		return len(req.Messages) == 2 && req.Messages[1].Role == "user" &&
+			containsAll(req.Messages[1].Content, "对话上下文", "图像数据集", "当前问题：那视频的呢？")
+	})).Return(`{"keywords":"video","modality":"video"}`, nil).Once()
 
-	events := collectEvents(t, comp, &types.AIChatRequest{Message: "随便找找"})
+	events := collectEvents(t, comp, &types.AIChatRequest{
+		Message: "那视频的呢？",
+		History: []types.AIChatMessage{{Role: "user", Content: "有没有图像数据集"}, {Role: "assistant", Content: "找到这些图像数据集"}},
+	})
 	require.Len(t, events, 1)
-	require.Equal(t, types.AIChatEventText, events[0].Type)
 }
 
 func TestAISearchChat_EmptyMessage(t *testing.T) {
-	comp := newAISearchTestComponent(&config.Config{}, nil, 0, nil)
+	comp, _ := newAISearchTestComponent(&config.Config{}, nil, 0, nil)
 	err := comp.Chat(context.Background(), &types.AIChatRequest{Message: "  "}, func(types.AIChatEvent) error { return nil })
 	require.Error(t, err)
+}
+
+func containsAll(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if !strings.Contains(s, sub) {
+			return false
+		}
+	}
+	return true
 }

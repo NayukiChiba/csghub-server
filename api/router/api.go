@@ -28,7 +28,6 @@ import (
 	"opencsg.com/csghub-server/builder/analytics"
 	"opencsg.com/csghub-server/builder/deploy"
 	"opencsg.com/csghub-server/builder/instrumentation"
-	"opencsg.com/csghub-server/builder/llm"
 	bldmq "opencsg.com/csghub-server/builder/mq"
 	bldprometheus "opencsg.com/csghub-server/builder/prometheus"
 	"opencsg.com/csghub-server/builder/store/database"
@@ -248,7 +247,7 @@ func NewRouter(config *config.Config, enableSwagger bool) (*gin.Engine, error) {
 		r.Any("/mcp", gin.WrapH(mcpHTTPHandler))
 	}
 	aiSearchHandler := handler.NewAISearchHandlerWithComponent(
-		component.NewAISearchComponentWithDeps(config, toolExec, llm.NewClient()))
+		component.NewAISearchComponentWithDeps(config, toolExec))
 	apiGroup.POST("/ai/dataset_chat", aiSearchHandler.DatasetChat)
 
 	// admin-editable LLM configuration for dataset AI search
