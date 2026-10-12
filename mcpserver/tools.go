@@ -168,7 +168,7 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		auxGroups = append(auxGroups, expandToken(lang))
 	}
 
-	newFilter := func(groups [][]string, any bool) *types.RepoFilter {
+	newFilter := func(groups [][]string, any bool, dropTags bool) *types.RepoFilter {
 		// Search mirrors the raw query text: it keeps the store layer on the
 		// full-text branch (which requires a non-empty Search) and
 		// participates in the cache key alongside the groups.
@@ -184,12 +184,14 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 			RepoSizeMax:  args.MaxSizeBytes,
 			Sort:         args.Sort,
 		}
-		for _, t := range args.Tags {
-			filter.Tags = append(filter.Tags, types.TagReq{
-				Category: t.Category,
-				Name:     t.Name,
-				Group:    t.Group,
-			})
+		if !dropTags {
+			for _, t := range args.Tags {
+				filter.Tags = append(filter.Tags, types.TagReq{
+					Category: t.Category,
+					Name:     t.Name,
+					Group:    t.Group,
+				})
+			}
 		}
 		return filter
 	}
@@ -212,10 +214,13 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	//  1. strict AND over keyword + modality/language groups
 	//  2. strict AND over keyword groups only (auxiliary groups dropped)
 	//  3. relaxed OR over all groups, ranked by relevance
+	//  4. relaxed OR without tag filters — tags are model-guessed and many
+	//     datasets carry no tags at all, so they must not be a hard cutoff
 	type attempt struct {
-		groups  [][]string
-		any     bool
-		relaxed bool
+		groups   [][]string
+		any      bool
+		relaxed  bool
+		dropTags bool
 	}
 	var attempts []attempt
 	if len(allGroups) > 0 {
@@ -227,9 +232,12 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	} else {
 		attempts = append(attempts, attempt{})
 	}
+	if len(args.Tags) > 0 {
+		attempts = append(attempts, attempt{groups: allGroups, any: true, relaxed: true, dropTags: true})
+	}
 
 	for i, att := range attempts {
-		filter := newFilter(att.groups, att.any)
+		filter := newFilter(att.groups, att.any, att.dropTags)
 		datasets, total, err := e.datasets.Index(ctx, filter, per, page, false)
 		if err != nil {
 			return nil, fmt.Errorf("search datasets: %w", err)
@@ -328,6 +336,10 @@ type ParseDatasetQueryArgs struct {
 // ParseDatasetQueryResult mirrors SearchDatasetsArgs so callers can feed the
 // parsed output straight into search_datasets.
 type ParseDatasetQueryResult struct {
+	// Intent is the parsed user intent: "search" (default, possibly with
+	// empty filters for browse/list-all) or "tags" (the user asks which
+	// tags/categories exist). Empty means search.
+	Intent       string   `json:"intent,omitempty"`
 	Keywords     string   `json:"keywords"`
 	Tags         []TagArg `json:"tags,omitempty"`
 	Modality     string   `json:"modality,omitempty"`
@@ -342,13 +354,15 @@ type ParseDatasetQueryResult struct {
 
 const parseQueryPrompt = `You convert natural-language dataset search queries into structured filters for the CSGHub dataset search tool.
 Respond with a JSON object only, no markdown fences, no explanation. Schema:
-{"keywords": "space separated english keywords matched against dataset name and description",
+{"intent": "search | browse | tags",
+ "keywords": "space separated english keywords matched against dataset name and description",
  "tags": [{"category": "task|license|framework|industry", "name": "exact tag name"}],
  "modality": "image|audio|video|text|3d (optional, omit if unsure)",
  "language": "chinese|english|... (optional, the natural language of dataset content)",
  "min_size_bytes": 0, "max_size_bytes": 0,
  "reason": "one short sentence describing the user's search intent only; do NOT describe or assume the dataset's content"}
-Only include tags you are confident exist (common task tags look like image-classification, automatic-speech-recognition, text-generation). Omit fields you cannot infer.`
+Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "browse" when the user wants to list or browse datasets without specific criteria (e.g. "有哪些数据集", "what datasets are available") and return empty keywords with no filters; otherwise use "search".
+Only include tags you are confident exist (common task tags look like image-classification, automatic-speech-recognition, text-generation); prefer the modality field over task tags for modality words (语音/音频 -> audio, 图像/图片 -> image, 视频 -> video, 文本 -> text). Omit fields you cannot infer.`
 
 func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQueryArgs) (*ParseDatasetQueryResult, error) {
 	query := strings.TrimSpace(args.Query)
@@ -388,9 +402,8 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 		slog.Warn("parse llm structured output failed, fallback to keyword search", slog.Any("error", err))
 		return &ParseDatasetQueryResult{Keywords: query, Fallback: true, Reason: "LLM output was not valid JSON"}, nil
 	}
-	if parsed.Keywords == "" {
-		parsed.Keywords = query
-	}
+	// Empty keywords with no filters is a valid browse/list-all intent; only
+	// the fallback paths above substitute the raw query as keywords.
 	return parsed, nil
 }
 

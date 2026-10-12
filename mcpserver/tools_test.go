@@ -6,7 +6,9 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	mockllm "opencsg.com/csghub-server/_mocks/opencsg.com/csghub-server/builder/llm"
 	"opencsg.com/csghub-server/builder/store/database"
 	"opencsg.com/csghub-server/common/config"
 	"opencsg.com/csghub-server/common/types"
@@ -162,6 +164,9 @@ func TestSearchDatasets_ModalityOnlySynthesizesSearch(t *testing.T) {
 
 func TestSearchDatasets_TagsAndPaginationCaps(t *testing.T) {
 	exec, ds, _, _ := newTestExecutor()
+	// a hit on the first attempt keeps the tag filter in place
+	ds.datasets = []*types.Dataset{{Path: "root/demo", Name: "demo"}}
+	ds.total = 1
 
 	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
 		Tags: []TagArg{{Category: "task", Name: "image-classification"}},
@@ -172,6 +177,26 @@ func TestSearchDatasets_TagsAndPaginationCaps(t *testing.T) {
 	require.Len(t, ds.lastFilter.Tags, 1)
 	require.Equal(t, "task", ds.lastFilter.Tags[0].Category)
 	require.Equal(t, "image-classification", ds.lastFilter.Tags[0].Name)
+}
+
+func TestSearchDatasets_TagFilterDroppedAsLastResort(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	// tag-filtered attempts find nothing; the tagless relaxed attempt hits
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if len(filter.Tags) > 0 {
+			return nil, 0, nil
+		}
+		return []*types.Dataset{{Path: "root/speech-zh", Name: "speech-zh"}}, 1, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "speech",
+		Tags:     []TagArg{{Category: "task", Name: "automatic-speech-recognition"}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.True(t, result.Relaxed)
+	require.Empty(t, ds.lastFilter.Tags)
 }
 
 func TestListDatasetTags_FilterByCategory(t *testing.T) {
@@ -226,6 +251,22 @@ func TestParseDatasetQuery_FallbackWhenLLMNotConfigured(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.Fallback)
 	require.Equal(t, "中文语音数据集", result.Keywords)
+}
+
+func TestParseDatasetQuery_BrowseIntentKeepsEmptyKeywords(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"browse","keywords":"","reason":"user wants to browse all datasets"}`, nil).Once()
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, llmClient, cfg, nil)
+
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "现在有哪些数据集"})
+	require.NoError(t, err)
+	require.False(t, result.Fallback)
+	require.Equal(t, "browse", result.Intent)
+	// empty keywords is a valid browse intent, not forced back to the raw query
+	require.Empty(t, result.Keywords)
 }
 
 func TestExecute_Dispatch(t *testing.T) {

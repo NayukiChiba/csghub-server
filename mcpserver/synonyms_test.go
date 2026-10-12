@@ -41,6 +41,15 @@ func TestBuildKeywordGroups_Empty(t *testing.T) {
 	require.Empty(t, buildKeywordGroups("  , "))
 }
 
+func TestBuildKeywordGroups_StopwordsDropped(t *testing.T) {
+	// "数据集" carries no filtering meaning; "语音数据集" behaves like "语音"
+	groups := buildKeywordGroups("语音数据集")
+	require.Len(t, groups, 1)
+	require.Contains(t, groups[0], "audio")
+	require.Empty(t, buildKeywordGroups("数据集"))
+	require.Empty(t, buildKeywordGroups("dataset data"))
+}
+
 func TestExpandToken_UnknownKeepsToken(t *testing.T) {
 	require.Equal(t, []string{"librispeech"}, expandToken("librispeech"))
 }

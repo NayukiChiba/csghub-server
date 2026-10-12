@@ -74,6 +74,14 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		parsed = &mcpserver.ParseDatasetQueryResult{Keywords: message, Fallback: true}
 	}
 
+	if parsed.Intent == "tags" {
+		tags, err := c.exec.ListDatasetTags(ctx, mcpserver.ListDatasetTagsArgs{})
+		if err != nil {
+			return fmt.Errorf("list dataset tags: %w", err)
+		}
+		return emit(types.AIChatEvent{Type: types.AIChatEventText, Text: composeTagsAnswer(tags)})
+	}
+
 	result, err := c.exec.SearchDatasets(ctx, mcpserver.SearchDatasetsArgs{
 		Keywords:     parsed.Keywords,
 		Tags:         parsed.Tags,
@@ -120,6 +128,21 @@ func contextualQuery(history []types.AIChatMessage, message string) string {
 	return b.String()
 }
 
+// isBrowseIntent reports whether the parser returned no criteria at all —
+// the user wants to browse or list datasets (e.g. "有哪些数据集").
+func isBrowseIntent(parsed *mcpserver.ParseDatasetQueryResult) bool {
+	if parsed.Intent == "browse" {
+		return true
+	}
+	return !parsed.Fallback &&
+		strings.TrimSpace(parsed.Keywords) == "" &&
+		len(parsed.Tags) == 0 &&
+		parsed.Modality == "" &&
+		parsed.Language == "" &&
+		parsed.MinSizeBytes == nil &&
+		parsed.MaxSizeBytes == nil
+}
+
 // composeChatAnswer renders the deterministic text answer from the parse and
 // search results. Dataset cards are delivered separately via the datasets
 // event, so the text never links to datasets the search did not return.
@@ -127,16 +150,68 @@ func composeChatAnswer(parsed *mcpserver.ParseDatasetQueryResult, result *mcpser
 	var b strings.Builder
 	if parsed.Fallback {
 		b.WriteString("AI 解析暂不可用，已按关键词直接搜索。")
-	} else if reason := strings.TrimSpace(parsed.Reason); reason != "" {
+	} else if reason := strings.TrimSpace(parsed.Reason); reason != "" && !isBrowseIntent(parsed) {
 		b.WriteString("已将您的问题理解为：" + reason + "。")
 	}
 	switch {
+	case isBrowseIntent(parsed) && result.Total == 0:
+		b.WriteString("平台上目前还没有数据集。")
+	case isBrowseIntent(parsed):
+		fmt.Fprintf(&b, "平台目前共有 %d 个数据集：", result.Total)
 	case result.Total == 0:
 		b.WriteString("没有找到符合条件的数据集。建议放宽筛选条件（去掉模态、语言或大小限制），或换个关键词再试。")
 	case result.Relaxed:
 		fmt.Fprintf(&b, "严格筛选没有完全匹配的结果，放宽条件后为您找到 %d 个相关数据集（按相关度排序）：", result.Total)
 	default:
 		fmt.Fprintf(&b, "为您找到 %d 个相关数据集：", result.Total)
+	}
+	return b.String()
+}
+
+// tagCategoryDisplayNames maps tag categories to Chinese display names.
+var tagCategoryDisplayNames = map[string]string{
+	"task":             "任务类型",
+	"license":          "许可证",
+	"framework":        "框架",
+	"industry":         "行业",
+	"program_language": "编程语言",
+}
+
+// maxTagNamesPerCategory caps how many tag names one category lists in the
+// chat answer; the remainder is summarized as "等".
+const maxTagNamesPerCategory = 15
+
+// composeTagsAnswer renders the answer for "which tags exist" questions from
+// the real tag vocabulary, grouped by category.
+func composeTagsAnswer(result *mcpserver.ListDatasetTagsResult) string {
+	if len(result.Tags) == 0 {
+		return "平台上还没有配置数据集标签。"
+	}
+	byCategory := make(map[string][]string)
+	var order []string
+	for _, t := range result.Tags {
+		if _, ok := byCategory[t.Category]; !ok {
+			order = append(order, t.Category)
+		}
+		byCategory[t.Category] = append(byCategory[t.Category], t.Name)
+	}
+	var b strings.Builder
+	b.WriteString("平台的数据集标签按类别划分如下，可以直接让我按标签筛选：")
+	for _, cat := range order {
+		names := byCategory[cat]
+		display := cat
+		if name, ok := tagCategoryDisplayNames[cat]; ok {
+			display = name
+		}
+		fmt.Fprintf(&b, "\n%s（共 %d 个）：", display, len(names))
+		shown := names
+		if len(shown) > maxTagNamesPerCategory {
+			shown = shown[:maxTagNamesPerCategory]
+		}
+		b.WriteString(strings.Join(shown, "、"))
+		if len(names) > maxTagNamesPerCategory {
+			b.WriteString(" 等")
+		}
 	}
 	return b.String()
 }

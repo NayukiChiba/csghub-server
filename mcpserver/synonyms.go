@@ -178,22 +178,39 @@ func expandToken(token string) []string {
 	return []string{token}
 }
 
+// queryStopwords are tokens that carry no filtering meaning in a dataset
+// search context (the user is already searching datasets). They are dropped
+// so "语音数据集" behaves like "语音".
+var queryStopwords = map[string]bool{
+	"数据集":      true,
+	"数据":       true,
+	"dataset":  true,
+	"datasets": true,
+	"data":     true,
+}
+
 // buildKeywordGroups converts raw keywords into query term groups: one group
 // per semantic term, synonyms OR-combined inside the group. Unspaced Chinese
-// tokens are first segmented against the synonym keys.
+// tokens are first segmented against the synonym keys; stopwords are dropped.
 func buildKeywordGroups(keywords string) [][]string {
 	var groups [][]string
+	appendTerm := func(term string) {
+		if term == "" || queryStopwords[term] {
+			return
+		}
+		groups = append(groups, expandToken(term))
+	}
 	for _, token := range splitQueryTokens(strings.ToLower(keywords)) {
-		if token == "" {
+		if token == "" || queryStopwords[token] {
 			continue
 		}
 		if segments := segmentCJK(token); segments != nil {
 			for _, seg := range segments {
-				groups = append(groups, expandToken(seg))
+				appendTerm(seg)
 			}
 			continue
 		}
-		groups = append(groups, expandToken(token))
+		appendTerm(token)
 	}
 	return groups
 }

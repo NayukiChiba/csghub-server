@@ -37,10 +37,12 @@ func (f *aiSearchFakeRepo) FileRaw(ctx context.Context, req *types.GetFileReq) (
 	return "", errors.New("not implemented")
 }
 
-type aiSearchFakeTags struct{}
+type aiSearchFakeTags struct {
+	tags []*database.Tag
+}
 
 func (f *aiSearchFakeTags) AllDatasetTags(ctx context.Context) ([]*database.Tag, error) {
-	return nil, nil
+	return f.tags, nil
 }
 
 func newAISearchTestComponent(cfg *config.Config, datasets []*types.Dataset, total int, llmClient *mockllm.MockLLMSvcClient) (AISearchComponent, *aiSearchFakeDatasets) {
@@ -138,6 +140,50 @@ func TestAISearchChat_HistoryFoldedIntoParseQuery(t *testing.T) {
 		History: []types.AIChatMessage{{Role: "user", Content: "有没有图像数据集"}, {Role: "assistant", Content: "找到这些图像数据集"}},
 	})
 	require.Len(t, events, 1)
+}
+
+func TestAISearchChat_BrowseIntentListsAll(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	comp, ds := newAISearchTestComponent(cfg,
+		[]*types.Dataset{{Path: "root/demo", Name: "demo"}}, 15, llmClient)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"browse","keywords":"","reason":"user wants to browse all datasets"}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "现在有哪些数据集"})
+	require.Len(t, events, 2)
+	require.Contains(t, events[0].Text, "平台目前共有 15 个数据集")
+	require.NotContains(t, events[0].Text, "没有找到")
+	// no search criteria: plain dataset listing
+	require.Empty(t, ds.lastFilter.Search)
+	require.Empty(t, ds.lastFilter.SearchGroups)
+}
+
+func TestAISearchChat_TagsIntent(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	ds := &aiSearchFakeDatasets{}
+	tags := &aiSearchFakeTags{tags: []*database.Tag{
+		{Category: "task", Name: "image-classification"},
+		{Category: "task", Name: "automatic-speech-recognition"},
+		{Category: "license", Name: "mit"},
+	}}
+	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, tags, llmClient, cfg, nil)
+	comp := NewAISearchComponentWithDeps(cfg, exec)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"tags","keywords":""}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "数据集有哪些标签"})
+	// tags are answered as text only; no dataset cards and no search
+	require.Len(t, events, 1)
+	require.Contains(t, events[0].Text, "任务类型（共 2 个）")
+	require.Contains(t, events[0].Text, "image-classification")
+	require.Contains(t, events[0].Text, "许可证（共 1 个）")
+	require.Nil(t, ds.lastFilter)
 }
 
 func TestAISearchChat_EmptyMessage(t *testing.T) {
