@@ -360,6 +360,13 @@ type RepoFilter struct {
 	ModelParamsMax      *float64
 	RepoSizeMin         *int64
 	RepoSizeMax         *int64
+	// SearchGroups holds pre-tokenized query term groups for full-text
+	// search: terms inside a group are OR-combined (synonyms), groups are
+	// combined with AND by default, or with OR when SearchAny is true
+	// (relaxed/recall mode). When empty, the legacy plain Search behavior
+	// (plainto_tsquery, all lexemes ANDed) is used.
+	SearchGroups [][]string
+	SearchAny    bool
 }
 
 type BatchGetFilter struct {

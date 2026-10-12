@@ -1880,6 +1880,8 @@ func (s *repoStoreImpl) getCacheKey(q *bun.SelectQuery, repoType types.Repositor
 		ModelParamsMax      *float64
 		RepoSizeMin         *int64
 		RepoSizeMax         *int64
+		SearchGroups        [][]string
+		SearchAny           bool
 	}{
 		Tags:                filter.Tags,
 		Search:              filter.Search,
@@ -1897,6 +1899,8 @@ func (s *repoStoreImpl) getCacheKey(q *bun.SelectQuery, repoType types.Repositor
 		ModelParamsMax:      filter.ModelParamsMax,
 		RepoSizeMin:         filter.RepoSizeMin,
 		RepoSizeMax:         filter.RepoSizeMax,
+		SearchGroups:        filter.SearchGroups,
+		SearchAny:           filter.SearchAny,
 	}
 	serializedFilter, err := json.Marshal(publicFilter)
 	if err != nil {
@@ -2109,7 +2113,36 @@ func buildVectorSearchQuery(
 			)::tsquery
 		)
 	`
-	q.Where(`repository.search_vector @@ `+tsQuerySub, searchConfiguration, input)
+	args := []any{searchConfiguration, input}
+
+	if len(filter.SearchGroups) > 0 {
+		// Grouped search: groups are serialized newline-separated; synonyms
+		// inside a group are '|'-separated and OR-combined; groups are joined
+		// with '&' (strict) or '|' (relaxed, SearchAny). Synonyms whose
+		// plainto_tsquery is empty drop out because string_to_array('', '&')
+		// yields no rows.
+		joiner := "&"
+		if filter.SearchAny {
+			joiner = "|"
+		}
+		tsQuerySub = `
+		(
+			SELECT string_agg(gq, ?)::tsquery FROM (
+				SELECT '(' || string_agg(lex, '|') || ')' AS gq
+				FROM (
+					SELECT g.grp AS grp, (trim(item) || ':*') AS lex
+					FROM unnest(string_to_array(?, chr(10))) AS g(grp),
+						LATERAL unnest(string_to_array(g.grp, '|')) AS s(syn),
+						LATERAL unnest(string_to_array(plainto_tsquery(?, s.syn)::text, '&')) AS item
+				) t
+				GROUP BY t.grp
+			) x
+		)
+	`
+		args = []any{joiner, serializeSearchGroups(filter.SearchGroups), searchConfiguration}
+	}
+
+	q.Where(`repository.search_vector @@ `+tsQuerySub, args...)
 	q.Limit(limit)
 
 	oq := db.NewSelect().
@@ -2121,10 +2154,32 @@ func buildVectorSearchQuery(
 				`+tsQuerySub+`,
 				32
 			) AS rank
-		`, searchConfiguration, input)
+		`, args...)
 	oq.OrderExpr("rank DESC")
 
 	return oq
+}
+
+// serializeSearchGroups encodes term groups for the grouped tsquery
+// subquery: synonyms inside a group are joined with '|', groups with a
+// newline. Separator characters are stripped from individual terms.
+func serializeSearchGroups(groups [][]string) string {
+	clean := func(s string) string {
+		return strings.NewReplacer("|", " ", "\n", " ", "\r", " ").Replace(s)
+	}
+	lines := make([]string, 0, len(groups))
+	for _, group := range groups {
+		terms := make([]string, 0, len(group))
+		for _, term := range group {
+			if t := strings.TrimSpace(clean(term)); t != "" {
+				terms = append(terms, t)
+			}
+		}
+		if len(terms) > 0 {
+			lines = append(lines, strings.Join(terms, "|"))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (s *repoStoreImpl) IsMirrorRepo(ctx context.Context, repoType types.RepositoryType, namespace, name string) (bool, error) {
