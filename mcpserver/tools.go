@@ -337,8 +337,9 @@ type ParseDatasetQueryArgs struct {
 // parsed output straight into search_datasets.
 type ParseDatasetQueryResult struct {
 	// Intent is the parsed user intent: "search" (default, possibly with
-	// empty filters for browse/list-all) or "tags" (the user asks which
-	// tags/categories exist). Empty means search.
+	// empty filters for browse/list-all), "browse" (list datasets without
+	// criteria), "tags" (the user asks which tags/categories exist) or
+	// "other" (off-topic, not about datasets). Empty means search.
 	Intent       string   `json:"intent,omitempty"`
 	Keywords     string   `json:"keywords"`
 	Tags         []TagArg `json:"tags,omitempty"`
@@ -354,14 +355,14 @@ type ParseDatasetQueryResult struct {
 
 const parseQueryPrompt = `You convert natural-language dataset search queries into structured filters for the CSGHub dataset search tool.
 Respond with a JSON object only, no markdown fences, no explanation. Schema:
-{"intent": "search | browse | tags",
+{"intent": "search | browse | tags | other",
  "keywords": "space separated english keywords matched against dataset name and description",
  "tags": [{"category": "task|license|framework|industry", "name": "exact tag name"}],
  "modality": "image|audio|video|text|3d (optional, omit if unsure)",
  "language": "chinese|english|... (optional, the natural language of dataset content)",
  "min_size_bytes": 0, "max_size_bytes": 0,
  "reason": "one short sentence describing the user's search intent only; do NOT describe or assume the dataset's content"}
-Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "browse" when the user wants to list or browse datasets without specific criteria (e.g. "有哪些数据集", "what datasets are available") and return empty keywords with no filters; otherwise use "search".
+Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "browse" when the user wants to list or browse datasets without specific criteria (e.g. "有哪些数据集", "what datasets are available") and return empty keywords with no filters; use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
 Only include tags you are confident exist (common task tags look like image-classification, automatic-speech-recognition, text-generation); prefer the modality field over task tags for modality words (语音/音频 -> audio, 图像/图片 -> image, 视频 -> video, 文本 -> text). Omit fields you cannot infer.`
 
 func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQueryArgs) (*ParseDatasetQueryResult, error) {

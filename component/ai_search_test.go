@@ -186,6 +186,22 @@ func TestAISearchChat_TagsIntent(t *testing.T) {
 	require.Nil(t, ds.lastFilter)
 }
 
+func TestAISearchChat_OtherIntentRefused(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	comp, ds := newAISearchTestComponent(cfg, nil, 0, llmClient)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"other","keywords":""}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "我喜欢你"})
+	require.Len(t, events, 1)
+	require.Contains(t, events[0].Text, "数据集搜索助手")
+	// off-topic messages never reach the search
+	require.Nil(t, ds.lastFilter)
+}
+
 func TestAISearchChat_EmptyMessage(t *testing.T) {
 	comp, _ := newAISearchTestComponent(&config.Config{}, nil, 0, nil)
 	err := comp.Chat(context.Background(), &types.AIChatRequest{Message: "  "}, func(types.AIChatEvent) error { return nil })

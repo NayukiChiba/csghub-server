@@ -74,6 +74,10 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		parsed = &mcpserver.ParseDatasetQueryResult{Keywords: message, Fallback: true}
 	}
 
+	if parsed.Intent == "other" {
+		return emit(types.AIChatEvent{Type: types.AIChatEventText, Text: offTopicAnswer})
+	}
+
 	if parsed.Intent == "tags" {
 		tags, err := c.exec.ListDatasetTags(ctx, mcpserver.ListDatasetTagsArgs{})
 		if err != nil {
@@ -167,6 +171,10 @@ func composeChatAnswer(parsed *mcpserver.ParseDatasetQueryResult, result *mcpser
 	}
 	return b.String()
 }
+
+// offTopicAnswer is the fixed refusal for messages unrelated to datasets
+// (intent "other"); the chat never searches or lists datasets for these.
+const offTopicAnswer = "我是数据集搜索助手，只能帮你查找和筛选数据集哦～可以试试问我：「现在有哪些数据集」「语音数据集」「数据集有哪些标签」。"
 
 // tagCategoryDisplayNames maps tag categories to Chinese display names.
 var tagCategoryDisplayNames = map[string]string{
