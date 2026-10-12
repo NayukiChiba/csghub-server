@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
+	"opencsg.com/csghub-server/builder/dataviewer"
 	"opencsg.com/csghub-server/builder/deploy"
 	"opencsg.com/csghub-server/builder/git/gitserver"
 	"opencsg.com/csghub-server/builder/git/gitserver/gitaly"
@@ -46,6 +47,7 @@ import (
 	"opencsg.com/csghub-server/common/errorx"
 	"opencsg.com/csghub-server/common/types"
 	"opencsg.com/csghub-server/common/utils/common"
+	dvCom "opencsg.com/csghub-server/dataviewer/common"
 	"opencsg.com/csghub-server/mq"
 )
 
@@ -104,6 +106,7 @@ type repoComponentImpl struct {
 	mirrorTaskStore                database.MirrorTaskStore
 	argoWorkFlowStore              database.ArgoWorkFlowStore
 	dataviewerStore                database.DataviewerStore
+	dataviewerClient               dataviewer.DataviewerClient
 	accountSyncQuotaStatementStore database.AccountSyncQuotaStatementStore
 	accountPriceStore              database.AccountPriceStore
 	notificationSvcClient          rpc.NotificationSvcClient
@@ -1046,6 +1049,8 @@ func (c *repoComponentImpl) CreateFile(ctx context.Context, req *types.CreateFil
 		c.asyncSyncRepositoryPackage(ctx, repo, req.Namespace, req.Name, req.Branch)
 	}
 
+	c.triggerDataviewerUpdate(repo, req.Namespace, req.Name, req.Branch)
+
 	var resp types.CreateFileResp
 	return &resp, nil
 }
@@ -1178,6 +1183,8 @@ func (c *repoComponentImpl) UpdateFile(ctx context.Context, req *types.UpdateFil
 		c.asyncSyncRepositoryPackage(ctx, repo, req.Namespace, req.Name, req.Branch)
 	}
 
+	c.triggerDataviewerUpdate(repo, req.Namespace, req.Name, req.Branch)
+
 	resp := new(types.UpdateFileResp)
 	return resp, nil
 }
@@ -1251,8 +1258,38 @@ func (c *repoComponentImpl) DeleteFile(ctx context.Context, req *types.DeleteFil
 		c.asyncSyncRepositoryPackage(ctx, repo, req.Namespace, req.Name, req.Branch)
 	}
 
+	c.triggerDataviewerUpdate(repo, req.Namespace, req.Name, req.Branch)
+
 	resp := new(types.DeleteFileResp)
 	return resp, nil
+}
+
+// triggerDataviewerUpdate asks the dataviewer service to re-convert a dataset
+// after its files changed through the API (web upload/edit/delete). Git pushes
+// are covered by the git callback hook; API writes are not, so without this
+// the dataset preview would never be generated for web-edited datasets. The
+// call is fire-and-forget: errors are logged only and never fail the write.
+func (c *repoComponentImpl) triggerDataviewerUpdate(repo *database.Repository, namespace, name, branch string) {
+	if repo.RepositoryType != types.DatasetRepo || c.dataviewerClient == nil {
+		return
+	}
+	if branch == dvCom.ParquetBranch || branch == dvCom.DuckdbBranch {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := c.dataviewerClient.TriggerWorkflow(ctx, types.UpdateViewerReq{
+			Namespace: namespace,
+			Name:      name,
+			Branch:    branch,
+			RepoType:  types.DatasetRepo,
+		})
+		if err != nil {
+			slog.Warn("failed to trigger dataviewer workflow", slog.String("dataset", namespace+"/"+name),
+				slog.String("branch", branch), slog.Any("error", err))
+		}
+	}()
 }
 
 func (c *repoComponentImpl) updateLibraryFile(ctx context.Context, req *types.UpdateFileReq) error {

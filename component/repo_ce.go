@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"opencsg.com/csghub-server/builder/dataviewer"
 	"opencsg.com/csghub-server/builder/deploy"
 	"opencsg.com/csghub-server/builder/git"
 	"opencsg.com/csghub-server/builder/multisync"
@@ -113,6 +114,7 @@ func NewRepoComponent(config *config.Config) (RepoComponent, error) {
 	c.pendingDeletion = database.NewPendingDeletionStore()
 	c.argoWorkFlowStore = database.NewArgoWorkFlowStore()
 	c.dataviewerStore = database.NewDataviewerStore()
+	c.dataviewerClient = dataviewer.NewDataviewerClient(config)
 	c.accountSyncQuotaStatementStore = database.NewAccountSyncQuotaStatementStore()
 	c.accountPriceStore = database.NewAccountPriceStore()
 	c.upstreamStore = database.NewUpstreamStore(config)

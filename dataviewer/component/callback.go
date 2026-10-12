@@ -2,11 +2,13 @@ package component
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 	"opencsg.com/csghub-server/builder/git/gitserver"
 	"opencsg.com/csghub-server/builder/store/database"
@@ -55,8 +57,29 @@ func (c *callbackComponentImpl) TriggerDataviewUpdateWorkflow(ctx context.Contex
 	if err != nil {
 		return nil, fmt.Errorf("failed to get running jobs by repo_id %d, error: %w", req.RepoID, err)
 	}
-	if len(jobs) > 0 {
-		slog.Debug("there are still running jobs for this dataset", slog.Any("req", req), slog.Any("running jobs count", len(jobs)))
+	// A job row in pending/running state does not prove the temporal workflow
+	// is alive: worker restarts can orphan jobs, and such zombies would block
+	// re-triggering forever. Reconcile with temporal before rejecting.
+	running := 0
+	for _, job := range jobs {
+		alive, err := c.workflowAlive(ctx, job.WorkflowID)
+		if err != nil {
+			slog.Warn("failed to check workflow status, treat as running", slog.String("workflow_id", job.WorkflowID), slog.Any("error", err))
+			running++
+			continue
+		}
+		if alive {
+			running++
+			continue
+		}
+		job.Status = types.WorkflowFailed
+		job.Logs = "manually marked failed: workflow is not running"
+		if _, err := c.dataviewerStore.UpdateJob(ctx, job); err != nil {
+			slog.Error("failed to mark zombie job as failed", slog.String("workflow_id", job.WorkflowID), slog.Any("error", err))
+		}
+	}
+	if running > 0 {
+		slog.Debug("there are still running jobs for this dataset", slog.Any("req", req), slog.Any("running jobs count", running))
 		return nil, fmt.Errorf("there are still running jobs for this dataset %s/%s branch %s", req.Namespace, req.Name, req.Branch)
 	}
 
@@ -121,4 +144,18 @@ func (c *callbackComponentImpl) TriggerDataviewUpdateWorkflow(ctx context.Contex
 	}
 
 	return &workFlowInfo, nil
+}
+
+// workflowAlive reports whether the temporal workflow is still running.
+// A not-found workflow or any closed status means the job row is a zombie.
+func (c *callbackComponentImpl) workflowAlive(ctx context.Context, workflowID string) (bool, error) {
+	resp, err := c.workflowClient.DescribeWorkflowExecution(ctx, workflowID, "")
+	if err != nil {
+		var notFound *serviceerror.NotFound
+		if errors.As(err, &notFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to describe workflow %s, error: %w", workflowID, err)
+	}
+	return resp.GetWorkflowExecutionInfo().GetStatus() == enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, nil
 }

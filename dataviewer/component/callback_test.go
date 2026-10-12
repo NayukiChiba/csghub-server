@@ -6,6 +6,10 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
+	workflowpb "go.temporal.io/api/workflow/v1"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"opencsg.com/csghub-server/builder/git/gitserver"
 	"opencsg.com/csghub-server/builder/store/database"
@@ -101,4 +105,100 @@ func TestDatasetViewerComppnent_TriggerWorkflow(t *testing.T) {
 	workflow, err := cbComp.TriggerDataviewUpdateWorkflow(ctx, req)
 	require.Nil(t, err)
 	require.NotNil(t, workflow)
+}
+
+// A pending/running job whose temporal workflow no longer exists (e.g. the
+// worker restarted mid-flight) must not block re-triggering forever: the
+// zombie job is marked failed and a new workflow is submitted.
+func TestDatasetViewerComponent_TriggerWorkflow_ZombieJobMarkedFailed(t *testing.T) {
+	ctx := context.TODO()
+
+	config := &config.Config{}
+
+	req := types.UpdateViewerReq{
+		Namespace: "test-ns",
+		Name:      "test-name",
+		Branch:    "test-branch",
+		RepoType:  types.DatasetRepo,
+		RepoID:    int64(1),
+	}
+
+	repo := mockdb.NewMockRepoStore(t)
+	repo.EXPECT().FindByPath(ctx, req.RepoType, req.Namespace, req.Name).Return(&database.Repository{
+		ID:            int64(1),
+		DefaultBranch: "test-branch",
+	}, nil)
+
+	dvstore := mockdb.NewMockDataviewerStore(t)
+	dvstore.EXPECT().GetRunningJobsByRepoID(ctx, int64(1)).Return([]database.DataviewerJob{
+		{ID: 11, RepoID: 1, WorkflowID: "zombie-wf", Status: types.WorkflowPending},
+	}, nil)
+	dvstore.EXPECT().UpdateJob(mock.Anything, mock.MatchedBy(func(job database.DataviewerJob) bool {
+		return job.ID == 11 && job.Status == types.WorkflowFailed
+	})).Return(&database.DataviewerJob{}, nil)
+	dvstore.EXPECT().GetViewerByRepoID(ctx, int64(1)).Return(&database.Dataviewer{
+		ID:         int64(1),
+		RepoID:     int64(1),
+		WorkflowID: "test-workflow-id",
+	}, nil)
+	dvstore.EXPECT().CreateJob(mock.Anything, mock.Anything).Return(nil)
+
+	mockGitServer := mockGit.NewMockGitServer(t)
+
+	mtc := mock_temporal.NewMockClient(t)
+	mtc.EXPECT().DescribeWorkflowExecution(mock.Anything, "zombie-wf", "").
+		Return(nil, serviceerror.NewNotFound("workflow not found"))
+	mtc.EXPECT().ExecuteWorkflow(
+		mock.Anything, mock.Anything,
+		mock.AnythingOfType("func(internal.Context, common.WorkflowUpdateParams) error"),
+		dvCom.WorkflowUpdateParams{Req: req, Config: config}).Return(&MockWorkflowRun{}, nil)
+
+	cbComp := NewTestNewCallbackComponent(config, mtc, mockGitServer, repo, dvstore)
+
+	workflow, err := cbComp.TriggerDataviewUpdateWorkflow(ctx, req)
+	require.Nil(t, err)
+	require.NotNil(t, workflow)
+}
+
+// A job whose workflow is genuinely running in temporal still blocks
+// re-triggering.
+func TestDatasetViewerComponent_TriggerWorkflow_RunningJobBlocks(t *testing.T) {
+	ctx := context.TODO()
+
+	config := &config.Config{}
+
+	req := types.UpdateViewerReq{
+		Namespace: "test-ns",
+		Name:      "test-name",
+		Branch:    "test-branch",
+		RepoType:  types.DatasetRepo,
+		RepoID:    int64(1),
+	}
+
+	repo := mockdb.NewMockRepoStore(t)
+	repo.EXPECT().FindByPath(ctx, req.RepoType, req.Namespace, req.Name).Return(&database.Repository{
+		ID:            int64(1),
+		DefaultBranch: "test-branch",
+	}, nil)
+
+	dvstore := mockdb.NewMockDataviewerStore(t)
+	dvstore.EXPECT().GetRunningJobsByRepoID(ctx, int64(1)).Return([]database.DataviewerJob{
+		{ID: 11, RepoID: 1, WorkflowID: "live-wf", Status: types.WorkflowRunning},
+	}, nil)
+
+	mockGitServer := mockGit.NewMockGitServer(t)
+
+	mtc := mock_temporal.NewMockClient(t)
+	mtc.EXPECT().DescribeWorkflowExecution(mock.Anything, "live-wf", "").
+		Return(&workflowservice.DescribeWorkflowExecutionResponse{
+			WorkflowExecutionInfo: &workflowpb.WorkflowExecutionInfo{
+				Status: enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING,
+			},
+		}, nil)
+
+	cbComp := NewTestNewCallbackComponent(config, mtc, mockGitServer, repo, dvstore)
+
+	_, err := cbComp.TriggerDataviewUpdateWorkflow(ctx, req)
+	require.NotNil(t, err)
+	require.Contains(t, err.Error(), "still running")
 }
