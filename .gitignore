@@ -56,3 +56,5 @@ pgdata15/
 .specs/
 cmd/dev/
 run_moderation_local.sh
+
+log/
