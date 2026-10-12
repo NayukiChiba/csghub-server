@@ -78,6 +78,14 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		return emit(types.AIChatEvent{Type: types.AIChatEventText, Text: offTopicAnswer})
 	}
 
+	// A browse intent over a message that still contains searchable terms is
+	// an LLM misclassification (e.g. "中文数据集有哪些" parsed as browse with
+	// empty filters); search by the raw message instead of listing all.
+	if parsed.Intent == "browse" && isBrowseIntent(parsed) && mcpserver.HasSearchTerms(message) {
+		parsed.Intent = "search"
+		parsed.Keywords = message
+	}
+
 	if parsed.Intent == "tags" {
 		tags, err := c.exec.ListDatasetTags(ctx, mcpserver.ListDatasetTagsArgs{})
 		if err != nil {
@@ -154,7 +162,7 @@ func composeChatAnswer(parsed *mcpserver.ParseDatasetQueryResult, result *mcpser
 	if parsed.Fallback {
 		b.WriteString("AI 解析暂不可用，已按关键词直接搜索。")
 	} else if reason := strings.TrimSpace(parsed.Reason); reason != "" && !isBrowseIntent(parsed) {
-		b.WriteString("已将您的问题理解为：" + reason + "。")
+		b.WriteString("已将您的问题理解为：" + strings.TrimRight(reason, "。.!！") + "。")
 	}
 	switch {
 	case isBrowseIntent(parsed) && result.Total == 0:

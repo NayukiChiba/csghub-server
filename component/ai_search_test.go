@@ -183,6 +183,45 @@ func TestAISearchChat_BrowseIntentWithKeywordsStillSearches(t *testing.T) {
 	require.NotEmpty(t, ds.lastFilter.SearchGroups)
 }
 
+// A browse misclassification over a message that still contains known domain
+// terms (e.g. "中文数据集有哪些" -> browse with empty filters) falls back to
+// a keyword search over the raw message instead of listing every dataset.
+func TestAISearchChat_BrowseMisclassificationWithTermsStillSearches(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	comp, ds := newAISearchTestComponent(cfg,
+		[]*types.Dataset{{Path: "csg_opencompass/ceval-exam", Name: "ceval-exam"}}, 1, llmClient)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"browse","keywords":""}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "中文数据集有哪些"})
+	require.Len(t, events, 2)
+	require.Contains(t, events[0].Text, "为您找到 1 个")
+	require.NotContains(t, events[0].Text, "平台目前共有")
+	// raw message became the search keywords
+	require.Equal(t, "中文数据集有哪些", ds.lastFilter.Search)
+	require.NotEmpty(t, ds.lastFilter.SearchGroups)
+}
+
+// "现在有哪些数据集" contains no known domain term; browse stays browse.
+func TestAISearchChat_PureBrowseNotRescuedByGuard(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	comp, ds := newAISearchTestComponent(cfg,
+		[]*types.Dataset{{Path: "root/demo", Name: "demo"}}, 15, llmClient)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"browse","keywords":""}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "现在有哪些数据集"})
+	require.Len(t, events, 2)
+	require.Contains(t, events[0].Text, "平台目前共有 15 个数据集")
+	require.Empty(t, ds.lastFilter.Search)
+}
+
 func TestAISearchChat_TagsIntent(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"

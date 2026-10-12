@@ -64,3 +64,22 @@ func TestBuildKeywordGroups_VideoDatasetSegmentsToVideoOnly(t *testing.T) {
 func TestExpandToken_UnknownKeepsToken(t *testing.T) {
 	require.Equal(t, []string{"librispeech"}, expandToken("librispeech"))
 }
+
+func TestBuildKeywordGroups_QuestionPhrasingsDropped(t *testing.T) {
+	// question phrasings are stopwords and segment out of unspaced Chinese
+	groups := buildKeywordGroups("中文数据集有哪些")
+	require.Len(t, groups, 1)
+	require.Contains(t, groups[0], "chinese")
+	require.Empty(t, buildKeywordGroups("有哪些数据集"))
+	require.Empty(t, buildKeywordGroups("有没有什么数据集"))
+}
+
+func TestHasSearchTerms(t *testing.T) {
+	// known domain terms count even when wrapped in question phrasing
+	require.True(t, HasSearchTerms("中文数据集有哪些"))
+	require.True(t, HasSearchTerms("有没有视频的数据集"))
+	// pure browse phrasings do not — unknown words are not search terms
+	require.False(t, HasSearchTerms("有哪些数据集"))
+	require.False(t, HasSearchTerms("现在有哪些数据集"))
+	require.False(t, HasSearchTerms("what datasets are available"))
+}

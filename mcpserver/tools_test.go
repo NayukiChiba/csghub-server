@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/mock"
@@ -299,6 +300,87 @@ func TestSearchDatasets_ZeroSizeBoundsAreIgnored(t *testing.T) {
 	require.Equal(t, 1, result.Total)
 	require.Nil(t, ds.lastFilter.RepoSizeMin)
 	require.Nil(t, ds.lastFilter.RepoSizeMax)
+}
+
+// When the LLM produced exact tag filters, a tags-only strict attempt runs
+// before the relaxed OR fallback: keywords are the least reliable channel
+// (e.g. "许可证" matches nothing in name/description), while tags come from
+// the real vocabulary.
+func TestSearchDatasets_TagsOnlyAttemptBeforeRelaxed(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if filter.Search == "" && len(filter.Tags) > 0 {
+			return []*types.Dataset{{Path: "root/img", Name: "img"}}, 1, nil
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "MIT 许可证 图像",
+		Modality: "image",
+		Tags:     []TagArg{{Category: "license", Name: "mit"}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.False(t, result.Relaxed)
+	// the winning attempt is tags-only: no text search, tag filter kept
+	require.Empty(t, ds.lastFilter.Search)
+	require.Empty(t, ds.lastFilter.SearchGroups)
+	require.Len(t, ds.lastFilter.Tags, 1)
+	require.Equal(t, "mit", ds.lastFilter.Tags[0].Name)
+}
+
+// Keywords-only queries must not trigger the tags-only attempt.
+func TestSearchDatasets_NoTagsSkipsTagsOnlyAttempt(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	var searches []string
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		searches = append(searches, filter.Search)
+		return nil, 0, nil
+	}
+
+	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Keywords: "demo"})
+	require.NoError(t, err)
+	for _, s := range searches {
+		require.Equal(t, "demo", s)
+	}
+}
+
+func TestParseTagVocab(t *testing.T) {
+	vocab := parseTagVocab([]*database.Tag{
+		{Category: "task", Name: "text-classification"},
+		{Category: "task", Name: "image-classification"},
+		{Category: "license", Name: "mit"},
+		{Category: "language", Name: "zh"},
+		{Category: "framework", Name: "pytorch"}, // not offered to the LLM
+	})
+	require.Contains(t, vocab, "task: text-classification, image-classification")
+	require.Contains(t, vocab, "license: mit")
+	require.Contains(t, vocab, "language: zh")
+	require.NotContains(t, vocab, "pytorch")
+	require.Empty(t, parseTagVocab(nil))
+}
+
+// The parse prompt must carry the real tag vocabulary so the LLM can emit
+// exact tag filters.
+func TestParseDatasetQuery_PromptContainsTagVocab(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.MatchedBy(func(req types.LLMReqBody) bool {
+		return strings.Contains(req.Messages[0].Content, "text-classification") &&
+			strings.Contains(req.Messages[0].Content, "language: zh")
+	})).Return(`{"intent":"search","language":"chinese","tags":[{"category":"language","name":"zh"}],"keywords":""}`, nil).Once()
+	tags := &fakeTagLister{tags: []*database.Tag{
+		{Category: "task", Name: "text-classification"},
+		{Category: "language", Name: "zh"},
+	}}
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, tags, llmClient, cfg, nil)
+
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "中文数据集有哪些"})
+	require.NoError(t, err)
+	require.Equal(t, "chinese", result.Language)
+	require.Len(t, result.Tags, 1)
 }
 
 func TestExecute_Dispatch(t *testing.T) {

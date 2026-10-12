@@ -168,12 +168,17 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		auxGroups = append(auxGroups, expandToken(lang))
 	}
 
-	newFilter := func(groups [][]string, any bool, dropTags bool) *types.RepoFilter {
+	newFilter := func(groups [][]string, any bool, dropTags, tagsOnly bool) *types.RepoFilter {
 		// Search mirrors the raw query text: it keeps the store layer on the
 		// full-text branch (which requires a non-empty Search) and
-		// participates in the cache key alongside the groups.
+		// participates in the cache key alongside the groups. Tags-only
+		// attempts must keep Search empty so the store takes the plain
+		// tag-join path instead of a full-text match on the raw keywords.
 		search := strings.ToLower(strings.TrimSpace(args.Keywords))
-		if search == "" && len(groups) > 0 {
+		if tagsOnly {
+			search = ""
+			groups = nil
+		} else if search == "" && len(groups) > 0 {
 			search = strings.ToLower(strings.TrimSpace(args.Modality + " " + args.Language))
 		}
 		filter := &types.RepoFilter{
@@ -221,31 +226,44 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	// Precision-to-recall cascade:
 	//  1. strict AND over keyword + modality/language groups
 	//  2. strict AND over keyword groups only (auxiliary groups dropped)
-	//  3. relaxed OR over all groups, ranked by relevance
-	//  4. relaxed OR without tag filters — tags are model-guessed and many
+	//  3. strict AND over auxiliary groups only (keywords dropped) — keywords
+	//     are the least reliable channel when the LLM also produced exact tag
+	//     filters from the real vocabulary
+	//  4. tags only — exact tag joins with no text search at all
+	//  5. relaxed OR over all groups, ranked by relevance
+	//  6. relaxed OR without tag filters — tags are model-guessed and many
 	//     datasets carry no tags at all, so they must not be a hard cutoff
 	type attempt struct {
 		groups   [][]string
 		any      bool
 		relaxed  bool
 		dropTags bool
+		tagsOnly bool
 	}
 	var attempts []attempt
 	if len(allGroups) > 0 {
 		attempts = append(attempts, attempt{groups: allGroups})
 		if len(auxGroups) > 0 && len(kwGroups) > 0 {
 			attempts = append(attempts, attempt{groups: kwGroups})
+			if len(args.Tags) > 0 {
+				attempts = append(attempts, attempt{groups: auxGroups})
+			}
+		}
+		if len(args.Tags) > 0 {
+			attempts = append(attempts, attempt{tagsOnly: true})
 		}
 		attempts = append(attempts, attempt{groups: allGroups, any: true, relaxed: true})
+	} else if len(args.Tags) > 0 {
+		attempts = append(attempts, attempt{tagsOnly: true})
 	} else {
 		attempts = append(attempts, attempt{})
 	}
-	if len(args.Tags) > 0 {
+	if len(args.Tags) > 0 && len(allGroups) > 0 {
 		attempts = append(attempts, attempt{groups: allGroups, any: true, relaxed: true, dropTags: true})
 	}
 
 	for i, att := range attempts {
-		filter := newFilter(att.groups, att.any, att.dropTags)
+		filter := newFilter(att.groups, att.any, att.dropTags, att.tagsOnly)
 		datasets, total, err := e.datasets.Index(ctx, filter, per, page, false)
 		if err != nil {
 			return nil, fmt.Errorf("search datasets: %w", err)
@@ -365,13 +383,50 @@ const parseQueryPrompt = `You convert natural-language dataset search queries in
 Respond with a JSON object only, no markdown fences, no explanation. Schema:
 {"intent": "search | browse | tags | other",
  "keywords": "space separated english keywords matched against dataset name and description",
- "tags": [{"category": "task|license|framework|industry", "name": "exact tag name"}],
+ "tags": [{"category": "task|license|framework|industry|language", "name": "exact tag name"}],
  "modality": "image|audio|video|text|3d (optional, omit if unsure)",
  "language": "chinese|english|... (optional, the natural language of dataset content)",
  "min_size_bytes": "number, omit unless the user specifies a size", "max_size_bytes": "number, omit unless the user specifies a size",
  "reason": "one short sentence describing the user's search intent only; do NOT describe or assume the dataset's content"}
-Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "browse" ONLY when the user wants to list or browse datasets without any criteria (e.g. "有哪些数据集", "what datasets are available") — keywords and all filters MUST be empty for browse; a message that names any topic, modality or data type (e.g. "视频数据集", "图像分类的数据") is always "search" with the corresponding keywords/modality filled in; use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
-Only include tags you are confident exist (common task tags look like image-classification, automatic-speech-recognition, text-generation); prefer the modality field over task tags for modality words (语音/音频 -> audio, 图像/图片 -> image, 视频 -> video, 文本 -> text). Omit fields you cannot infer.`
+Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "browse" ONLY when the user wants to list or browse datasets without any criteria (e.g. "有哪些数据集", "what datasets are available") — keywords and all filters MUST be empty for browse; a message that names any topic, modality or data type (e.g. "视频数据集", "图像分类的数据", "中文数据集有哪些") is always "search" with the corresponding keywords/modality/language filled in; use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
+%sWhen the query mentions a task type, license, or content language that matches a known tag, emit it as a tag filter with the exact category and name from the vocabulary (文本分类 -> task/text-classification, 目标检测 -> task/object-detection, 中文 -> language/zh, 英文 -> language/en). Prefer the modality field over task tags for pure modality words (语音/音频 -> audio, 图像/图片 -> image, 视频 -> video, 文本 -> text).
+Do not repeat in keywords what you already expressed via tags, modality, language or size filters; keywords are only for the remaining free-text concepts. Omit fields you cannot infer.`
+
+// parseTagVocab formats the real dataset tag vocabulary for the parse prompt
+// so the LLM can emit exact tag filters instead of guessing tag names. Only
+// task/license/language categories are included; names are capped per
+// category to keep the prompt small.
+func parseTagVocab(tags []*database.Tag) string {
+	const maxNamesPerCategory = 40
+	byCategory := make(map[string][]string)
+	var order []string
+	for _, t := range tags {
+		if t.Category != "task" && t.Category != "license" && t.Category != "language" {
+			continue
+		}
+		if _, ok := byCategory[t.Category]; !ok {
+			order = append(order, t.Category)
+		}
+		if len(byCategory[t.Category]) < maxNamesPerCategory {
+			byCategory[t.Category] = append(byCategory[t.Category], t.Name)
+		}
+	}
+	if len(order) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Known dataset tags you may use in the tags field (exact category: name pairs): ")
+	for i, cat := range order {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(cat)
+		b.WriteString(": ")
+		b.WriteString(strings.Join(byCategory[cat], ", "))
+	}
+	b.WriteString(".\n")
+	return b.String()
+}
 
 func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQueryArgs) (*ParseDatasetQueryResult, error) {
 	query := strings.TrimSpace(args.Query)
@@ -394,10 +449,16 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	if apiKey != "" {
 		headers["Authorization"] = "Bearer " + apiKey
 	}
+	var tagVocab string
+	if e.tags != nil {
+		if allTags, err := e.tags.AllDatasetTags(ctx); err == nil {
+			tagVocab = parseTagVocab(allTags)
+		}
+	}
 	content, err := e.llm.Chat(llmCtx, endpoint, "", headers, types.LLMReqBody{
 		Model: model,
 		Messages: []types.LLMMessage{
-			{Role: "system", Content: parseQueryPrompt},
+			{Role: "system", Content: fmt.Sprintf(parseQueryPrompt, tagVocab)},
 			{Role: "user", Content: query},
 		},
 	})

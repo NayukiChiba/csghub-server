@@ -145,7 +145,7 @@ func segmentCJK(token string) []string {
 	rest := token
 	for len(rest) > 0 {
 		hit := ""
-		for _, key := range synonymKeysByLen {
+		for _, key := range segmentKeysByLen {
 			if strings.HasPrefix(rest, key) {
 				hit = key
 				break
@@ -178,16 +178,71 @@ func expandToken(token string) []string {
 	return []string{token}
 }
 
+// HasSearchTerms reports whether the raw message contains at least one term
+// from the synonym vocabulary (e.g. 中文, 视频, mit). Unknown raw words do
+// not count — "现在有哪些数据集" must stay a browse query. Used to catch LLM
+// misclassifications where a criteria-bearing message like "中文数据集有哪些"
+// is labeled browse with empty filters.
+func HasSearchTerms(message string) bool {
+	for _, token := range splitQueryTokens(strings.ToLower(message)) {
+		if token == "" || queryStopwords[token] {
+			continue
+		}
+		if segments := segmentCJK(token); segments != nil {
+			for _, seg := range segments {
+				if _, ok := synonymIndex[seg]; ok {
+					return true
+				}
+			}
+			continue
+		}
+		if _, ok := synonymIndex[token]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // queryStopwords are tokens that carry no filtering meaning in a dataset
 // search context (the user is already searching datasets). They are dropped
-// so "语音数据集" behaves like "语音".
+// so "语音数据集" behaves like "语音". Question phrasings are stopwords too:
+// "中文数据集有哪些" must reduce to "中文".
 var queryStopwords = map[string]bool{
 	"数据集":      true,
 	"数据":       true,
 	"dataset":  true,
 	"datasets": true,
 	"data":     true,
+	"有哪些":      true,
+	"有没有":      true,
+	"哪些":       true,
+	"什么":       true,
+	"呢":        true,
+	"吗":        true,
+	"一下":       true,
+	"推荐":       true,
 }
+
+// segmentKeysByLen extends synonymKeysByLen with the stopwords so unspaced
+// Chinese queries like "中文数据集有哪些" segment the stopwords out cleanly
+// instead of merging them into an unmatchable raw term. Stopword segments
+// are dropped later by buildKeywordGroups.
+var segmentKeysByLen = func() []string {
+	keys := make([]string, 0, len(synonymKeysByLen)+len(queryStopwords))
+	keys = append(keys, synonymKeysByLen...)
+	for k := range queryStopwords {
+		keys = append(keys, k)
+	}
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			ri, rj := len([]rune(keys[i])), len([]rune(keys[j]))
+			if rj > ri || (rj == ri && keys[j] < keys[i]) {
+				keys[i], keys[j] = keys[j], keys[i]
+			}
+		}
+	}
+	return keys
+}()
 
 // buildKeywordGroups converts raw keywords into query term groups: one group
 // per semantic term, synonyms OR-combined inside the group. Unspaced Chinese
