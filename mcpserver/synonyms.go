@@ -17,7 +17,7 @@ import (
 var querySynonymGroups = [][]string{
 	// modality
 	{"image", "images", "img", "picture", "pictures", "photo", "photos", "vision", "cv", "图像", "图片", "照片", "影像", "视觉"},
-	{"video", "videos", "视频", "视频数据"},
+	{"video", "videos", "视频"},
 	{"audio", "speech", "voice", "sound", "asr", "tts", "音频", "语音", "声音"},
 	{"text", "texts", "nlp", "corpus", "文本", "语料", "语料库"},
 	{"3d", "pointcloud", "point cloud", "三维", "点云"},

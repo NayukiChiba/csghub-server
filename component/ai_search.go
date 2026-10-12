@@ -133,11 +133,10 @@ func contextualQuery(history []types.AIChatMessage, message string) string {
 }
 
 // isBrowseIntent reports whether the parser returned no criteria at all —
-// the user wants to browse or list datasets (e.g. "有哪些数据集").
+// the user wants to browse or list datasets (e.g. "有哪些数据集"). The
+// intent label alone is not trusted: a misclassification like intent=browse
+// with keywords="视频数据集" must still search by those keywords.
 func isBrowseIntent(parsed *mcpserver.ParseDatasetQueryResult) bool {
-	if parsed.Intent == "browse" {
-		return true
-	}
 	return !parsed.Fallback &&
 		strings.TrimSpace(parsed.Keywords) == "" &&
 		len(parsed.Tags) == 0 &&

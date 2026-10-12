@@ -50,6 +50,17 @@ func TestBuildKeywordGroups_StopwordsDropped(t *testing.T) {
 	require.Empty(t, buildKeywordGroups("dataset data"))
 }
 
+func TestBuildKeywordGroups_VideoDatasetSegmentsToVideoOnly(t *testing.T) {
+	// "视频数据集" must reduce to the video group alone; a "视频数据" synonym
+	// key would segment to 视频+数据 and "数据" matches every Chinese
+	// description, drowning the real video datasets.
+	groups := buildKeywordGroups("视频数据集")
+	require.Len(t, groups, 1)
+	require.Contains(t, groups[0], "video")
+	require.Contains(t, groups[0], "视频")
+	require.NotContains(t, groups[0], "视频数据")
+}
+
 func TestExpandToken_UnknownKeepsToken(t *testing.T) {
 	require.Equal(t, []string{"librispeech"}, expandToken("librispeech"))
 }

@@ -121,8 +121,8 @@ type SearchDatasetsArgs struct {
 	Tags         []TagArg `json:"tags,omitempty" jsonschema:"exact tag filters (AND-combined); discover valid values with list_dataset_tags"`
 	Modality     string   `json:"modality,omitempty" jsonschema:"data modality filter: image, audio, video, text, 3d or multimodal; expanded to synonyms and matched against name and description"`
 	Language     string   `json:"language,omitempty" jsonschema:"natural language of the dataset content, e.g. chinese, english, 中文; expanded to synonyms"`
-	MinSizeBytes *int64   `json:"min_size_bytes,omitempty" jsonschema:"minimum repository size in bytes"`
-	MaxSizeBytes *int64   `json:"max_size_bytes,omitempty" jsonschema:"maximum repository size in bytes"`
+	MinSizeBytes *int64   `json:"min_size_bytes,omitempty" jsonschema:"minimum repository size in bytes; omit unless the user specifies a size"`
+	MaxSizeBytes *int64   `json:"max_size_bytes,omitempty" jsonschema:"maximum repository size in bytes; omit unless the user specifies a size"`
 	Sort         string   `json:"sort,omitempty" jsonschema:"sort order: trending, recently_update, most_download, most_favorite or most_star"`
 	Page         int      `json:"page,omitempty" jsonschema:"page number, starting at 1"`
 	Per          int      `json:"per,omitempty" jsonschema:"page size, max 50"`
@@ -206,6 +206,14 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	page := args.Page
 	if page <= 0 {
 		page = 1
+	}
+	// A zero/negative size bound is not a real filter (LLM clients often emit
+	// explicit 0 for "no constraint"); <= 0 max size would match nothing.
+	if args.MinSizeBytes != nil && *args.MinSizeBytes <= 0 {
+		args.MinSizeBytes = nil
+	}
+	if args.MaxSizeBytes != nil && *args.MaxSizeBytes <= 0 {
+		args.MaxSizeBytes = nil
 	}
 
 	allGroups := append(append([][]string{}, kwGroups...), auxGroups...)
@@ -360,9 +368,9 @@ Respond with a JSON object only, no markdown fences, no explanation. Schema:
  "tags": [{"category": "task|license|framework|industry", "name": "exact tag name"}],
  "modality": "image|audio|video|text|3d (optional, omit if unsure)",
  "language": "chinese|english|... (optional, the natural language of dataset content)",
- "min_size_bytes": 0, "max_size_bytes": 0,
+ "min_size_bytes": "number, omit unless the user specifies a size", "max_size_bytes": "number, omit unless the user specifies a size",
  "reason": "one short sentence describing the user's search intent only; do NOT describe or assume the dataset's content"}
-Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "browse" when the user wants to list or browse datasets without specific criteria (e.g. "有哪些数据集", "what datasets are available") and return empty keywords with no filters; use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
+Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "browse" ONLY when the user wants to list or browse datasets without any criteria (e.g. "有哪些数据集", "what datasets are available") — keywords and all filters MUST be empty for browse; a message that names any topic, modality or data type (e.g. "视频数据集", "图像分类的数据") is always "search" with the corresponding keywords/modality filled in; use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
 Only include tags you are confident exist (common task tags look like image-classification, automatic-speech-recognition, text-generation); prefer the modality field over task tags for modality words (语音/音频 -> audio, 图像/图片 -> image, 视频 -> video, 文本 -> text). Omit fields you cannot infer.`
 
 func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQueryArgs) (*ParseDatasetQueryResult, error) {
@@ -402,6 +410,15 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	if err := json.Unmarshal([]byte(strings.TrimSpace(strings.Trim(content, "`"))), parsed); err != nil {
 		slog.Warn("parse llm structured output failed, fallback to keyword search", slog.Any("error", err))
 		return &ParseDatasetQueryResult{Keywords: query, Fallback: true, Reason: "LLM output was not valid JSON"}, nil
+	}
+	// LLMs often emit explicit 0 for the size fields (the schema example shows
+	// numbers); a zero bound is not a real constraint and a zero max would
+	// match nothing.
+	if parsed.MinSizeBytes != nil && *parsed.MinSizeBytes <= 0 {
+		parsed.MinSizeBytes = nil
+	}
+	if parsed.MaxSizeBytes != nil && *parsed.MaxSizeBytes <= 0 {
+		parsed.MaxSizeBytes = nil
 	}
 	// Empty keywords with no filters is a valid browse/list-all intent; only
 	// the fallback paths above substitute the raw query as keywords.

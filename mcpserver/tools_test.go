@@ -269,6 +269,38 @@ func TestParseDatasetQuery_BrowseIntentKeepsEmptyKeywords(t *testing.T) {
 	require.Empty(t, result.Keywords)
 }
 
+func TestParseDatasetQuery_ZeroSizeBoundsAreDropped(t *testing.T) {
+	// LLMs often echo the schema's numeric fields as explicit 0; a zero max
+	// size would filter out every dataset.
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"browse","keywords":"","min_size_bytes":0,"max_size_bytes":0}`, nil).Once()
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, llmClient, cfg, nil)
+
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "现在有哪些数据集"})
+	require.NoError(t, err)
+	require.Nil(t, result.MinSizeBytes)
+	require.Nil(t, result.MaxSizeBytes)
+}
+
+func TestSearchDatasets_ZeroSizeBoundsAreIgnored(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.datasets = []*types.Dataset{{Path: "root/demo", Name: "demo"}}
+	ds.total = 1
+
+	zero := int64(0)
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		MinSizeBytes: &zero,
+		MaxSizeBytes: &zero,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.Nil(t, ds.lastFilter.RepoSizeMin)
+	require.Nil(t, ds.lastFilter.RepoSizeMax)
+}
+
 func TestExecute_Dispatch(t *testing.T) {
 	exec, ds, _, _ := newTestExecutor()
 	ds.datasets = []*types.Dataset{{Path: "root/demo", Name: "demo"}}

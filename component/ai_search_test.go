@@ -161,6 +161,28 @@ func TestAISearchChat_BrowseIntentListsAll(t *testing.T) {
 	require.Empty(t, ds.lastFilter.SearchGroups)
 }
 
+// A misclassified intent=browse that still carries keywords (the LLM does
+// this for queries like "视频数据集") must search by those keywords instead
+// of listing every dataset on the platform.
+func TestAISearchChat_BrowseIntentWithKeywordsStillSearches(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	comp, ds := newAISearchTestComponent(cfg,
+		[]*types.Dataset{{Path: "root/tiny-video", Name: "tiny-video"}}, 1, llmClient)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"browse","keywords":"视频数据集"}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "视频数据集"})
+	require.Len(t, events, 2)
+	require.Contains(t, events[0].Text, "为您找到 1 个")
+	require.NotContains(t, events[0].Text, "平台目前共有")
+	// keywords were forwarded to the search
+	require.Equal(t, "视频数据集", ds.lastFilter.Search)
+	require.NotEmpty(t, ds.lastFilter.SearchGroups)
+}
+
 func TestAISearchChat_TagsIntent(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"

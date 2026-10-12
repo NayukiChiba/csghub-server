@@ -2118,7 +2118,10 @@ func buildVectorSearchQuery(
 	if len(filter.SearchGroups) > 0 {
 		// Grouped search: groups are serialized newline-separated; synonyms
 		// inside a group are '|'-separated and OR-combined; groups are joined
-		// with '&' (strict) or '|' (relaxed, SearchAny). Synonyms whose
+		// with '&' (strict) or '|' (relaxed, SearchAny). Lexemes produced by a
+		// single multi-word synonym (e.g. "question answering" -> question &
+		// answer) are AND-combined so the synonym stays one semantic unit
+		// instead of exploding into an OR over each word. Synonyms whose
 		// plainto_tsquery is empty drop out because string_to_array('', '&')
 		// yields no rows.
 		joiner := "&"
@@ -2128,12 +2131,13 @@ func buildVectorSearchQuery(
 		tsQuerySub = `
 		(
 			SELECT string_agg(gq, ?)::tsquery FROM (
-				SELECT '(' || string_agg(lex, '|') || ')' AS gq
+				SELECT '(' || string_agg(synq, '|') || ')' AS gq
 				FROM (
-					SELECT g.grp AS grp, (trim(item) || ':*') AS lex
+					SELECT g.grp AS grp, s.syn AS syn, string_agg(trim(item) || ':*', '&') AS synq
 					FROM unnest(string_to_array(?, chr(10))) AS g(grp),
 						LATERAL unnest(string_to_array(g.grp, '|')) AS s(syn),
 						LATERAL unnest(string_to_array(plainto_tsquery(?, s.syn)::text, '&')) AS item
+					GROUP BY g.grp, s.syn
 				) t
 				GROUP BY t.grp
 			) x
