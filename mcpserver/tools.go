@@ -347,7 +347,7 @@ Respond with a JSON object only, no markdown fences, no explanation. Schema:
  "modality": "image|audio|video|text|3d (optional, omit if unsure)",
  "language": "chinese|english|... (optional, the natural language of dataset content)",
  "min_size_bytes": 0, "max_size_bytes": 0,
- "reason": "one short sentence explaining your interpretation"}
+ "reason": "one short sentence describing the user's search intent only; do NOT describe or assume the dataset's content"}
 Only include tags you are confident exist (common task tags look like image-classification, automatic-speech-recognition, text-generation). Omit fields you cannot infer.`
 
 func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQueryArgs) (*ParseDatasetQueryResult, error) {
