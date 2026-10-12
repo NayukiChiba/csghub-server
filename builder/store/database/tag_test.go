@@ -214,13 +214,20 @@ func TestTagStore_AllTags_UsedOnly(t *testing.T) {
 		GitPath:        "datasets_owner/used-tags",
 		Name:           "used-tags",
 		RepositoryType: types.DatasetRepo,
+		Source:         types.LocalSource,
 	}
 	_, err = db.Core.NewInsert().Model(repo).Exec(ctx)
 	require.NoError(t, err)
 	_, err = db.Core.NewInsert().Model(&[]database.RepositoryTag{
 		{RepositoryID: repo.ID, TagID: usedTag.ID, Count: 1},
-		{RepositoryID: repo.ID, TagID: depletedTag.ID, Count: 0},
+		{RepositoryID: repo.ID, TagID: depletedTag.ID, Count: 1},
 	}).Exec(ctx)
+	require.NoError(t, err)
+	// the Count field defaults to 1 on insert, so set the depleted count explicitly
+	_, err = db.Core.NewUpdate().Model(&database.RepositoryTag{}).
+		Set("count = 0").
+		Where("tag_id = ?", depletedTag.ID).
+		Exec(ctx)
 	require.NoError(t, err)
 
 	tags, err := ts.AllTags(ctx, &types.TagFilter{
@@ -231,6 +238,83 @@ func TestTagStore_AllTags_UsedOnly(t *testing.T) {
 	require.Len(t, tags, 1)
 	require.Equal(t, usedTag.ID, tags[0].ID)
 	require.NotEqual(t, unusedTag.ID, tags[0].ID)
+}
+
+// Non-built-in tags only qualify for UsedOnly when at least one local
+// (non-mirror) repository uses them; built-in tags qualify on any repo.
+// This keeps mirror-synced upstream tags out of the tag sidebar.
+func TestTagStore_AllTags_UsedOnly_LocalSourceGate(t *testing.T) {
+	db := tests.InitTestDB()
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, err := db.Core.NewDelete().Model(&database.Tag{}).Where("1=1").Exec(ctx)
+	require.NoError(t, err)
+
+	ts := database.NewTagStoreWithDB(db)
+	suffix := uuid.NewString()
+	builtinMirrorTag, err := ts.CreateTag(ctx, database.Tag{
+		Category: "task",
+		Name:     "builtin_mirror_" + suffix,
+		Scope:    types.DatasetTagScope,
+		BuiltIn:  true,
+	})
+	require.NoError(t, err)
+	customMirrorTag, err := ts.CreateTag(ctx, database.Tag{
+		Category: "task",
+		Name:     "custom_mirror_" + suffix,
+		Scope:    types.DatasetTagScope,
+	})
+	require.NoError(t, err)
+	customLocalTag, err := ts.CreateTag(ctx, database.Tag{
+		Category: "task",
+		Name:     "custom_local_" + suffix,
+		Scope:    types.DatasetTagScope,
+	})
+	require.NoError(t, err)
+
+	mirrorRepo := &database.Repository{
+		Path:           "owner/mirror-repo",
+		GitPath:        "datasets_owner/mirror-repo",
+		Name:           "mirror-repo",
+		RepositoryType: types.DatasetRepo,
+		Source:         types.OpenCSGSource,
+	}
+	_, err = db.Core.NewInsert().Model(mirrorRepo).Exec(ctx)
+	require.NoError(t, err)
+	localRepo := &database.Repository{
+		Path:           "owner/local-repo",
+		GitPath:        "datasets_owner/local-repo",
+		Name:           "local-repo",
+		RepositoryType: types.DatasetRepo,
+		Source:         types.LocalSource,
+	}
+	_, err = db.Core.NewInsert().Model(localRepo).Exec(ctx)
+	require.NoError(t, err)
+	_, err = db.Core.NewInsert().Model(&[]database.RepositoryTag{
+		{RepositoryID: mirrorRepo.ID, TagID: builtinMirrorTag.ID, Count: 1},
+		{RepositoryID: mirrorRepo.ID, TagID: customMirrorTag.ID, Count: 1},
+		{RepositoryID: localRepo.ID, TagID: customLocalTag.ID, Count: 1},
+	}).Exec(ctx)
+	require.NoError(t, err)
+
+	tags, err := ts.AllTags(ctx, &types.TagFilter{
+		Scopes:   []types.TagScope{types.DatasetTagScope},
+		UsedOnly: true,
+	})
+	require.NoError(t, err)
+	ids := make(map[int64]bool, len(tags))
+	for _, tag := range tags {
+		ids[tag.ID] = true
+	}
+	// built-in tag used only by a mirror repo: shown
+	require.True(t, ids[builtinMirrorTag.ID])
+	// non-built-in tag used only by a mirror repo: hidden
+	require.False(t, ids[customMirrorTag.ID])
+	// non-built-in tag used by a local repo: shown
+	require.True(t, ids[customLocalTag.ID])
 }
 
 func TestTagStore_AllTagsWithPagination(t *testing.T) {

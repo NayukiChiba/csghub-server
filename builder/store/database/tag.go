@@ -118,6 +118,17 @@ func (ts *tagStoreImpl) buildTagQuery(filter *types.TagFilter) *bun.SelectQuery 
 				JOIN repositories AS r ON r.id = rt.repository_id
 				WHERE rt.tag_id = tag.id AND rt.count > 0 AND r.deleted_at IS NULL
 			)`)
+			// Sidebar noise control: a non-built-in tag additionally needs at
+			// least one local (non-mirror) repository using it. Mirror sync
+			// imports upstream tags verbatim (framework names, ISO language
+			// codes, ...), which would otherwise flood the tag sidebar with
+			// hundreds of entries. Custom tags stay visible because users
+			// apply them to their own local repositories.
+			q = q.Where(`(tag.built_in OR EXISTS (
+				SELECT 1 FROM repository_tags AS rtl
+				JOIN repositories AS rl ON rl.id = rtl.repository_id
+				WHERE rtl.tag_id = tag.id AND rtl.count > 0 AND rl.deleted_at IS NULL AND rl.source = 'local'
+			))`)
 		}
 	}
 
