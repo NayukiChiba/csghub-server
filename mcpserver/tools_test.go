@@ -977,3 +977,20 @@ func TestParseDatasetQueryResult_ToleratesStringSizeFields(t *testing.T) {
 	require.NotNil(t, r.MinSizeBytes)
 	require.Equal(t, int64(1024), *r.MinSizeBytes)
 }
+
+// An LLM outage must not silently drop the date condition: the deterministic
+// date parser runs on the fallback path too.
+func TestParseDatasetQuery_FallbackStillAppliesDateConstraint(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return("", errors.New("llm down")).Once()
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
+
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "10.12之后更新的数据集"})
+	require.NoError(t, err)
+	require.True(t, result.Fallback)
+	require.Equal(t, "2026-10-12", result.UpdatedAfter)
+	require.Empty(t, result.CreatedAfter)
+}

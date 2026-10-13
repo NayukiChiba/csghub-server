@@ -781,6 +781,43 @@ func parseTagVocab(tags []*database.Tag) string {
 	return b.String()
 }
 
+// fallbackParseResult builds the raw-keyword fallback used when the LLM is
+// unavailable or its output is unusable. Deterministic date expressions are
+// still honored so an LLM outage does not silently drop the date condition.
+func fallbackParseResult(query, reason string) *ParseDatasetQueryResult {
+	r := &ParseDatasetQueryResult{Keywords: query, Fallback: true, Reason: reason}
+	applyDateConstraint(r, query)
+	return r
+}
+
+// applyDateConstraint overrides the result's date fields with the
+// deterministically parsed date expression, if the query contains one. Dates
+// are NOT trusted to the LLM: compact forms like "10.12" are occasionally
+// misread (observed as 2026-02-12). Unrecognized fuzzy phrasings keep the
+// LLM's interpretation.
+func applyDateConstraint(parsed *ParseDatasetQueryResult, query string) {
+	dc := extractDateConstraint(query, time.Now())
+	if dc == nil {
+		return
+	}
+	format := func(t *time.Time) string {
+		if t == nil {
+			return ""
+		}
+		return t.Format(time.DateOnly)
+	}
+	parsed.CreatedAfter, parsed.CreatedBefore, parsed.UpdatedAfter, parsed.UpdatedBefore = "", "", "", ""
+	if dc.updated {
+		parsed.UpdatedAfter, parsed.UpdatedBefore = format(dc.after), format(dc.before)
+	} else {
+		parsed.CreatedAfter, parsed.CreatedBefore = format(dc.after), format(dc.before)
+	}
+	// an explicit date outranks the vague "recently updated" ordering
+	if parsed.Sort == "recently_update" {
+		parsed.Sort = ""
+	}
+}
+
 func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQueryArgs) (*ParseDatasetQueryResult, error) {
 	query := strings.TrimSpace(args.Query)
 	if query == "" {
@@ -788,7 +825,7 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	}
 	endpoint, model, apiKey := e.ResolveLLMConfig(ctx)
 	if endpoint == "" {
-		return &ParseDatasetQueryResult{Keywords: query, Fallback: true, Reason: "LLM not configured"}, nil
+		return fallbackParseResult(query, "LLM not configured"), nil
 	}
 
 	timeout := time.Duration(e.cfg.AISearch.TimeoutMS) * time.Millisecond
@@ -817,13 +854,13 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	})
 	if err != nil {
 		slog.Warn("parse dataset query via llm failed, fallback to keyword search", slog.Any("error", err))
-		return &ParseDatasetQueryResult{Keywords: query, Fallback: true, Reason: "LLM request failed"}, nil
+		return fallbackParseResult(query, "LLM request failed"), nil
 	}
 
 	parsed := &ParseDatasetQueryResult{}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(strings.Trim(content, "`"))), parsed); err != nil {
 		slog.Warn("parse llm structured output failed, fallback to keyword search", slog.Any("error", err))
-		return &ParseDatasetQueryResult{Keywords: query, Fallback: true, Reason: "LLM output was not valid JSON"}, nil
+		return fallbackParseResult(query, "LLM output was not valid JSON"), nil
 	}
 	// LLMs often emit explicit 0 for the size fields (the schema example shows
 	// numbers); a zero bound is not a real constraint and a zero max would
@@ -856,28 +893,7 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	// Expansions are a best-effort recall aid: normalize them and drop junk
 	// entries rather than failing the search on malformed LLM output.
 	parsed.KeywordExpansions = sanitizeKeywordExpansions(parsed.KeywordExpansions)
-	// Dates are NOT trusted to the LLM: compact forms like "10.12" are
-	// occasionally misread (observed as 2026-02-12), so an explicitly
-	// recognized date expression overrides the LLM's date fields wholesale.
-	// Unrecognized fuzzy phrasings keep the LLM's interpretation.
-	if dc := extractDateConstraint(args.Query, time.Now()); dc != nil {
-		format := func(t *time.Time) string {
-			if t == nil {
-				return ""
-			}
-			return t.Format(time.DateOnly)
-		}
-		parsed.CreatedAfter, parsed.CreatedBefore, parsed.UpdatedAfter, parsed.UpdatedBefore = "", "", "", ""
-		if dc.updated {
-			parsed.UpdatedAfter, parsed.UpdatedBefore = format(dc.after), format(dc.before)
-		} else {
-			parsed.CreatedAfter, parsed.CreatedBefore = format(dc.after), format(dc.before)
-		}
-		// an explicit date outranks the vague "recently updated" ordering
-		if parsed.Sort == "recently_update" {
-			parsed.Sort = ""
-		}
-	}
+	applyDateConstraint(parsed, args.Query)
 	// Empty keywords with no filters is a valid browse/list-all intent; only
 	// the fallback paths above substitute the raw query as keywords.
 	return parsed, nil
