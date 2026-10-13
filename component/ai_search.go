@@ -100,18 +100,19 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 	}
 
 	result, err := c.exec.SearchDatasets(ctx, mcpserver.SearchDatasetsArgs{
-		Keywords:      parsed.Keywords,
-		Tags:          parsed.Tags,
-		Modality:      parsed.Modality,
-		Language:      parsed.Language,
-		MinSizeBytes:  parsed.MinSizeBytes,
-		MaxSizeBytes:  parsed.MaxSizeBytes,
-		CreatedAfter:  parsed.CreatedAfter,
-		CreatedBefore: parsed.CreatedBefore,
-		UpdatedAfter:  parsed.UpdatedAfter,
-		UpdatedBefore: parsed.UpdatedBefore,
-		Sort:          parsed.Sort,
-		Per:           10,
+		Keywords:          parsed.Keywords,
+		KeywordExpansions: parsed.KeywordExpansions,
+		Tags:              parsed.Tags,
+		Modality:          parsed.Modality,
+		Language:          parsed.Language,
+		MinSizeBytes:      parsed.MinSizeBytes,
+		MaxSizeBytes:      parsed.MaxSizeBytes,
+		CreatedAfter:      parsed.CreatedAfter,
+		CreatedBefore:     parsed.CreatedBefore,
+		UpdatedAfter:      parsed.UpdatedAfter,
+		UpdatedBefore:     parsed.UpdatedBefore,
+		Sort:              parsed.Sort,
+		Per:               10,
 	})
 	if err != nil {
 		return fmt.Errorf("search datasets: %w", err)

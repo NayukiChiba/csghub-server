@@ -137,19 +137,20 @@ type TagArg struct {
 }
 
 type SearchDatasetsArgs struct {
-	Keywords      string   `json:"keywords,omitempty" jsonschema:"search terms matched against dataset name and description; space-separated, chinese or english; synonyms are expanded automatically"`
-	Tags          []TagArg `json:"tags,omitempty" jsonschema:"exact tag filters (AND-combined); discover valid values with list_dataset_tags"`
-	Modality      string   `json:"modality,omitempty" jsonschema:"data modality filter: image, audio, video, text, 3d or multimodal; expanded to synonyms and matched against name and description"`
-	Language      string   `json:"language,omitempty" jsonschema:"natural language of the dataset content, e.g. chinese, english, 中文; expanded to synonyms"`
-	MinSizeBytes  *int64   `json:"min_size_bytes,omitempty" jsonschema:"minimum repository size in bytes; omit unless the user specifies a size"`
-	MaxSizeBytes  *int64   `json:"max_size_bytes,omitempty" jsonschema:"maximum repository size in bytes; omit unless the user specifies a size"`
-	CreatedAfter  string   `json:"created_after,omitempty" jsonschema:"only datasets created on or after this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
-	CreatedBefore string   `json:"created_before,omitempty" jsonschema:"only datasets created on or before this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
-	UpdatedAfter  string   `json:"updated_after,omitempty" jsonschema:"only datasets updated on or after this date, YYYY-MM-DD; omit unless the user constrains the update date"`
-	UpdatedBefore string   `json:"updated_before,omitempty" jsonschema:"only datasets updated on or before this date, YYYY-MM-DD; omit unless the user constrains the update date"`
-	Sort          string   `json:"sort,omitempty" jsonschema:"sort order: trending, recently_update, most_download, most_favorite, most_star, largest (biggest repo size first) or smallest"`
-	Page          int      `json:"page,omitempty" jsonschema:"page number, starting at 1"`
-	Per           int      `json:"per,omitempty" jsonschema:"page size, max 50"`
+	Keywords          string             `json:"keywords,omitempty" jsonschema:"search terms matched against dataset name and description; space-separated, chinese or english; synonyms are expanded automatically"`
+	KeywordExpansions []KeywordExpansion `json:"keyword_expansions,omitempty" jsonschema:"equivalent expressions for keywords (e.g. the english form of a chinese term); OR-combined with the source keyword to widen full-text recall"`
+	Tags              []TagArg           `json:"tags,omitempty" jsonschema:"exact tag filters (AND-combined); discover valid values with list_dataset_tags"`
+	Modality          string             `json:"modality,omitempty" jsonschema:"data modality filter: image, audio, video, text, 3d or multimodal; expanded to synonyms and matched against name and description"`
+	Language          string             `json:"language,omitempty" jsonschema:"natural language of the dataset content, e.g. chinese, english, 中文; expanded to synonyms"`
+	MinSizeBytes      *int64             `json:"min_size_bytes,omitempty" jsonschema:"minimum repository size in bytes; omit unless the user specifies a size"`
+	MaxSizeBytes      *int64             `json:"max_size_bytes,omitempty" jsonschema:"maximum repository size in bytes; omit unless the user specifies a size"`
+	CreatedAfter      string             `json:"created_after,omitempty" jsonschema:"only datasets created on or after this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
+	CreatedBefore     string             `json:"created_before,omitempty" jsonschema:"only datasets created on or before this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
+	UpdatedAfter      string             `json:"updated_after,omitempty" jsonschema:"only datasets updated on or after this date, YYYY-MM-DD; omit unless the user constrains the update date"`
+	UpdatedBefore     string             `json:"updated_before,omitempty" jsonschema:"only datasets updated on or before this date, YYYY-MM-DD; omit unless the user constrains the update date"`
+	Sort              string             `json:"sort,omitempty" jsonschema:"sort order: trending, recently_update, most_download, most_favorite, most_star, largest (biggest repo size first) or smallest"`
+	Page              int                `json:"page,omitempty" jsonschema:"page number, starting at 1"`
+	Per               int                `json:"per,omitempty" jsonschema:"page size, max 50"`
 }
 
 type SearchDatasetsResult struct {
@@ -180,7 +181,7 @@ func summarize(ds *types.Dataset) types.DatasetSummary {
 }
 
 func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsArgs) (*SearchDatasetsResult, error) {
-	kwGroups := buildKeywordGroups(args.Keywords)
+	kwGroups := buildKeywordGroups(args.Keywords, args.KeywordExpansions)
 	var auxGroups [][]string
 	if m := strings.ToLower(strings.TrimSpace(args.Modality)); m != "" {
 		auxGroups = append(auxGroups, expandToken(m))
@@ -595,13 +596,17 @@ type ParseDatasetQueryResult struct {
 	Intent string `json:"intent,omitempty"`
 	// Dataset names one specific dataset (namespace/name or a bare name) when
 	// intent is "detail".
-	Dataset      string   `json:"dataset,omitempty"`
-	Keywords     string   `json:"keywords"`
-	Tags         []TagArg `json:"tags,omitempty"`
-	Modality     string   `json:"modality,omitempty"`
-	Language     string   `json:"language,omitempty"`
-	MinSizeBytes *int64   `json:"min_size_bytes,omitempty"`
-	MaxSizeBytes *int64   `json:"max_size_bytes,omitempty"`
+	Dataset  string `json:"dataset,omitempty"`
+	Keywords string `json:"keywords"`
+	// KeywordExpansions carries LLM-produced equivalent expressions for the
+	// keywords (always including the english form), widened into the search
+	// groups so Chinese queries can hit English README/description content.
+	KeywordExpansions []KeywordExpansion `json:"keyword_expansions,omitempty"`
+	Tags              []TagArg           `json:"tags,omitempty"`
+	Modality          string             `json:"modality,omitempty"`
+	Language          string             `json:"language,omitempty"`
+	MinSizeBytes      *int64             `json:"min_size_bytes,omitempty"`
+	MaxSizeBytes      *int64             `json:"max_size_bytes,omitempty"`
 	// CreatedAfter/CreatedBefore bound the dataset creation date (YYYY-MM-DD).
 	CreatedAfter  string `json:"created_after,omitempty"`
 	CreatedBefore string `json:"created_before,omitempty"`
@@ -624,6 +629,7 @@ Respond with a JSON object only, no markdown fences, no explanation. Schema:
 {"intent": "search | browse | tags | detail | other",
  "dataset": "namespace/name or bare dataset name, only for intent=detail",
  "keywords": "space separated english keywords matched against dataset name and description",
+ "keyword_expansions": [{"term": "a word from keywords", "equivalents": ["1-5 equivalent expressions, always including the common english form"]}],
  "tags": [{"category": "task|license|framework|industry|language", "name": "exact tag name"}],
  "modality": "image|audio|video|text|3d (optional, omit if unsure)",
  "language": "chinese|english|... (optional, the natural language of dataset content)",
@@ -636,7 +642,8 @@ Intent rules: use "tags" when the user asks which tags or tag categories exist (
 Sort rules: ordering words are NOT search keywords — map them to the sort field instead (下载最多/最多下载/最热门 -> most_download, 收藏最多 -> most_favorite, 星标最多/最多 star -> most_star, 最近更新/最新 -> recently_update, 体积最大/数据量最大/最大的 -> largest, 体积最小/最小的 -> smallest, 热门趋势 -> trending). A query that only asks for an ordering (e.g. "下载最多的数据集有哪些", "most downloaded datasets") is "browse" with sort set; omit sort when the user does not ask for an ordering.
 Date rules: convert relative dates (上个月, 去年, 最近三个月) to absolute YYYY-MM-DD using the current date above; an open-ended range sets only one bound (2025年之后 -> created_after=2025-01-01). Distinguish creation from update: use created_after/created_before ONLY for creation/upload phrasing (创建/上传/导入/发布); use updated_after/updated_before for update phrasing (更新/最近更新, e.g. "今天更新的数据集" -> updated_after=<today>); when the user asks for recently updated datasets without a concrete date, set sort=recently_update and leave all date bounds empty.
 %sWhen the query mentions a task type, license, or content language that matches a known tag, emit it as a tag filter with the exact category and name from the vocabulary (文本分类 -> task/text-classification, 目标检测 -> task/object-detection, 中文 -> language/zh, 英文 -> language/en). Prefer the modality field over task tags for pure modality words (语音/音频 -> audio, 图像/图片 -> image, 视频 -> video, 文本 -> text).
-Do not repeat in keywords what you already expressed via tags, modality, language, sort or size filters; keywords are only for the remaining free-text concepts. Omit fields you cannot infer.`
+Do not repeat in keywords what you already expressed via tags, modality, language, sort or size filters; keywords are only for the remaining free-text concepts. Omit fields you cannot infer.
+Keyword expansion rules: dataset names, descriptions and README docs on this platform are mostly english, so for every content keyword provide 1-5 equivalent or synonymous expressions in keyword_expansions, ALWAYS including the common english form (多选题 -> multiple choice, multiple-choice, mcq; 自动驾驶 -> autonomous driving, self-driving). The term must be a word that appears in keywords; skip keywords with no useful equivalents, and omit the whole field when there is nothing to expand; do not expand words already expressed via tags, modality or language.`
 
 // parseTagVocab formats the real dataset tag vocabulary for the parse prompt
 // so the LLM can emit exact tag filters instead of guessing tag names. Only
@@ -746,6 +753,9 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	if _, err := parseDateBound(parsed.UpdatedBefore, true); err != nil {
 		parsed.UpdatedBefore = ""
 	}
+	// Expansions are a best-effort recall aid: normalize them and drop junk
+	// entries rather than failing the search on malformed LLM output.
+	parsed.KeywordExpansions = sanitizeKeywordExpansions(parsed.KeywordExpansions)
 	// Empty keywords with no filters is a valid browse/list-all intent; only
 	// the fallback paths above substitute the raw query as keywords.
 	return parsed, nil

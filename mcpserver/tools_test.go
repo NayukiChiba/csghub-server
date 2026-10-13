@@ -711,3 +711,37 @@ func TestSearchDatasets_UnderfilledTagSearchMergesTagsOnlyMatches(t *testing.T) 
 	require.Equal(t, "ceval-exam", result.Datasets[0].Name)
 	require.Equal(t, "scikit-learn-iris", result.Datasets[3].Name)
 }
+
+func TestParseDatasetQuery_KeywordExpansionsSanitized(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"多选题","keyword_expansions":[{"term":" 多选题 ","equivalents":["Multiple Choice","multiple choice","多选题","数据集",""]},{"term":"","equivalents":["x"]},{"term":"火星","equivalents":[]}],"reason":"多选题数据集"}`, nil).Once()
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
+
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "有没有多选题数据集"})
+	require.NoError(t, err)
+	// trimmed/lowercased, duplicates/stopwords/empty entries dropped
+	require.Equal(t, []KeywordExpansion{{Term: "多选题", Equivalents: []string{"multiple choice"}}}, result.KeywordExpansions)
+}
+
+func TestSearchDatasets_KeywordExpansionsWidenGroups(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.datasets = []*types.Dataset{{Path: "root/demo", Name: "demo"}}
+	ds.total = 1
+
+	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "多选题",
+		KeywordExpansions: []KeywordExpansion{
+			{Term: "多选题", Equivalents: []string{"multiple choice", "multiple-choice"}},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, ds.lastFilter)
+	// the source term and its LLM equivalents form one OR group
+	require.Len(t, ds.lastFilter.SearchGroups, 1)
+	require.Contains(t, ds.lastFilter.SearchGroups[0], "多选题")
+	require.Contains(t, ds.lastFilter.SearchGroups[0], "multiple choice")
+	require.Contains(t, ds.lastFilter.SearchGroups[0], "multiple-choice")
+}

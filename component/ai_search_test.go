@@ -382,3 +382,23 @@ func TestAISearchChat_DetailIntentWrongNamespaceFallsBackToBareName(t *testing.T
 	require.Contains(t, events[0].Text, "数据集 csg_opencompass/mmlu 的基本信息")
 	require.Equal(t, "csg_opencompass/mmlu", events[1].Datasets[0].Namespace+"/"+events[1].Datasets[0].Name)
 }
+
+// The LLM's keyword expansions must flow from parse into the search filter so
+// a Chinese query can hit English dataset docs.
+func TestAISearchChat_KeywordExpansionsPassThrough(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	comp, ds := newAISearchTestComponent(cfg,
+		[]*types.Dataset{{Path: "opencompass/mmlu", Name: "mmlu"}}, 1, llmClient)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"多选题","keyword_expansions":[{"term":"多选题","equivalents":["multiple choice","multiple-choice"]}],"reason":"多选题数据集"}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "有没有多选题数据集"})
+	require.Len(t, events, 2)
+	require.NotNil(t, ds.lastFilter)
+	require.Len(t, ds.lastFilter.SearchGroups, 1)
+	require.Contains(t, ds.lastFilter.SearchGroups[0], "多选题")
+	require.Contains(t, ds.lastFilter.SearchGroups[0], "multiple choice")
+}

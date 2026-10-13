@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -244,16 +245,82 @@ var segmentKeysByLen = func() []string {
 	return keys
 }()
 
+// KeywordExpansion carries equivalent expressions for one source keyword,
+// produced by the query-parsing LLM (e.g. 多选题 -> multiple choice,
+// multiple-choice). Equivalents are OR-combined with the source term inside
+// its query group, so a Chinese query can hit English README/description
+// content without any hardcoded cross-lingual word list. Groups stay
+// AND-combined, so the strict keyword semantics are unchanged.
+type KeywordExpansion struct {
+	Term        string   `json:"term" jsonschema:"the source keyword, as it appears in keywords"`
+	Equivalents []string `json:"equivalents" jsonschema:"1-8 equivalent or synonymous expressions; include the common english form when the source term is not english"`
+}
+
+// maxEquivalentsPerTerm caps LLM-provided expansions so one term cannot blow
+// up the tsquery with dozens of OR branches.
+const maxEquivalentsPerTerm = 8
+
+// sanitizeKeywordExpansions normalizes LLM- or caller-provided expansions:
+// lowercases and trims, drops empty terms, stopwords and duplicates, and caps
+// the equivalents per term. Invalid entries are dropped silently — expansion
+// is a best-effort recall aid and must never fail the search.
+func sanitizeKeywordExpansions(expansions []KeywordExpansion) []KeywordExpansion {
+	var out []KeywordExpansion
+	for _, exp := range expansions {
+		term := strings.ToLower(strings.TrimSpace(exp.Term))
+		if term == "" || queryStopwords[term] {
+			continue
+		}
+		seen := map[string]bool{term: true}
+		var equivalents []string
+		for _, eq := range exp.Equivalents {
+			eq = strings.ToLower(strings.TrimSpace(eq))
+			if eq == "" || queryStopwords[eq] || seen[eq] {
+				continue
+			}
+			seen[eq] = true
+			equivalents = append(equivalents, eq)
+			if len(equivalents) >= maxEquivalentsPerTerm {
+				break
+			}
+		}
+		if len(equivalents) == 0 {
+			continue
+		}
+		out = append(out, KeywordExpansion{Term: term, Equivalents: equivalents})
+	}
+	return out
+}
+
 // buildKeywordGroups converts raw keywords into query term groups: one group
 // per semantic term, synonyms OR-combined inside the group. Unspaced Chinese
 // tokens are first segmented against the synonym keys; stopwords are dropped.
-func buildKeywordGroups(keywords string) [][]string {
+// LLM-provided expansions are merged into the group of their source term.
+func buildKeywordGroups(keywords string, expansions []KeywordExpansion) [][]string {
+	equivByTerm := make(map[string][]string)
+	for _, exp := range sanitizeKeywordExpansions(expansions) {
+		equivByTerm[exp.Term] = exp.Equivalents
+	}
 	var groups [][]string
-	appendTerm := func(term string) {
+	appendTerm := func(term, token string) {
 		if term == "" || queryStopwords[term] {
 			return
 		}
-		groups = append(groups, expandToken(term))
+		// expandToken returns the shared synonym group slice; clone before
+		// appending so LLM equivalents never mutate the global word list.
+		group := slices.Clone(expandToken(term))
+		equivs := equivByTerm[term]
+		if len(equivs) == 0 && term != token {
+			// the LLM may key an expansion by the whole raw token (e.g.
+			// 多选题数据集) while segmentation split it; honor that too.
+			equivs = equivByTerm[token]
+		}
+		for _, eq := range equivs {
+			if !slices.Contains(group, eq) {
+				group = append(group, eq)
+			}
+		}
+		groups = append(groups, group)
 	}
 	for _, token := range splitQueryTokens(strings.ToLower(keywords)) {
 		if token == "" || queryStopwords[token] {
@@ -261,11 +328,11 @@ func buildKeywordGroups(keywords string) [][]string {
 		}
 		if segments := segmentCJK(token); segments != nil {
 			for _, seg := range segments {
-				appendTerm(seg)
+				appendTerm(seg, token)
 			}
 			continue
 		}
-		appendTerm(token)
+		appendTerm(token, token)
 	}
 	return groups
 }
