@@ -775,3 +775,85 @@ func TestSearchDatasets_KeywordExpansionsWidenGroups(t *testing.T) {
 	require.Contains(t, ds.lastFilter.SearchGroups[0], "multiple choice")
 	require.Contains(t, ds.lastFilter.SearchGroups[0], "multiple-choice")
 }
+
+// Explicit date expressions in the query override the LLM's date fields
+// wholesale: the model occasionally misreads compact forms ("10.12" observed
+// as 2026-02-12), so dates are parsed deterministically in Go.
+func TestParseDatasetQuery_ExplicitDateOverridesLLM(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"","created_after":"2026-02-12","sort":"recently_update"}`, nil).Once()
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
+
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "2026-10-12之后创建的数据集"})
+	require.NoError(t, err)
+	require.Equal(t, "2026-10-12", result.CreatedAfter)
+	require.Empty(t, result.CreatedBefore)
+	require.Empty(t, result.UpdatedAfter)
+	require.Empty(t, result.UpdatedBefore)
+	// an explicit date outranks the vague recently_update ordering
+	require.Empty(t, result.Sort)
+}
+
+// Update phrasing routes the deterministic date to the updated bounds.
+func TestParseDatasetQuery_ExplicitDateUpdatePhrasing(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"","created_after":"2026-10-12"}`, nil).Once()
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
+
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "2026-10-12之后更新的数据集"})
+	require.NoError(t, err)
+	require.Equal(t, "2026-10-12", result.UpdatedAfter)
+	require.Empty(t, result.CreatedAfter)
+}
+
+// When the query carries no recognizable date expression, the LLM's date
+// fields survive untouched.
+func TestParseDatasetQuery_FuzzyDateKeepsLLMFields(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"","updated_after":"2026-07-13","sort":"recently_update"}`, nil).Once()
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
+
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "最近更新的数据集"})
+	require.NoError(t, err)
+	require.Equal(t, "2026-07-13", result.UpdatedAfter)
+	require.Equal(t, "recently_update", result.Sort)
+}
+
+func TestSearchDatasetsByDate_MapsDateField(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.datasets = []*types.Dataset{{Path: "root/demo", Name: "demo"}}
+	ds.total = 1
+
+	_, err := exec.SearchDatasetsByDate(context.Background(), SearchDatasetsByDateArgs{
+		DateField: "updated",
+		After:     "2026-10-12",
+		Before:    "2026-10-13",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, ds.lastFilter.UpdatedAfter)
+	require.Equal(t, "2026-10-12", ds.lastFilter.UpdatedAfter.Format(time.DateOnly))
+	require.NotNil(t, ds.lastFilter.UpdatedBefore)
+	require.Nil(t, ds.lastFilter.CreatedAfter)
+
+	_, err = exec.SearchDatasetsByDate(context.Background(), SearchDatasetsByDateArgs{
+		DateField: "created",
+		After:     "2026-10-01",
+	})
+	require.NoError(t, err)
+	require.NotNil(t, ds.lastFilter.CreatedAfter)
+	require.Nil(t, ds.lastFilter.UpdatedAfter)
+
+	_, err = exec.SearchDatasetsByDate(context.Background(), SearchDatasetsByDateArgs{DateField: "modified", After: "2026-10-01"})
+	require.Error(t, err)
+	_, err = exec.SearchDatasetsByDate(context.Background(), SearchDatasetsByDateArgs{DateField: "created"})
+	require.Error(t, err)
+}

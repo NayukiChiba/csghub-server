@@ -3,6 +3,7 @@ package component
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"opencsg.com/csghub-server/builder/dataviewer"
@@ -74,6 +75,9 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		// failure; this guard only covers unexpected errors.
 		parsed = &mcpserver.ParseDatasetQueryResult{Keywords: message, Fallback: true}
 	}
+	// keep the parse on record: chat requests otherwise leave no trace, so a
+	// misparsed query (a wrong date, a guessed tag) cannot be investigated.
+	slog.Info("ai dataset chat", slog.String("message", truncateRunes(message, 200)), slog.Any("parsed", parsed))
 
 	if parsed.Intent == "other" {
 		return emit(types.AIChatEvent{Type: types.AIChatEventText, Text: offTopicAnswer})

@@ -126,7 +126,7 @@ func (e *ToolExecutor) ResolveLLMConfig(ctx context.Context) (endpoint, model, a
 }
 
 // ToolNames lists all registered tool names.
-var ToolNames = []string{"search_datasets", "list_dataset_tags", "get_dataset_detail", "parse_dataset_query"}
+var ToolNames = []string{"search_datasets", "list_dataset_tags", "get_dataset_detail", "parse_dataset_query", "search_datasets_by_date"}
 
 // ---------- search_datasets ----------
 
@@ -350,6 +350,43 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		return result, nil
 	}
 	return &SearchDatasetsResult{}, nil
+}
+
+// ---------- search_datasets_by_date ----------
+
+// SearchDatasetsByDateArgs is the explicit date-window search: dates arrive
+// as plain YYYY-MM-DD and are applied exactly, with no natural-language date
+// interpretation anywhere on the path.
+type SearchDatasetsByDateArgs struct {
+	DateField string `json:"date_field" jsonschema:"which date to filter on: created (creation/upload) or updated (last update)"`
+	After     string `json:"after,omitempty" jsonschema:"only datasets whose date is on or after this day, YYYY-MM-DD"`
+	Before    string `json:"before,omitempty" jsonschema:"only datasets whose date is on or before this day, YYYY-MM-DD"`
+	Keywords  string `json:"keywords,omitempty" jsonschema:"optional extra search terms matched against dataset name and description"`
+	Page      int    `json:"page,omitempty" jsonschema:"page number, starting at 1"`
+	Per       int    `json:"per,omitempty" jsonschema:"page size, max 50"`
+}
+
+// SearchDatasetsByDate is a thin deterministic wrapper over SearchDatasets:
+// it only maps the date window onto the created_at/updated_at bounds.
+func (e *ToolExecutor) SearchDatasetsByDate(ctx context.Context, args SearchDatasetsByDateArgs) (*SearchDatasetsResult, error) {
+	field := strings.ToLower(strings.TrimSpace(args.DateField))
+	if field != "created" && field != "updated" {
+		return nil, fmt.Errorf("date_field must be \"created\" or \"updated\"")
+	}
+	if strings.TrimSpace(args.After) == "" && strings.TrimSpace(args.Before) == "" {
+		return nil, fmt.Errorf("after or before is required")
+	}
+	searchArgs := SearchDatasetsArgs{
+		Keywords: args.Keywords,
+		Page:     args.Page,
+		Per:      args.Per,
+	}
+	if field == "created" {
+		searchArgs.CreatedAfter, searchArgs.CreatedBefore = args.After, args.Before
+	} else {
+		searchArgs.UpdatedAfter, searchArgs.UpdatedBefore = args.After, args.Before
+	}
+	return e.SearchDatasets(ctx, searchArgs)
 }
 
 // parseDateBound parses a YYYY-MM-DD (or RFC3339) date bound; endOfDay makes
@@ -762,6 +799,28 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	// Expansions are a best-effort recall aid: normalize them and drop junk
 	// entries rather than failing the search on malformed LLM output.
 	parsed.KeywordExpansions = sanitizeKeywordExpansions(parsed.KeywordExpansions)
+	// Dates are NOT trusted to the LLM: compact forms like "10.12" are
+	// occasionally misread (observed as 2026-02-12), so an explicitly
+	// recognized date expression overrides the LLM's date fields wholesale.
+	// Unrecognized fuzzy phrasings keep the LLM's interpretation.
+	if dc := extractDateConstraint(args.Query, time.Now()); dc != nil {
+		format := func(t *time.Time) string {
+			if t == nil {
+				return ""
+			}
+			return t.Format(time.DateOnly)
+		}
+		parsed.CreatedAfter, parsed.CreatedBefore, parsed.UpdatedAfter, parsed.UpdatedBefore = "", "", "", ""
+		if dc.updated {
+			parsed.UpdatedAfter, parsed.UpdatedBefore = format(dc.after), format(dc.before)
+		} else {
+			parsed.CreatedAfter, parsed.CreatedBefore = format(dc.after), format(dc.before)
+		}
+		// an explicit date outranks the vague "recently updated" ordering
+		if parsed.Sort == "recently_update" {
+			parsed.Sort = ""
+		}
+	}
 	// Empty keywords with no filters is a valid browse/list-all intent; only
 	// the fallback paths above substitute the raw query as keywords.
 	return parsed, nil
@@ -782,6 +841,11 @@ func (e *ToolExecutor) Execute(ctx context.Context, name string, arguments strin
 		var args SearchDatasetsArgs
 		if err = json.Unmarshal([]byte(arguments), &args); err == nil {
 			result, err = e.SearchDatasets(ctx, args)
+		}
+	case "search_datasets_by_date":
+		var args SearchDatasetsByDateArgs
+		if err = json.Unmarshal([]byte(arguments), &args); err == nil {
+			result, err = e.SearchDatasetsByDate(ctx, args)
 		}
 	case "list_dataset_tags":
 		var args ListDatasetTagsArgs

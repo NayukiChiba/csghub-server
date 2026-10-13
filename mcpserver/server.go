@@ -66,5 +66,18 @@ func NewDatasetMCPServer(exec *ToolExecutor) *mcp.Server {
 		return nil, result, nil
 	})
 
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "search_datasets_by_date",
+		Description: "Search CSGHub datasets filtered by an explicit date window on the creation or " +
+			"update date. Dates are plain YYYY-MM-DD and applied exactly as given — no natural-language " +
+			"date guessing. Combine with optional keywords.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args SearchDatasetsByDateArgs) (*mcp.CallToolResult, *SearchDatasetsResult, error) {
+		result, err := exec.SearchDatasetsByDate(ctx, args)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, result, nil
+	})
+
 	return server
 }
