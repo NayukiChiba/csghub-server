@@ -203,8 +203,9 @@ func TestSearchDatasets_StrictAttemptsExhaustedReturnsEmpty(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, result.Total)
 	require.Empty(t, result.Datasets)
-	// text+tag and tags-only, both keeping the tag filter
-	require.Len(t, ds.filters, 2)
+	// content keywords gate the tags-only attempt off: only the strict
+	// text+tag attempt runs
+	require.Len(t, ds.filters, 1)
 	for _, filter := range ds.filters {
 		require.NotEmpty(t, filter.Tags)
 	}
@@ -331,10 +332,8 @@ func TestSearchDatasets_ZeroSizeBoundsAreIgnored(t *testing.T) {
 	require.Nil(t, ds.lastFilter.RepoSizeMax)
 }
 
-// When the LLM produced exact tag filters, a tags-only strict attempt runs
-// before giving up: keywords are the least reliable channel (e.g. "许可证"
-// matches nothing in name/description), while tags come from the real
-// vocabulary.
+// When the query carries no content keywords (the LLM expressed everything
+// via exact tag filters), a tags-only strict attempt runs before giving up.
 func TestSearchDatasets_TagsOnlyAttemptBeforeEmpty(t *testing.T) {
 	exec, ds, _, _ := newTestExecutor()
 	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
@@ -345,9 +344,7 @@ func TestSearchDatasets_TagsOnlyAttemptBeforeEmpty(t *testing.T) {
 	}
 
 	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
-		Keywords: "MIT 许可证 图像",
-		Modality: "image",
-		Tags:     []TagArg{{Category: "license", Name: "mit"}},
+		Tags: []TagArg{{Category: "license", Name: "mit"}},
 	})
 	require.NoError(t, err)
 	require.Equal(t, 1, result.Total)
@@ -356,6 +353,39 @@ func TestSearchDatasets_TagsOnlyAttemptBeforeEmpty(t *testing.T) {
 	require.Empty(t, ds.lastFilter.SearchGroups)
 	require.Len(t, ds.lastFilter.Tags, 1)
 	require.Equal(t, "mit", ds.lastFilter.Tags[0].Name)
+
+	// stopword-only keywords are "no content keywords" too
+	result, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "数据集",
+		Tags:     []TagArg{{Category: "license", Name: "mit"}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.Empty(t, ds.lastFilter.Search)
+}
+
+// With real content keywords the tags-only attempt must NOT fire: dropping a
+// core keyword constraint (多模态评估) and answering with datasets that merely
+// carry an LLM-guessed tag is the silent relaxation strict AND forbids.
+func TestSearchDatasets_TagsOnlySkippedWhenKeywordsPresent(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if filter.Search == "" && len(filter.Tags) > 0 {
+			// the tags-only join would match, but must never be consulted
+			return []*types.Dataset{{Path: "root/qa", Name: "qa"}}, 1, nil
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "多模态评估",
+		Tags:     []TagArg{{Category: "task", Name: "question-answering"}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, result.Total)
+	require.Empty(t, result.Datasets)
+	// every attempted filter kept the keyword search; none went tags-only
+	require.NotEmpty(t, ds.lastFilter.Search)
 }
 
 // Keywords-only queries must not trigger the tags-only attempt.
