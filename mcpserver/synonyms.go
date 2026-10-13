@@ -340,11 +340,21 @@ func sanitizeKeywordExpansions(expansions []KeywordExpansion) []KeywordExpansion
 // buildKeywordGroups converts raw keywords into query term groups: one group
 // per semantic term, synonyms OR-combined inside the group. Unspaced Chinese
 // tokens are first segmented against the synonym keys; stopwords are dropped.
-// LLM-provided expansions are merged into the group of their source term.
+// LLM-provided expansions are merged into the group of their source term; an
+// expansion keyed by a multi-word phrase (term="multiple choice" while the
+// keywords tokenize into separate words) is merged into every constituent
+// word's group, so the phrase's equivalents are not lost.
 func buildKeywordGroups(keywords string, expansions []KeywordExpansion) [][]string {
 	equivByTerm := make(map[string][]string)
+	equivByWord := make(map[string][]string)
 	for _, exp := range sanitizeKeywordExpansions(expansions) {
 		equivByTerm[exp.Term] = exp.Equivalents
+		words := splitQueryTokens(exp.Term)
+		if len(words) > 1 {
+			for _, w := range words {
+				equivByWord[w] = append(equivByWord[w], exp.Equivalents...)
+			}
+		}
 	}
 	var groups [][]string
 	appendTerm := func(term, token string) {
@@ -355,10 +365,12 @@ func buildKeywordGroups(keywords string, expansions []KeywordExpansion) [][]stri
 		// appending so LLM equivalents never mutate the global word list.
 		group := slices.Clone(expandToken(term))
 		equivs := equivByTerm[term]
-		if len(equivs) == 0 && term != token {
+		equivs = append(equivs, equivByWord[term]...)
+		if term != token {
 			// the LLM may key an expansion by the whole raw token (e.g.
 			// 多选题数据集) while segmentation split it; honor that too.
-			equivs = equivByTerm[token]
+			equivs = append(equivs, equivByTerm[token]...)
+			equivs = append(equivs, equivByWord[token]...)
 		}
 		for _, eq := range equivs {
 			if !slices.Contains(group, eq) {

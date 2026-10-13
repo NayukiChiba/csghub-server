@@ -169,3 +169,25 @@ func TestStripContentLangTerms(t *testing.T) {
 	// unknown content lang: keywords untouched
 	require.Equal(t, "french reviews", stripContentLangTerms("french reviews", ""))
 }
+
+func TestBuildKeywordGroups_MultiWordExpansionTermSpreadsToWords(t *testing.T) {
+	// the LLM keys the expansion by the whole phrase while keywords tokenize
+	// into separate words; the equivalents must not be lost
+	groups := buildKeywordGroups("multiple choice", []KeywordExpansion{
+		{Term: "multiple choice", Equivalents: []string{"multiple-choice", "mcq"}},
+	})
+	require.Len(t, groups, 2)
+	for _, g := range groups {
+		require.Contains(t, g, "multiple-choice")
+		require.Contains(t, g, "mcq")
+	}
+	require.Contains(t, groups[0], "multiple")
+	require.Contains(t, groups[1], "choice")
+
+	// single-word terms are unaffected by the spreading
+	groups = buildKeywordGroups("多选题", []KeywordExpansion{
+		{Term: "多选题", Equivalents: []string{"multiple choice"}},
+	})
+	require.Len(t, groups, 1)
+	require.Contains(t, groups[0], "multiple choice")
+}
