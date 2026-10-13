@@ -191,13 +191,18 @@ func TestSearchDatasets_TagsAndPaginationCaps(t *testing.T) {
 
 // When every strict attempt (text+tag, then tags-only) comes back empty the
 // result stays empty: the tag filter is never silently dropped to zero-AND.
+// When every strict attempt (text+tag, then text without the tag) comes back
+// empty the result stays empty. Crucially the tags-only attempt — which would
+// drop the user's content keywords and answer with datasets that merely carry
+// an LLM-guessed tag — must never fire while keywords exist.
 func TestSearchDatasets_StrictAttemptsExhaustedReturnsEmpty(t *testing.T) {
 	exec, ds, _, _ := newTestExecutor()
 	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
-		if len(filter.Tags) > 0 {
-			return nil, 0, nil
+		if filter.Search == "" && len(filter.Tags) > 0 {
+			// the tags-only join would match, but must never be consulted
+			return []*types.Dataset{{Path: "root/speech-zh", Name: "speech-zh"}}, 1, nil
 		}
-		return []*types.Dataset{{Path: "root/speech-zh", Name: "speech-zh"}}, 1, nil
+		return nil, 0, nil
 	}
 
 	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
@@ -207,11 +212,10 @@ func TestSearchDatasets_StrictAttemptsExhaustedReturnsEmpty(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 0, result.Total)
 	require.Empty(t, result.Datasets)
-	// content keywords gate the tags-only attempt off: only the strict
-	// text+tag attempt runs
-	require.Len(t, ds.filters, 1)
+	// every attempted filter kept the keyword search; none went tags-only
+	require.NotEmpty(t, ds.filters)
 	for _, filter := range ds.filters {
-		require.NotEmpty(t, filter.Tags)
+		require.NotEmpty(t, filter.Search)
 	}
 }
 
@@ -1051,4 +1055,34 @@ func TestSearchDatasets_TagsOnlyEmptyFallsToTagNameText(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, result.Total)
 	require.Equal(t, "mmlu", result.Datasets[0].Name)
+}
+
+// A correct-but-sparse tag must not cut away genuine keyword matches: when
+// the strict keyword+tag combination finds nothing, the keyword groups are
+// retried without the LLM-guessed tag filter.
+func TestSearchDatasets_KeywordsRetriedWithoutTags(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	var filters []*types.RepoFilter
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		filters = append(filters, filter)
+		if len(filter.Tags) > 0 {
+			return nil, 0, nil // the tag join under-recalls
+		}
+		if filter.Search != "" {
+			return []*types.Dataset{{Path: "csg_opencompass/mmlu", Name: "mmlu"}}, 1, nil
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "multiple choice",
+		Tags:     []TagArg{{Category: "task", Name: "multiple-choice"}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.Equal(t, "mmlu", result.Datasets[0].Name)
+	// first attempt kept the tag, the winning one dropped it but kept keywords
+	require.Len(t, filters[0].Tags, 1)
+	require.Empty(t, filters[len(filters)-1].Tags)
+	require.NotEmpty(t, filters[len(filters)-1].Search)
 }

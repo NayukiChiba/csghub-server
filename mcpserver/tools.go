@@ -312,7 +312,11 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	//  3. strict AND over auxiliary groups only (keywords dropped) — keywords
 	//     are the least reliable channel when the LLM also produced exact tag
 	//     filters from the real vocabulary
-	//  4. tags only — exact tag joins with no text search at all; only when
+	//  4. strict AND over keyword groups without the tag filters — LLM-guessed
+	//     tags have incomplete coverage, so a correct tag can still cut away
+	//     genuine keyword matches (多选题: only one dataset carries the
+	//     multiple-choice tag while several READMEs describe the task)
+	//  5. tags only — exact tag joins with no text search at all; only when
 	//     there are no content keywords, see below
 	type attempt struct {
 		groups   [][]string
@@ -329,6 +333,9 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 				attempts = append(attempts, attempt{groups: auxGroups})
 			}
 		}
+	}
+	if len(args.Tags) > 0 && len(kwGroups) > 0 {
+		attempts = append(attempts, attempt{groups: kwGroups, dropTags: true})
 	}
 	// A tags-only attempt drops the keyword constraint entirely, so it is
 	// legitimate only when there is nothing to drop: keywords empty or fully
