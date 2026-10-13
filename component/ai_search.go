@@ -38,7 +38,7 @@ func NewDatasetToolExecutor(cfg *config.Config) (*mcpserver.ToolExecutor, error)
 	if err != nil {
 		return nil, fmt.Errorf("create repo component: %w", err)
 	}
-	return mcpserver.NewToolExecutor(dsComp, repoComp, database.NewTagStore(), llm.NewClient(), cfg, database.NewAgentConfigStore()), nil
+	return mcpserver.NewToolExecutor(dsComp, repoComp, database.NewTagStore(), database.NewRepositoryStatisticsStore(), llm.NewClient(), cfg, database.NewAgentConfigStore()), nil
 }
 
 func NewAISearchComponent(cfg *config.Config) (AISearchComponent, error) {
@@ -95,14 +95,16 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 	}
 
 	result, err := c.exec.SearchDatasets(ctx, mcpserver.SearchDatasetsArgs{
-		Keywords:     parsed.Keywords,
-		Tags:         parsed.Tags,
-		Modality:     parsed.Modality,
-		Language:     parsed.Language,
-		MinSizeBytes: parsed.MinSizeBytes,
-		MaxSizeBytes: parsed.MaxSizeBytes,
-		Sort:         parsed.Sort,
-		Per:          10,
+		Keywords:      parsed.Keywords,
+		Tags:          parsed.Tags,
+		Modality:      parsed.Modality,
+		Language:      parsed.Language,
+		MinSizeBytes:  parsed.MinSizeBytes,
+		MaxSizeBytes:  parsed.MaxSizeBytes,
+		CreatedAfter:  parsed.CreatedAfter,
+		CreatedBefore: parsed.CreatedBefore,
+		Sort:          parsed.Sort,
+		Per:           10,
 	})
 	if err != nil {
 		return fmt.Errorf("search datasets: %w", err)
@@ -152,7 +154,9 @@ func isBrowseIntent(parsed *mcpserver.ParseDatasetQueryResult) bool {
 		parsed.Modality == "" &&
 		parsed.Language == "" &&
 		parsed.MinSizeBytes == nil &&
-		parsed.MaxSizeBytes == nil
+		parsed.MaxSizeBytes == nil &&
+		parsed.CreatedAfter == "" &&
+		parsed.CreatedBefore == ""
 }
 
 // composeChatAnswer renders the deterministic text answer from the parse and
@@ -169,15 +173,36 @@ func composeChatAnswer(parsed *mcpserver.ParseDatasetQueryResult, result *mcpser
 	case isBrowseIntent(parsed) && result.Total == 0:
 		b.WriteString("平台上目前还没有数据集。")
 	case isBrowseIntent(parsed):
-		fmt.Fprintf(&b, "平台目前共有 %d 个数据集：", result.Total)
+		fmt.Fprintf(&b, "平台目前共有 %d 个数据集%s：", result.Total, sortSuffix(parsed.Sort))
 	case result.Total == 0:
 		b.WriteString("没有找到符合条件的数据集。建议放宽筛选条件（去掉模态、语言或大小限制），或换个关键词再试。")
 	case result.Relaxed:
 		fmt.Fprintf(&b, "严格筛选没有完全匹配的结果，放宽条件后为您找到 %d 个相关数据集（按相关度排序）：", result.Total)
 	default:
-		fmt.Fprintf(&b, "为您找到 %d 个相关数据集：", result.Total)
+		fmt.Fprintf(&b, "为您找到 %d 个相关数据集%s：", result.Total, sortSuffix(parsed.Sort))
 	}
 	return b.String()
+}
+
+// sortSuffix notes the active ordering in the answer so "最大的数据集" is
+// visibly answered by size, not by an unexplained order.
+func sortSuffix(sort string) string {
+	switch sort {
+	case "largest":
+		return "（按体积从大到小排序）"
+	case "smallest":
+		return "（按体积从小到大排序）"
+	case "most_download":
+		return "（按下载量排序）"
+	case "most_favorite":
+		return "（按收藏量排序）"
+	case "most_star":
+		return "（按星标数排序）"
+	case "recently_update":
+		return "（按最近更新排序）"
+	default:
+		return ""
+	}
 }
 
 // offTopicAnswer is the fixed refusal for messages unrelated to datasets

@@ -47,7 +47,7 @@ func (f *aiSearchFakeTags) AllDatasetTags(ctx context.Context) ([]*database.Tag,
 
 func newAISearchTestComponent(cfg *config.Config, datasets []*types.Dataset, total int, llmClient *mockllm.MockLLMSvcClient) (AISearchComponent, *aiSearchFakeDatasets) {
 	ds := &aiSearchFakeDatasets{datasets: datasets, total: total}
-	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, &aiSearchFakeTags{}, llmClient, cfg, nil)
+	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, &aiSearchFakeTags{}, nil, llmClient, cfg, nil)
 	return NewAISearchComponentWithDeps(cfg, exec), ds
 }
 
@@ -232,7 +232,7 @@ func TestAISearchChat_TagsIntent(t *testing.T) {
 		{Category: "task", Name: "automatic-speech-recognition"},
 		{Category: "license", Name: "mit"},
 	}}
-	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, tags, llmClient, cfg, nil)
+	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, tags, nil, llmClient, cfg, nil)
 	comp := NewAISearchComponentWithDeps(cfg, exec)
 
 	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).

@@ -10,6 +10,10 @@ type DatasetSummary struct {
 	Tags        []string `json:"tags,omitempty"`
 	Downloads   int64    `json:"downloads"`
 	Likes       int64    `json:"likes"`
+	// Size is the default-branch repository size in bytes; zero when unknown.
+	Size int64 `json:"size,omitempty"`
+	// CreatedAt is the repository creation date (YYYY-MM-DD).
+	CreatedAt string `json:"created_at,omitempty"`
 }
 
 // AIChatMessage is one message in the AI dataset chat history.

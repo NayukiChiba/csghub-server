@@ -5,6 +5,7 @@
 package mcpserver
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -38,6 +39,12 @@ type DatasetTagLister interface {
 	AllDatasetTags(ctx context.Context) ([]*database.Tag, error)
 }
 
+// RepoSizeLister loads per-branch repository statistics; implemented by
+// database.RepoStatisticsStore.
+type RepoSizeLister interface {
+	FindByRepositoryIDs(ctx context.Context, repoIDs []int64) ([]*database.RepositoryStatistics, error)
+}
+
 const (
 	// readmePreviewLimit caps how many readme bytes get_dataset_detail returns.
 	readmePreviewLimit = 4000
@@ -51,16 +58,18 @@ type ToolExecutor struct {
 	datasets     DatasetSearcher
 	repo         RepoFileReader
 	tags         DatasetTagLister
+	repoStats    RepoSizeLister
 	llm          llm.LLMSvcClient
 	cfg          *config.Config
 	agentConfigs database.AgentConfigStore
 }
 
-func NewToolExecutor(datasets DatasetSearcher, repo RepoFileReader, tags DatasetTagLister, llmClient llm.LLMSvcClient, cfg *config.Config, agentConfigs database.AgentConfigStore) *ToolExecutor {
+func NewToolExecutor(datasets DatasetSearcher, repo RepoFileReader, tags DatasetTagLister, repoStats RepoSizeLister, llmClient llm.LLMSvcClient, cfg *config.Config, agentConfigs database.AgentConfigStore) *ToolExecutor {
 	return &ToolExecutor{
 		datasets:     datasets,
 		repo:         repo,
 		tags:         tags,
+		repoStats:    repoStats,
 		llm:          llmClient,
 		cfg:          cfg,
 		agentConfigs: agentConfigs,
@@ -118,15 +127,17 @@ type TagArg struct {
 }
 
 type SearchDatasetsArgs struct {
-	Keywords     string   `json:"keywords,omitempty" jsonschema:"search terms matched against dataset name and description; space-separated, chinese or english; synonyms are expanded automatically"`
-	Tags         []TagArg `json:"tags,omitempty" jsonschema:"exact tag filters (AND-combined); discover valid values with list_dataset_tags"`
-	Modality     string   `json:"modality,omitempty" jsonschema:"data modality filter: image, audio, video, text, 3d or multimodal; expanded to synonyms and matched against name and description"`
-	Language     string   `json:"language,omitempty" jsonschema:"natural language of the dataset content, e.g. chinese, english, 中文; expanded to synonyms"`
-	MinSizeBytes *int64   `json:"min_size_bytes,omitempty" jsonschema:"minimum repository size in bytes; omit unless the user specifies a size"`
-	MaxSizeBytes *int64   `json:"max_size_bytes,omitempty" jsonschema:"maximum repository size in bytes; omit unless the user specifies a size"`
-	Sort         string   `json:"sort,omitempty" jsonschema:"sort order: trending, recently_update, most_download, most_favorite or most_star"`
-	Page         int      `json:"page,omitempty" jsonschema:"page number, starting at 1"`
-	Per          int      `json:"per,omitempty" jsonschema:"page size, max 50"`
+	Keywords      string   `json:"keywords,omitempty" jsonschema:"search terms matched against dataset name and description; space-separated, chinese or english; synonyms are expanded automatically"`
+	Tags          []TagArg `json:"tags,omitempty" jsonschema:"exact tag filters (AND-combined); discover valid values with list_dataset_tags"`
+	Modality      string   `json:"modality,omitempty" jsonschema:"data modality filter: image, audio, video, text, 3d or multimodal; expanded to synonyms and matched against name and description"`
+	Language      string   `json:"language,omitempty" jsonschema:"natural language of the dataset content, e.g. chinese, english, 中文; expanded to synonyms"`
+	MinSizeBytes  *int64   `json:"min_size_bytes,omitempty" jsonschema:"minimum repository size in bytes; omit unless the user specifies a size"`
+	MaxSizeBytes  *int64   `json:"max_size_bytes,omitempty" jsonschema:"maximum repository size in bytes; omit unless the user specifies a size"`
+	CreatedAfter  string   `json:"created_after,omitempty" jsonschema:"only datasets created on or after this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
+	CreatedBefore string   `json:"created_before,omitempty" jsonschema:"only datasets created on or before this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
+	Sort          string   `json:"sort,omitempty" jsonschema:"sort order: trending, recently_update, most_download, most_favorite, most_star, largest (biggest repo size first) or smallest"`
+	Page          int      `json:"page,omitempty" jsonschema:"page number, starting at 1"`
+	Per           int      `json:"per,omitempty" jsonschema:"page size, max 50"`
 }
 
 type SearchDatasetsResult struct {
@@ -152,6 +163,7 @@ func summarize(ds *types.Dataset) types.DatasetSummary {
 		Description: ds.Description,
 		Downloads:   ds.Downloads,
 		Likes:       ds.Likes,
+		CreatedAt:   ds.CreatedAt.Format(time.DateOnly),
 	}
 	for _, t := range ds.Tags {
 		s.Tags = append(s.Tags, t.Name)
@@ -169,6 +181,16 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		auxGroups = append(auxGroups, expandToken(lang))
 	}
 
+	createdAfter, err := parseDateBound(args.CreatedAfter, false)
+	if err != nil {
+		return nil, err
+	}
+	createdBefore, err := parseDateBound(args.CreatedBefore, true)
+	if err != nil {
+		return nil, err
+	}
+	sizeSort := args.Sort == "largest" || args.Sort == "smallest"
+
 	newFilter := func(groups [][]string, any bool, dropTags, tagsOnly bool) *types.RepoFilter {
 		// Search mirrors the raw query text: it keeps the store layer on the
 		// full-text branch (which requires a non-empty Search) and
@@ -183,12 +205,14 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 			search = strings.ToLower(strings.TrimSpace(args.Modality + " " + args.Language))
 		}
 		filter := &types.RepoFilter{
-			Search:       search,
-			SearchGroups: groups,
-			SearchAny:    any,
-			RepoSizeMin:  args.MinSizeBytes,
-			RepoSizeMax:  args.MaxSizeBytes,
-			Sort:         args.Sort,
+			Search:        search,
+			SearchGroups:  groups,
+			SearchAny:     any,
+			RepoSizeMin:   args.MinSizeBytes,
+			RepoSizeMax:   args.MaxSizeBytes,
+			CreatedAfter:  createdAfter,
+			CreatedBefore: createdBefore,
+			Sort:          args.Sort,
 		}
 		if !dropTags {
 			for _, t := range args.Tags {
@@ -263,9 +287,16 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		attempts = append(attempts, attempt{groups: allGroups, any: true, relaxed: true, dropTags: true})
 	}
 
+	// Size orderings are also applied client-side: the full-text search path
+	// ranks by relevance and ignores SQL ORDER BY, so a single wider window
+	// is fetched and re-sorted by size before paging.
+	queryPer, queryPage := per, page
+	if sizeSort {
+		queryPer, queryPage = maxPerPage, 1
+	}
 	for i, att := range attempts {
 		filter := newFilter(att.groups, att.any, att.dropTags, att.tagsOnly)
-		datasets, total, err := e.datasets.Index(ctx, filter, per, page, false)
+		datasets, total, err := e.datasets.Index(ctx, filter, queryPer, queryPage, false)
 		if err != nil {
 			return nil, fmt.Errorf("search datasets: %w", err)
 		}
@@ -276,9 +307,80 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		for _, ds := range datasets {
 			result.Datasets = append(result.Datasets, summarize(ds))
 		}
+		e.fillSizes(ctx, datasets, result.Datasets)
+		if sizeSort {
+			sortDatasetsBySize(result.Datasets, args.Sort)
+			result.Datasets = slicePage(result.Datasets, per, page)
+		}
 		return result, nil
 	}
 	return &SearchDatasetsResult{}, nil
+}
+
+// parseDateBound parses a YYYY-MM-DD (or RFC3339) date bound; endOfDay makes
+// a date-only upper bound inclusive of that whole day.
+func parseDateBound(value string, endOfDay bool) (*time.Time, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return nil, nil
+	}
+	if t, err := time.Parse(time.DateOnly, v); err == nil {
+		if endOfDay {
+			t = t.Add(24*time.Hour - time.Nanosecond)
+		}
+		return &t, nil
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return &t, nil
+	}
+	return nil, fmt.Errorf("invalid date %q, want YYYY-MM-DD", value)
+}
+
+// fillSizes populates the Size field of each summary from the repository
+// statistics of its default branch. Best-effort: failures leave sizes at 0.
+func (e *ToolExecutor) fillSizes(ctx context.Context, datasets []*types.Dataset, summaries []types.DatasetSummary) {
+	if e.repoStats == nil || len(datasets) == 0 {
+		return
+	}
+	type statsKey struct {
+		repoID int64
+		branch string
+	}
+	repoIDs := make([]int64, 0, len(datasets))
+	for _, ds := range datasets {
+		repoIDs = append(repoIDs, ds.RepositoryID)
+	}
+	stats, err := e.repoStats.FindByRepositoryIDs(ctx, repoIDs)
+	if err != nil {
+		slog.Warn("fill dataset sizes failed", slog.Any("error", err))
+		return
+	}
+	sizeByKey := make(map[statsKey]int64, len(stats))
+	for _, st := range stats {
+		sizeByKey[statsKey{st.RepositoryID, st.Branch}] = st.TotalSize
+	}
+	for i, ds := range datasets {
+		summaries[i].Size = sizeByKey[statsKey{ds.RepositoryID, ds.DefaultBranch}]
+	}
+}
+
+func sortDatasetsBySize(datasets []types.DatasetSummary, sort string) {
+	slices.SortFunc(datasets, func(a, b types.DatasetSummary) int {
+		if sort == "smallest" {
+			return cmp.Compare(a.Size, b.Size)
+		}
+		return cmp.Compare(b.Size, a.Size)
+	})
+}
+
+// slicePage extracts the requested page from a wider pre-fetched window.
+func slicePage(datasets []types.DatasetSummary, per, page int) []types.DatasetSummary {
+	begin := (page - 1) * per
+	if begin >= len(datasets) {
+		return nil
+	}
+	end := min(begin+per, len(datasets))
+	return datasets[begin:end]
 }
 
 // ---------- list_dataset_tags ----------
@@ -374,9 +476,12 @@ type ParseDatasetQueryResult struct {
 	Language     string   `json:"language,omitempty"`
 	MinSizeBytes *int64   `json:"min_size_bytes,omitempty"`
 	MaxSizeBytes *int64   `json:"max_size_bytes,omitempty"`
+	// CreatedAfter/CreatedBefore bound the dataset creation date (YYYY-MM-DD).
+	CreatedAfter  string `json:"created_after,omitempty"`
+	CreatedBefore string `json:"created_before,omitempty"`
 	// Sort is the native list ordering (trending, recently_update,
-	// most_download, most_favorite, most_star); only set when the user asks
-	// for an ordering such as "下载最多".
+	// most_download, most_favorite, most_star, largest, smallest); only set
+	// when the user asks for an ordering such as "下载最多" or "最大的数据集".
 	Sort string `json:"sort,omitempty"`
 	// Fallback is true when the LLM was unavailable or its output could not be
 	// parsed; Keywords then holds the raw query for plain keyword search.
@@ -385,6 +490,7 @@ type ParseDatasetQueryResult struct {
 }
 
 const parseQueryPrompt = `You convert natural-language dataset search queries into structured filters for the CSGHub dataset search tool.
+Current date: %s.
 Respond with a JSON object only, no markdown fences, no explanation. Schema:
 {"intent": "search | browse | tags | other",
  "keywords": "space separated english keywords matched against dataset name and description",
@@ -392,10 +498,12 @@ Respond with a JSON object only, no markdown fences, no explanation. Schema:
  "modality": "image|audio|video|text|3d (optional, omit if unsure)",
  "language": "chinese|english|... (optional, the natural language of dataset content)",
  "min_size_bytes": "number, omit unless the user specifies a size", "max_size_bytes": "number, omit unless the user specifies a size",
- "sort": "trending|recently_update|most_download|most_favorite|most_star (optional, only when the user asks for an ordering)",
+ "created_after": "YYYY-MM-DD, omit unless the user constrains the creation/upload date", "created_before": "YYYY-MM-DD, omit unless the user constrains the creation/upload date",
+ "sort": "trending|recently_update|most_download|most_favorite|most_star|largest|smallest (optional, only when the user asks for an ordering)",
  "reason": "one short sentence describing the user's search intent only; do NOT describe or assume the dataset's content"}
-Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "browse" ONLY when the user wants to list or browse datasets without any criteria (e.g. "有哪些数据集", "what datasets are available") — keywords and all filters MUST be empty for browse; a message that names any topic, modality or data type (e.g. "视频数据集", "图像分类的数据", "中文数据集有哪些") is always "search" with the corresponding keywords/modality/language filled in; use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
-Sort rules: ordering words are NOT search keywords — map them to the sort field instead (下载最多/最多下载/最热门 -> most_download, 收藏最多 -> most_favorite, 星标最多/最多 star -> most_star, 最近更新/最新 -> recently_update, 热门趋势 -> trending). A query that only asks for an ordering (e.g. "下载最多的数据集有哪些", "most downloaded datasets") is "browse" with sort set; omit sort when the user does not ask for an ordering.
+Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "browse" ONLY when the user wants to list or browse datasets without any criteria (e.g. "有哪些数据集", "what datasets are available") — keywords and all filters MUST be empty for browse; a message that names any topic, modality or data type (e.g. "视频数据集", "图像分类的数据", "中文数据集有哪些") is always "search" with the corresponding keywords/modality/language filled in; a date or size constraint is a criterion too, so such queries are "search" (with empty keywords if there is nothing else, e.g. "2025年之后上传的数据集" -> intent=search, created_after=2025-01-01); use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
+Sort rules: ordering words are NOT search keywords — map them to the sort field instead (下载最多/最多下载/最热门 -> most_download, 收藏最多 -> most_favorite, 星标最多/最多 star -> most_star, 最近更新/最新 -> recently_update, 体积最大/数据量最大/最大的 -> largest, 体积最小/最小的 -> smallest, 热门趋势 -> trending). A query that only asks for an ordering (e.g. "下载最多的数据集有哪些", "most downloaded datasets") is "browse" with sort set; omit sort when the user does not ask for an ordering.
+Date rules: convert relative dates (上个月, 去年, 最近三个月) to absolute YYYY-MM-DD using the current date above; an open-ended range sets only one bound (2025年之后 -> created_after=2025-01-01).
 %sWhen the query mentions a task type, license, or content language that matches a known tag, emit it as a tag filter with the exact category and name from the vocabulary (文本分类 -> task/text-classification, 目标检测 -> task/object-detection, 中文 -> language/zh, 英文 -> language/en). Prefer the modality field over task tags for pure modality words (语音/音频 -> audio, 图像/图片 -> image, 视频 -> video, 文本 -> text).
 Do not repeat in keywords what you already expressed via tags, modality, language, sort or size filters; keywords are only for the remaining free-text concepts. Omit fields you cannot infer.`
 
@@ -465,7 +573,7 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	content, err := e.llm.Chat(llmCtx, endpoint, "", headers, types.LLMReqBody{
 		Model: model,
 		Messages: []types.LLMMessage{
-			{Role: "system", Content: fmt.Sprintf(parseQueryPrompt, tagVocab)},
+			{Role: "system", Content: fmt.Sprintf(parseQueryPrompt, time.Now().Format(time.DateOnly), tagVocab)},
 			{Role: "user", Content: query},
 		},
 	})
@@ -490,8 +598,16 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	}
 	// Only the native sort orders are accepted; an unrecognized LLM-emitted
 	// value would silently fall back to the store default, so drop it here.
-	if !slices.Contains(types.Sorts, parsed.Sort) {
+	if !slices.Contains(types.DatasetSorts, parsed.Sort) {
 		parsed.Sort = ""
+	}
+	// Same for date bounds: an unparseable LLM-emitted value would otherwise
+	// fail the whole search; dropping it keeps the rest of the criteria.
+	if _, err := parseDateBound(parsed.CreatedAfter, false); err != nil {
+		parsed.CreatedAfter = ""
+	}
+	if _, err := parseDateBound(parsed.CreatedBefore, true); err != nil {
+		parsed.CreatedBefore = ""
 	}
 	// Empty keywords with no filters is a valid browse/list-all intent; only
 	// the fallback paths above substitute the raw query as keywords.

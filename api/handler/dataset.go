@@ -142,8 +142,8 @@ func (h *DatasetHandler) Index(ctx *gin.Context) {
 		httpbase.BadRequestWithExt(ctx, errorx.ReqParamInvalid(err, errorx.Ctx().Set("query", "repo_size_range")))
 		return
 	}
-	if !slices.Contains(types.Sorts, filter.Sort) {
-		err = fmt.Errorf("sort parameter must be one of %v", types.Sorts)
+	if !slices.Contains(types.DatasetSorts, filter.Sort) {
+		err = fmt.Errorf("sort parameter must be one of %v", types.DatasetSorts)
 		err = errorx.ReqParamInvalid(err, errorx.Ctx().Set("query", "sort_filter"))
 		slog.ErrorContext(ctx.Request.Context(), "Bad sort request format,", slog.Any("error", err))
 		httpbase.BadRequestWithExt(ctx, err)

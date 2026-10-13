@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -69,7 +70,7 @@ func newTestExecutor() (*ToolExecutor, *fakeDatasetSearcher, *fakeRepoFileReader
 	ds := &fakeDatasetSearcher{}
 	repo := &fakeRepoFileReader{}
 	tags := &fakeTagLister{}
-	exec := NewToolExecutor(ds, repo, tags, nil, &config.Config{}, nil)
+	exec := NewToolExecutor(ds, repo, tags, nil, nil, &config.Config{}, nil)
 	return exec, ds, repo, tags
 }
 
@@ -260,7 +261,7 @@ func TestParseDatasetQuery_BrowseIntentKeepsEmptyKeywords(t *testing.T) {
 	llmClient := mockllm.NewMockLLMSvcClient(t)
 	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(`{"intent":"browse","keywords":"","reason":"user wants to browse all datasets"}`, nil).Once()
-	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, llmClient, cfg, nil)
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, llmClient, cfg, nil)
 
 	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "现在有哪些数据集"})
 	require.NoError(t, err)
@@ -278,7 +279,7 @@ func TestParseDatasetQuery_ZeroSizeBoundsAreDropped(t *testing.T) {
 	llmClient := mockllm.NewMockLLMSvcClient(t)
 	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(`{"intent":"browse","keywords":"","min_size_bytes":0,"max_size_bytes":0}`, nil).Once()
-	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, llmClient, cfg, nil)
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, llmClient, cfg, nil)
 
 	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "现在有哪些数据集"})
 	require.NoError(t, err)
@@ -294,7 +295,7 @@ func TestParseDatasetQuery_SortWhitelist(t *testing.T) {
 		Return(`{"intent":"browse","keywords":"","sort":"most_download"}`, nil).Once()
 	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(`{"intent":"browse","keywords":"","sort":"download_count desc"}`, nil).Once()
-	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, llmClient, cfg, nil)
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, llmClient, cfg, nil)
 
 	valid, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "下载最多的数据集"})
 	require.NoError(t, err)
@@ -394,7 +395,7 @@ func TestParseDatasetQuery_PromptContainsTagVocab(t *testing.T) {
 		{Category: "task", Name: "text-classification"},
 		{Category: "language", Name: "zh"},
 	}}
-	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, tags, llmClient, cfg, nil)
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, tags, nil, llmClient, cfg, nil)
 
 	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "中文数据集有哪些"})
 	require.NoError(t, err)
@@ -415,4 +416,109 @@ func TestExecute_Dispatch(t *testing.T) {
 
 	_, err = exec.Execute(context.Background(), "no_such_tool", `{}`)
 	require.Error(t, err)
+}
+
+type fakeRepoSizeLister struct {
+	// sizes maps repository ID to the total size of branch "main"
+	sizes map[int64]int64
+	err   error
+}
+
+func (f *fakeRepoSizeLister) FindByRepositoryIDs(ctx context.Context, repoIDs []int64) ([]*database.RepositoryStatistics, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []*database.RepositoryStatistics
+	for _, id := range repoIDs {
+		if size, ok := f.sizes[id]; ok {
+			out = append(out, &database.RepositoryStatistics{RepositoryID: id, Branch: "main", TotalSize: size})
+		}
+	}
+	return out, nil
+}
+
+func TestParseDateBound(t *testing.T) {
+	after, err := parseDateBound("2025-06-01", false)
+	require.NoError(t, err)
+	require.Equal(t, "2025-06-01T00:00:00Z", after.Format(time.RFC3339))
+
+	before, err := parseDateBound("2025-06-01", true)
+	require.NoError(t, err)
+	// a date-only upper bound covers the whole day
+	require.Equal(t, "2025-06-01", before.Format(time.DateOnly))
+	require.Equal(t, 23, before.Hour())
+	require.Equal(t, 59, before.Minute())
+
+	rfc, err := parseDateBound("2025-06-01T10:30:00Z", false)
+	require.NoError(t, err)
+	require.Equal(t, 10, rfc.Hour())
+
+	none, err := parseDateBound("", false)
+	require.NoError(t, err)
+	require.Nil(t, none)
+
+	_, err = parseDateBound("2025-13-40", false)
+	require.Error(t, err)
+}
+
+func TestSearchDatasets_CreatedDateBounds(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.datasets = []*types.Dataset{{Path: "root/demo", Name: "demo"}}
+	ds.total = 1
+
+	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		CreatedAfter:  "2025-06-01",
+		CreatedBefore: "2025-12-31",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "2025-06-01", ds.lastFilter.CreatedAfter.Format(time.DateOnly))
+	require.Equal(t, "2025-12-31", ds.lastFilter.CreatedBefore.Format(time.DateOnly))
+	require.Equal(t, 23, ds.lastFilter.CreatedBefore.Hour())
+
+	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{CreatedAfter: "not-a-date"})
+	require.Error(t, err)
+}
+
+// Size orderings re-sort the relevance-ranked search window by actual size
+// and fill the Size field on every summary.
+func TestSearchDatasets_SizeSortFillsSizesAndReorders(t *testing.T) {
+	ds := &fakeDatasetSearcher{
+		datasets: []*types.Dataset{
+			{Path: "root/small", Name: "small", RepositoryID: 1, DefaultBranch: "main"},
+			{Path: "root/big", Name: "big", RepositoryID: 2, DefaultBranch: "main"},
+			{Path: "root/mid", Name: "mid", RepositoryID: 3, DefaultBranch: "main"},
+		},
+		total: 3,
+	}
+	stats := &fakeRepoSizeLister{sizes: map[int64]int64{1: 100, 2: 300, 3: 200}}
+	exec := NewToolExecutor(ds, &fakeRepoFileReader{}, &fakeTagLister{}, stats, nil, &config.Config{}, nil)
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Sort: "largest", Per: 2})
+	require.NoError(t, err)
+	require.Equal(t, 3, result.Total)
+	require.Len(t, result.Datasets, 2)
+	require.Equal(t, "big", result.Datasets[0].Name)
+	require.Equal(t, int64(300), result.Datasets[0].Size)
+	require.Equal(t, "mid", result.Datasets[1].Name)
+	require.Equal(t, int64(200), result.Datasets[1].Size)
+
+	result, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Sort: "smallest"})
+	require.NoError(t, err)
+	require.Equal(t, "small", result.Datasets[0].Name)
+}
+
+func TestParseDatasetQuery_DropsInvalidSortAndDates(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"search","keywords":"","sort":"largest","created_after":"2025-01-01","created_before":"2025-13-40"}`, nil).Once()
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, llmClient, cfg, nil)
+
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "2025年之后最大的数据集"})
+	require.NoError(t, err)
+	require.Equal(t, "largest", result.Sort)
+	require.Equal(t, "2025-01-01", result.CreatedAfter)
+	// an unparseable date must not fail the whole search
+	require.Empty(t, result.CreatedBefore)
 }

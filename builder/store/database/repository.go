@@ -1276,7 +1276,7 @@ func (s *repoStoreImpl) publicToUser(ctx context.Context, repoType types.Reposit
 		return
 	}
 
-	q.Order(sortBy[filter.Sort])
+	q.Order(repoOrderBy(repoType, filter.Sort))
 
 	count, err = s.countRepoList(ctx, q, per, page)
 	err = errorx.HandleDBError(err, errorx.Ctx().
@@ -1630,7 +1630,7 @@ func (s *repoStoreImpl) publicToUserV2(ctx context.Context, repoType types.Repos
 		return
 	}
 
-	q.Order(sortBy[filter.Sort])
+	q.Order(repoOrderBy(repoType, filter.Sort))
 
 	count, err = q.Count(ctx)
 	err = errorx.HandleDBError(err, errorx.Ctx().
@@ -1880,6 +1880,8 @@ func (s *repoStoreImpl) getCacheKey(q *bun.SelectQuery, repoType types.Repositor
 		ModelParamsMax      *float64
 		RepoSizeMin         *int64
 		RepoSizeMax         *int64
+		CreatedAfter        *time.Time
+		CreatedBefore       *time.Time
 		SearchGroups        [][]string
 		SearchAny           bool
 	}{
@@ -1899,6 +1901,8 @@ func (s *repoStoreImpl) getCacheKey(q *bun.SelectQuery, repoType types.Repositor
 		ModelParamsMax:      filter.ModelParamsMax,
 		RepoSizeMin:         filter.RepoSizeMin,
 		RepoSizeMax:         filter.RepoSizeMax,
+		CreatedAfter:        filter.CreatedAfter,
+		CreatedBefore:       filter.CreatedBefore,
 		SearchGroups:        filter.SearchGroups,
 		SearchAny:           filter.SearchAny,
 	}
@@ -2046,6 +2050,12 @@ func applyRepoComplianceFilter(q *bun.SelectQuery, repoAlias string, filter *typ
 }
 
 func applyRepoRangeFilters(q *bun.SelectQuery, repoType types.RepositoryType, repoAlias string, filter *types.RepoFilter) {
+	if filter.CreatedAfter != nil {
+		q.Where(repoAlias+".created_at >= ?", *filter.CreatedAfter)
+	}
+	if filter.CreatedBefore != nil {
+		q.Where(repoAlias+".created_at <= ?", *filter.CreatedBefore)
+	}
 	if repoType == types.ModelRepo && (filter.ModelParamsMin != nil || filter.ModelParamsMax != nil) {
 		q.Join(fmt.Sprintf("INNER JOIN metadata AS range_metadata ON range_metadata.repository_id = %s.id", repoAlias))
 		if filter.ModelParamsMin != nil {
@@ -2056,7 +2066,11 @@ func applyRepoRangeFilters(q *bun.SelectQuery, repoType types.RepositoryType, re
 		}
 	}
 
-	if repoType == types.DatasetRepo && (filter.RepoSizeMin != nil || filter.RepoSizeMax != nil) {
+	// The statistics join backs both the size range bounds and the
+	// largest/smallest orderings (datasets only, see repoOrderBy).
+	needStatsJoin := filter.RepoSizeMin != nil || filter.RepoSizeMax != nil ||
+		filter.Sort == "largest" || filter.Sort == "smallest"
+	if repoType == types.DatasetRepo && needStatsJoin {
 		q.Join(fmt.Sprintf(
 			"INNER JOIN repository_statistics AS range_repository_statistics ON range_repository_statistics.repository_id = %s.id AND range_repository_statistics.branch = %s.default_branch",
 			repoAlias,
@@ -2069,6 +2083,21 @@ func applyRepoRangeFilters(q *bun.SelectQuery, repoType types.RepositoryType, re
 			q.Where("range_repository_statistics.total_size <= ?", *filter.RepoSizeMax)
 		}
 	}
+}
+
+// repoOrderBy resolves the ORDER BY expression for a repository list query.
+// Size orderings are only valid for dataset queries: other repo types never
+// get the range_repository_statistics join, so the expression is dropped to
+// avoid emitting SQL that references a missing table alias.
+func repoOrderBy(repoType types.RepositoryType, sort string) string {
+	expr, ok := sortBy[sort]
+	if !ok {
+		return ""
+	}
+	if (sort == "largest" || sort == "smallest") && repoType != types.DatasetRepo {
+		return ""
+	}
+	return expr
 }
 
 func buildLikeQuery(q *bun.SelectQuery, filter *types.RepoFilter, limit int) {
@@ -2249,9 +2278,8 @@ func (s *repoStoreImpl) ListRepoByDeployType(ctx context.Context, repoType types
 			q.Join("LEFT JOIN (" + subQuery.String() + ") AS recom_repo_scores ON repository.id = recom_repo_scores.repository_id")
 			q.ColumnExpr(`COALESCE(recom_repo_scores.score, 0) AS popularity`)
 		}
-		sortByStr, exits := sortBy[sort]
-		if exits {
-			orderBy = sortByStr
+		if ob := repoOrderBy(repoType, sort); ob != "" {
+			orderBy = ob
 		}
 	}
 

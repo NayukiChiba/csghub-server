@@ -139,6 +139,10 @@ const (
 var (
 	Sorts   = []string{"trending", "recently_update", "most_download", "most_favorite", "most_star"}
 	Sources = []string{"opencsg", "huggingface", "local"}
+	// DatasetSorts extends Sorts with repository-size orderings; only dataset
+	// queries back them with the repository_statistics join, so other repo
+	// types must not accept them.
+	DatasetSorts = []string{"trending", "recently_update", "most_download", "most_favorite", "most_star", "largest", "smallest"}
 )
 
 type RepoRequest struct {
@@ -360,6 +364,9 @@ type RepoFilter struct {
 	ModelParamsMax      *float64
 	RepoSizeMin         *int64
 	RepoSizeMax         *int64
+	// CreatedAfter/CreatedBefore bound repository.created_at (inclusive).
+	CreatedAfter  *time.Time
+	CreatedBefore *time.Time
 	// SearchGroups holds pre-tokenized query term groups for full-text
 	// search: terms inside a group are OR-combined (synonyms), groups are
 	// combined with AND by default, or with OR when SearchAny is true
