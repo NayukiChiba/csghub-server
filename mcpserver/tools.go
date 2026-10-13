@@ -237,6 +237,15 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 			if contentLang == "" {
 				search = strings.ToLower(strings.TrimSpace(search + " " + args.Language))
 			}
+			if search == "" {
+				// group-only attempts (e.g. tag-name text top-up) still need
+				// a non-empty Search so the store takes the full-text branch
+				var terms []string
+				for _, g := range groups {
+					terms = append(terms, g...)
+				}
+				search = strings.ToLower(strings.Join(terms, " "))
+			}
 		}
 		filter := &types.RepoFilter{
 			Search:        search,
@@ -329,6 +338,19 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	// relaxation the strict AND semantics forbid.
 	if len(args.Tags) > 0 && len(kwGroups) == 0 {
 		attempts = append(attempts, attempt{tagsOnly: true})
+		// Tag coverage is incomplete on the platform (e.g. HF task_ids never
+		// became tags), so an exact tag join under-recalls: a full-text
+		// search on the tag names themselves catches datasets whose README
+		// describes the task without carrying the tag.
+		var tagGroups [][]string
+		for _, t := range args.Tags {
+			if name := strings.TrimSpace(t.Name); name != "" {
+				tagGroups = append(tagGroups, []string{name})
+			}
+		}
+		if len(tagGroups) > 0 {
+			attempts = append(attempts, attempt{groups: tagGroups, dropTags: true})
+		}
 	}
 	if len(attempts) == 0 {
 		attempts = append(attempts, attempt{})
@@ -361,6 +383,30 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 			datasets, total, err = e.topUpUnderfilled(ctx, newFilter, allGroups, datasets, total, per, queryPer, queryPage)
 			if err != nil {
 				return nil, err
+			}
+		}
+		// An under-filled tags-only page suffers the same incomplete tag
+		// coverage: fill it from the tag-name text search (the next attempt)
+		// instead of reporting only the few tag carriers.
+		if att.tagsOnly && total > 0 && total < per && i < len(attempts)-1 {
+			next := attempts[i+1]
+			if !next.tagsOnly {
+				extra, extraTotal, err := e.datasets.Index(ctx, newFilter(next.groups, next.any, next.dropTags, false), queryPer, queryPage, false)
+				if err != nil {
+					return nil, fmt.Errorf("top up tags-only search datasets: %w", err)
+				}
+				total = max(total, extraTotal)
+				seen := make(map[string]bool, len(datasets))
+				for _, ds := range datasets {
+					seen[ds.Path] = true
+				}
+				for _, ds := range extra {
+					if !seen[ds.Path] {
+						seen[ds.Path] = true
+						datasets = append(datasets, ds)
+					}
+				}
+				total = max(total, len(datasets))
 			}
 		}
 		result := &SearchDatasetsResult{Total: total}

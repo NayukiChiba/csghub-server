@@ -181,9 +181,12 @@ func TestSearchDatasets_TagsAndPaginationCaps(t *testing.T) {
 		Page: -1,
 	})
 	require.NoError(t, err)
-	require.Len(t, ds.lastFilter.Tags, 1)
-	require.Equal(t, "task", ds.lastFilter.Tags[0].Category)
-	require.Equal(t, "image-classification", ds.lastFilter.Tags[0].Name)
+	// the tags-only attempt keeps the tag filter in place (a later top-up
+	// query may follow it)
+	require.NotEmpty(t, ds.filters)
+	require.Len(t, ds.filters[0].Tags, 1)
+	require.Equal(t, "task", ds.filters[0].Tags[0].Category)
+	require.Equal(t, "image-classification", ds.filters[0].Tags[0].Name)
 }
 
 // When every strict attempt (text+tag, then tags-only) comes back empty the
@@ -337,7 +340,9 @@ func TestSearchDatasets_ZeroSizeBoundsAreIgnored(t *testing.T) {
 // via exact tag filters), a tags-only strict attempt runs before giving up.
 func TestSearchDatasets_TagsOnlyAttemptBeforeEmpty(t *testing.T) {
 	exec, ds, _, _ := newTestExecutor()
+	var filters []*types.RepoFilter
 	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		filters = append(filters, filter)
 		if filter.Search == "" && len(filter.Tags) > 0 {
 			return []*types.Dataset{{Path: "root/img", Name: "img"}}, 1, nil
 		}
@@ -350,19 +355,24 @@ func TestSearchDatasets_TagsOnlyAttemptBeforeEmpty(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, result.Total)
 	// the winning attempt is tags-only: no text search, tag filter kept
-	require.Empty(t, ds.lastFilter.Search)
-	require.Empty(t, ds.lastFilter.SearchGroups)
-	require.Len(t, ds.lastFilter.Tags, 1)
-	require.Equal(t, "mit", ds.lastFilter.Tags[0].Name)
+	require.Empty(t, filters[0].Search)
+	require.Empty(t, filters[0].SearchGroups)
+	require.Len(t, filters[0].Tags, 1)
+	require.Equal(t, "mit", filters[0].Tags[0].Name)
+	// the under-filled page is topped up from the tag-name text search
+	require.Len(t, filters, 2)
+	require.Equal(t, "mit", filters[1].Search)
+	require.Empty(t, filters[1].Tags)
 
 	// stopword-only keywords are "no content keywords" too
+	filters = nil
 	result, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
 		Keywords: "数据集",
 		Tags:     []TagArg{{Category: "license", Name: "mit"}},
 	})
 	require.NoError(t, err)
 	require.Equal(t, 1, result.Total)
-	require.Empty(t, ds.lastFilter.Search)
+	require.Empty(t, filters[0].Search)
 }
 
 // With real content keywords the tags-only attempt must NOT fire: dropping a
@@ -993,4 +1003,52 @@ func TestParseDatasetQuery_FallbackStillAppliesDateConstraint(t *testing.T) {
 	require.True(t, result.Fallback)
 	require.Equal(t, "2026-10-12", result.UpdatedAfter)
 	require.Empty(t, result.CreatedAfter)
+}
+
+// Tag coverage is incomplete (HF task_ids never became tags): an under-filled
+// tags-only page is topped up from a full-text search on the tag names.
+func TestSearchDatasets_TagsOnlyUnderfilledMergesTagNameTextMatches(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if filter.Search == "" && len(filter.Tags) > 0 {
+			// the tag join finds only the one dataset carrying the tag
+			return []*types.Dataset{{Path: "csg_opencompass/ceval-exam", Name: "ceval-exam"}}, 1, nil
+		}
+		if filter.Search == "multiple-choice" {
+			return []*types.Dataset{
+				{Path: "csg_opencompass/ceval-exam", Name: "ceval-exam"},
+				{Path: "csg_opencompass/mmlu", Name: "mmlu"},
+				{Path: "csg_opencompass/ai2_arc", Name: "ai2_arc"},
+			}, 3, nil
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Tags: []TagArg{{Category: "task", Name: "multiple-choice"}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 3, result.Total)
+	require.Len(t, result.Datasets, 3)
+	require.Equal(t, "csg_opencompass", result.Datasets[0].Namespace)
+	require.Equal(t, "ceval-exam", result.Datasets[0].Name)
+}
+
+// When the exact tag join finds nothing at all, the tag-name text search is
+// the last resort before reporting empty.
+func TestSearchDatasets_TagsOnlyEmptyFallsToTagNameText(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if filter.Search == "multiple-choice" && len(filter.Tags) == 0 {
+			return []*types.Dataset{{Path: "csg_opencompass/mmlu", Name: "mmlu"}}, 1, nil
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Tags: []TagArg{{Category: "task", Name: "multiple-choice"}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.Equal(t, "mmlu", result.Datasets[0].Name)
 }
