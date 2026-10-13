@@ -367,6 +367,9 @@ type RepoFilter struct {
 	// CreatedAfter/CreatedBefore bound repository.created_at (inclusive).
 	CreatedAfter  *time.Time
 	CreatedBefore *time.Time
+	// UpdatedAfter/UpdatedBefore bound repository.updated_at (inclusive).
+	UpdatedAfter  *time.Time
+	UpdatedBefore *time.Time
 	// SearchGroups holds pre-tokenized query term groups for full-text
 	// search: terms inside a group are OR-combined (synonyms), groups are
 	// combined with AND by default, or with OR when SearchAny is true

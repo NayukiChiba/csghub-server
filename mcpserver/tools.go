@@ -145,6 +145,8 @@ type SearchDatasetsArgs struct {
 	MaxSizeBytes  *int64   `json:"max_size_bytes,omitempty" jsonschema:"maximum repository size in bytes; omit unless the user specifies a size"`
 	CreatedAfter  string   `json:"created_after,omitempty" jsonschema:"only datasets created on or after this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
 	CreatedBefore string   `json:"created_before,omitempty" jsonschema:"only datasets created on or before this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
+	UpdatedAfter  string   `json:"updated_after,omitempty" jsonschema:"only datasets updated on or after this date, YYYY-MM-DD; omit unless the user constrains the update date"`
+	UpdatedBefore string   `json:"updated_before,omitempty" jsonschema:"only datasets updated on or before this date, YYYY-MM-DD; omit unless the user constrains the update date"`
 	Sort          string   `json:"sort,omitempty" jsonschema:"sort order: trending, recently_update, most_download, most_favorite, most_star, largest (biggest repo size first) or smallest"`
 	Page          int      `json:"page,omitempty" jsonschema:"page number, starting at 1"`
 	Per           int      `json:"per,omitempty" jsonschema:"page size, max 50"`
@@ -199,6 +201,14 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	if err != nil {
 		return nil, err
 	}
+	updatedAfter, err := parseDateBound(args.UpdatedAfter, false)
+	if err != nil {
+		return nil, err
+	}
+	updatedBefore, err := parseDateBound(args.UpdatedBefore, true)
+	if err != nil {
+		return nil, err
+	}
 	sizeSort := args.Sort == "largest" || args.Sort == "smallest"
 
 	newFilter := func(groups [][]string, any bool, dropTags, tagsOnly bool) *types.RepoFilter {
@@ -222,6 +232,8 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 			RepoSizeMax:   args.MaxSizeBytes,
 			CreatedAfter:  createdAfter,
 			CreatedBefore: createdBefore,
+			UpdatedAfter:  updatedAfter,
+			UpdatedBefore: updatedBefore,
 			Sort:          args.Sort,
 		}
 		if !dropTags {
@@ -574,6 +586,9 @@ type ParseDatasetQueryResult struct {
 	// CreatedAfter/CreatedBefore bound the dataset creation date (YYYY-MM-DD).
 	CreatedAfter  string `json:"created_after,omitempty"`
 	CreatedBefore string `json:"created_before,omitempty"`
+	// UpdatedAfter/UpdatedBefore bound the dataset update date (YYYY-MM-DD).
+	UpdatedAfter  string `json:"updated_after,omitempty"`
+	UpdatedBefore string `json:"updated_before,omitempty"`
 	// Sort is the native list ordering (trending, recently_update,
 	// most_download, most_favorite, most_star, largest, smallest); only set
 	// when the user asks for an ordering such as "下载最多" or "最大的数据集".
@@ -595,11 +610,12 @@ Respond with a JSON object only, no markdown fences, no explanation. Schema:
  "language": "chinese|english|... (optional, the natural language of dataset content)",
  "min_size_bytes": "number, omit unless the user specifies a size", "max_size_bytes": "number, omit unless the user specifies a size",
  "created_after": "YYYY-MM-DD, omit unless the user constrains the creation/upload date", "created_before": "YYYY-MM-DD, omit unless the user constrains the creation/upload date",
+ "updated_after": "YYYY-MM-DD, omit unless the user constrains the update date", "updated_before": "YYYY-MM-DD, omit unless the user constrains the update date",
  "sort": "trending|recently_update|most_download|most_favorite|most_star|largest|smallest (optional, only when the user asks for an ordering)",
  "reason": "one short sentence describing the user's search intent only; do NOT describe or assume the dataset's content"}
 Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "detail" when the user asks for the basic information of ONE specific named dataset — its purpose, modality, license, size or samples (e.g. "mmlu 这个数据集的基本信息", "介绍一下 ceval-exam", "opencompass/mmlu 的许可是什么", "这个数据集有什么用途" referring to a dataset named earlier) — set the dataset field to the name exactly as the user wrote it: the bare name unless the user explicitly wrote namespace/name, NEVER guess or invent a namespace; leave all filters empty; use "browse" ONLY when the user wants to list or browse datasets without any criteria (e.g. "有哪些数据集", "what datasets are available") — keywords and all filters MUST be empty for browse; a message that names any topic, modality or data type (e.g. "视频数据集", "图像分类的数据", "中文数据集有哪些") is always "search" with the corresponding keywords/modality/language filled in; a date or size constraint is a criterion too, so such queries are "search" (with empty keywords if there is nothing else, e.g. "2025年之后上传的数据集" -> intent=search, created_after=2025-01-01); use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
 Sort rules: ordering words are NOT search keywords — map them to the sort field instead (下载最多/最多下载/最热门 -> most_download, 收藏最多 -> most_favorite, 星标最多/最多 star -> most_star, 最近更新/最新 -> recently_update, 体积最大/数据量最大/最大的 -> largest, 体积最小/最小的 -> smallest, 热门趋势 -> trending). A query that only asks for an ordering (e.g. "下载最多的数据集有哪些", "most downloaded datasets") is "browse" with sort set; omit sort when the user does not ask for an ordering.
-Date rules: convert relative dates (上个月, 去年, 最近三个月) to absolute YYYY-MM-DD using the current date above; an open-ended range sets only one bound (2025年之后 -> created_after=2025-01-01).
+Date rules: convert relative dates (上个月, 去年, 最近三个月) to absolute YYYY-MM-DD using the current date above; an open-ended range sets only one bound (2025年之后 -> created_after=2025-01-01). Distinguish creation from update: use created_after/created_before ONLY for creation/upload phrasing (创建/上传/导入/发布); use updated_after/updated_before for update phrasing (更新/最近更新, e.g. "今天更新的数据集" -> updated_after=<today>); when the user asks for recently updated datasets without a concrete date, set sort=recently_update and leave all date bounds empty.
 %sWhen the query mentions a task type, license, or content language that matches a known tag, emit it as a tag filter with the exact category and name from the vocabulary (文本分类 -> task/text-classification, 目标检测 -> task/object-detection, 中文 -> language/zh, 英文 -> language/en). Prefer the modality field over task tags for pure modality words (语音/音频 -> audio, 图像/图片 -> image, 视频 -> video, 文本 -> text).
 Do not repeat in keywords what you already expressed via tags, modality, language, sort or size filters; keywords are only for the remaining free-text concepts. Omit fields you cannot infer.`
 
@@ -704,6 +720,12 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	}
 	if _, err := parseDateBound(parsed.CreatedBefore, true); err != nil {
 		parsed.CreatedBefore = ""
+	}
+	if _, err := parseDateBound(parsed.UpdatedAfter, false); err != nil {
+		parsed.UpdatedAfter = ""
+	}
+	if _, err := parseDateBound(parsed.UpdatedBefore, true); err != nil {
+		parsed.UpdatedBefore = ""
 	}
 	// Empty keywords with no filters is a valid browse/list-all intent; only
 	// the fallback paths above substitute the raw query as keywords.

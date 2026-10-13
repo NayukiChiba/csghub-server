@@ -1882,6 +1882,8 @@ func (s *repoStoreImpl) getCacheKey(q *bun.SelectQuery, repoType types.Repositor
 		RepoSizeMax         *int64
 		CreatedAfter        *time.Time
 		CreatedBefore       *time.Time
+		UpdatedAfter        *time.Time
+		UpdatedBefore       *time.Time
 		SearchGroups        [][]string
 		SearchAny           bool
 	}{
@@ -1903,6 +1905,8 @@ func (s *repoStoreImpl) getCacheKey(q *bun.SelectQuery, repoType types.Repositor
 		RepoSizeMax:         filter.RepoSizeMax,
 		CreatedAfter:        filter.CreatedAfter,
 		CreatedBefore:       filter.CreatedBefore,
+		UpdatedAfter:        filter.UpdatedAfter,
+		UpdatedBefore:       filter.UpdatedBefore,
 		SearchGroups:        filter.SearchGroups,
 		SearchAny:           filter.SearchAny,
 	}
@@ -2055,6 +2059,12 @@ func applyRepoRangeFilters(q *bun.SelectQuery, repoType types.RepositoryType, re
 	}
 	if filter.CreatedBefore != nil {
 		q.Where(repoAlias+".created_at <= ?", *filter.CreatedBefore)
+	}
+	if filter.UpdatedAfter != nil {
+		q.Where(repoAlias+".updated_at >= ?", *filter.UpdatedAfter)
+	}
+	if filter.UpdatedBefore != nil {
+		q.Where(repoAlias+".updated_at <= ?", *filter.UpdatedBefore)
 	}
 	if repoType == types.ModelRepo && (filter.ModelParamsMin != nil || filter.ModelParamsMax != nil) {
 		q.Join(fmt.Sprintf("INNER JOIN metadata AS range_metadata ON range_metadata.repository_id = %s.id", repoAlias))

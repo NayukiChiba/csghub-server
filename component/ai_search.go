@@ -108,6 +108,8 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		MaxSizeBytes:  parsed.MaxSizeBytes,
 		CreatedAfter:  parsed.CreatedAfter,
 		CreatedBefore: parsed.CreatedBefore,
+		UpdatedAfter:  parsed.UpdatedAfter,
+		UpdatedBefore: parsed.UpdatedBefore,
 		Sort:          parsed.Sort,
 		Per:           10,
 	})
@@ -161,7 +163,9 @@ func isBrowseIntent(parsed *mcpserver.ParseDatasetQueryResult) bool {
 		parsed.MinSizeBytes == nil &&
 		parsed.MaxSizeBytes == nil &&
 		parsed.CreatedAfter == "" &&
-		parsed.CreatedBefore == ""
+		parsed.CreatedBefore == "" &&
+		parsed.UpdatedAfter == "" &&
+		parsed.UpdatedBefore == ""
 }
 
 // composeChatAnswer renders the deterministic text answer from the parse and

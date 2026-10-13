@@ -513,7 +513,7 @@ func TestParseDatasetQuery_DropsInvalidSortAndDates(t *testing.T) {
 	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
 	llmClient := mockllm.NewMockLLMSvcClient(t)
 	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Return(`{"intent":"search","keywords":"","sort":"largest","created_after":"2025-01-01","created_before":"2025-13-40"}`, nil).Once()
+		Return(`{"intent":"search","keywords":"","sort":"largest","created_after":"2025-01-01","created_before":"2025-13-40","updated_after":"2026-10-01","updated_before":"10-13"}`, nil).Once()
 	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
 
 	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "2025年之后最大的数据集"})
@@ -522,6 +522,8 @@ func TestParseDatasetQuery_DropsInvalidSortAndDates(t *testing.T) {
 	require.Equal(t, "2025-01-01", result.CreatedAfter)
 	// an unparseable date must not fail the whole search
 	require.Empty(t, result.CreatedBefore)
+	require.Equal(t, "2026-10-01", result.UpdatedAfter)
+	require.Empty(t, result.UpdatedBefore)
 }
 
 type fakeDatasetViewer struct {
@@ -595,6 +597,24 @@ func TestGetDatasetDetail_ViewerFailureIsBestEffort(t *testing.T) {
 	require.Empty(t, detail.Splits)
 	require.Zero(t, detail.RowsNum)
 	require.Empty(t, detail.SampleColumns)
+}
+
+func TestSearchDatasets_UpdatedDateBounds(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.datasets = []*types.Dataset{{Path: "root/demo", Name: "demo"}}
+	ds.total = 1
+
+	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		UpdatedAfter:  "2026-10-01",
+		UpdatedBefore: "2026-10-13",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "2026-10-01", ds.lastFilter.UpdatedAfter.Format(time.DateOnly))
+	require.Equal(t, "2026-10-13", ds.lastFilter.UpdatedBefore.Format(time.DateOnly))
+	require.Equal(t, 23, ds.lastFilter.UpdatedBefore.Hour())
+
+	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{UpdatedBefore: "not-a-date"})
+	require.Error(t, err)
 }
 
 // A strict search whose page is under-filled by the LLM-guessed tag join is
