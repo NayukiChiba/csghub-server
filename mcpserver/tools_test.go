@@ -959,3 +959,21 @@ func TestSearchDatasets_DropsLanguageTagWhenContentLangSet(t *testing.T) {
 	require.Len(t, ds.lastFilter.Tags, 1)
 	require.Equal(t, "language", ds.lastFilter.Tags[0].Category)
 }
+
+// LLMs format integer fields inconsistently ("" or "1048576"); the parse
+// result must still decode instead of falling back to raw keyword search.
+func TestParseDatasetQueryResult_ToleratesStringSizeFields(t *testing.T) {
+	var r ParseDatasetQueryResult
+	err := json.Unmarshal([]byte(`{"keywords":"text classification","min_size_bytes":"","max_size_bytes":"1048576"}`), &r)
+	require.NoError(t, err)
+	require.Equal(t, "text classification", r.Keywords)
+	require.Nil(t, r.MinSizeBytes)
+	require.NotNil(t, r.MaxSizeBytes)
+	require.Equal(t, int64(1048576), *r.MaxSizeBytes)
+
+	// plain numbers keep working
+	err = json.Unmarshal([]byte(`{"keywords":"x","min_size_bytes":1024}`), &r)
+	require.NoError(t, err)
+	require.NotNil(t, r.MinSizeBytes)
+	require.Equal(t, int64(1024), *r.MinSizeBytes)
+}

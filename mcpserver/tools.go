@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -688,6 +689,38 @@ type ParseDatasetQueryResult struct {
 	// parsed; Keywords then holds the raw query for plain keyword search.
 	Fallback bool   `json:"fallback"`
 	Reason   string `json:"reason,omitempty"`
+}
+
+// UnmarshalJSON tolerates LLM-issued string values in the integer size
+// fields ("" or "1048576" instead of a number) instead of rejecting the
+// whole parse result — different models format these fields differently.
+func (r *ParseDatasetQueryResult) UnmarshalJSON(data []byte) error {
+	type plain ParseDatasetQueryResult
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for _, key := range []string{"min_size_bytes", "max_size_bytes"} {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil {
+			continue // already a number or null, standard decode handles it
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+		if err != nil {
+			delete(raw, key) // empty or unparsable: treat as absent
+			continue
+		}
+		raw[key] = json.RawMessage(strconv.FormatInt(n, 10))
+	}
+	fixed, err := json.Marshal(raw)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(fixed, (*plain)(r))
 }
 
 const parseQueryPrompt = `You convert natural-language dataset search queries into structured filters for the CSGHub dataset search tool.
