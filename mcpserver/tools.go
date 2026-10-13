@@ -181,15 +181,23 @@ func summarize(ds *types.Dataset) types.DatasetSummary {
 }
 
 func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsArgs) (*SearchDatasetsResult, error) {
-	kwGroups := buildKeywordGroups(args.Keywords, args.KeywordExpansions)
-	var auxGroups [][]string
-	if m := strings.ToLower(strings.TrimSpace(args.Modality)); m != "" {
-		auxGroups = append(auxGroups, expandToken(m))
-	}
 	// Chinese/English get a structured content-language filter: English
 	// datasets never say "english" in name/description, so full-text matching
 	// cannot express the condition. Other languages keep the text fallback.
 	contentLang := contentLangCode(args.Language)
+	keywords := args.Keywords
+	if contentLang != "" {
+		// the parser may repeat the language inside keywords ("English text
+		// classification" with Language=english); the structured filter
+		// already covers it, and a full-text group on the language word
+		// itself would match nothing real.
+		keywords = stripContentLangTerms(keywords, contentLang)
+	}
+	kwGroups := buildKeywordGroups(keywords, args.KeywordExpansions)
+	var auxGroups [][]string
+	if m := strings.ToLower(strings.TrimSpace(args.Modality)); m != "" {
+		auxGroups = append(auxGroups, expandToken(m))
+	}
 	if lang := strings.ToLower(strings.TrimSpace(args.Language)); lang != "" && contentLang == "" {
 		auxGroups = append(auxGroups, expandToken(lang))
 	}
@@ -213,12 +221,13 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	sizeSort := args.Sort == "largest" || args.Sort == "smallest"
 
 	newFilter := func(groups [][]string, any bool, dropTags, tagsOnly bool) *types.RepoFilter {
-		// Search mirrors the raw query text: it keeps the store layer on the
+		// Search mirrors the raw query text (language terms stripped when the
+		// structured filter covers them): it keeps the store layer on the
 		// full-text branch (which requires a non-empty Search) and
 		// participates in the cache key alongside the groups. Tags-only
 		// attempts must keep Search empty so the store takes the plain
 		// tag-join path instead of a full-text match on the raw keywords.
-		search := strings.ToLower(strings.TrimSpace(args.Keywords))
+		search := strings.ToLower(strings.TrimSpace(keywords))
 		if tagsOnly {
 			search = ""
 			groups = nil

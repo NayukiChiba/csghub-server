@@ -157,3 +157,15 @@ func countOccurrences(haystack []string, needle string) int {
 	}
 	return n
 }
+
+func TestStripContentLangTerms(t *testing.T) {
+	// the LLM often repeats the language inside keywords; the structured
+	// content_lang filter already covers it
+	require.Equal(t, "text classification", stripContentLangTerms("English text classification", "en"))
+	require.Equal(t, "文本 分类", stripContentLangTerms("英文文本分类", "en"))
+	require.Equal(t, "", stripContentLangTerms("english", "en"))
+	// a different language mention is a real criterion and stays
+	require.Equal(t, "english 语料", stripContentLangTerms("english 语料", "zh"))
+	// unknown content lang: keywords untouched
+	require.Equal(t, "french reviews", stripContentLangTerms("french reviews", ""))
+}

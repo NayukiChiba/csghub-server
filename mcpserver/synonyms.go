@@ -194,6 +194,36 @@ func contentLangCode(language string) string {
 	return ""
 }
 
+// stripContentLangTerms removes keyword tokens that merely name the language
+// already enforced by the structured content_lang filter (e.g. "english" in
+// "English text classification" when Language=english). LLM parsers often
+// repeat the language inside keywords; keeping it as a full-text group would
+// require documents to literally contain the word "english", which real
+// English datasets never do. Tokens naming a *different* language are kept.
+func stripContentLangTerms(keywords string, contentLang string) string {
+	marker := map[string]string{"zh": "chinese", "en": "english"}[contentLang]
+	if marker == "" {
+		return keywords
+	}
+	var kept []string
+	for _, token := range splitQueryTokens(strings.ToLower(keywords)) {
+		if token == "" {
+			continue
+		}
+		segments := segmentCJK(token)
+		if segments == nil {
+			segments = []string{token}
+		}
+		for _, seg := range segments {
+			if slices.Contains(expandToken(seg), marker) {
+				continue
+			}
+			kept = append(kept, seg)
+		}
+	}
+	return strings.Join(kept, " ")
+}
+
 // HasSearchTerms reports whether the raw message contains at least one term
 // from the synonym vocabulary (e.g. 中文, 视频, mit). Unknown raw words do
 // not count — "现在有哪些数据集" must stay a browse query. Used to catch LLM

@@ -899,3 +899,33 @@ func TestSearchDatasets_LanguageOnlyUsesContentLang(t *testing.T) {
 	require.Equal(t, "en", ds.lastFilter.ContentLang)
 	require.Empty(t, ds.lastFilter.SearchGroups)
 }
+
+// Language terms repeated inside keywords must not become full-text groups:
+// no real English document contains the word "english".
+func TestSearchDatasets_StripsRepeatedLanguageFromKeywords(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.datasets = []*types.Dataset{{Path: "root/iris", Name: "iris"}}
+	ds.total = 1
+
+	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "English text classification",
+		Language: "english",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "en", ds.lastFilter.ContentLang)
+	require.Equal(t, "text classification", ds.lastFilter.Search)
+	for _, group := range ds.lastFilter.SearchGroups {
+		require.NotContains(t, group, "english")
+		require.NotContains(t, group, "en")
+	}
+
+	// keywords that are only the language reduce to a content-lang browse
+	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "英文",
+		Language: "english",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "en", ds.lastFilter.ContentLang)
+	require.Empty(t, ds.lastFilter.Search)
+	require.Empty(t, ds.lastFilter.SearchGroups)
+}
