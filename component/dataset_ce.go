@@ -100,6 +100,7 @@ func (c *datasetComponentImpl) commonIndex(ctx context.Context, filter *types.Re
 			Downloads:            repo.DownloadCount,
 			Path:                 repo.Path,
 			RepositoryID:         repo.ID,
+			DefaultBranch:        repo.DefaultBranch,
 			Private:              repo.Private,
 			Tags:                 tags,
 			CreatedAt:            dataset.CreatedAt,
