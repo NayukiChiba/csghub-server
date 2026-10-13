@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	mockllm "opencsg.com/csghub-server/_mocks/opencsg.com/csghub-server/builder/llm"
+	"opencsg.com/csghub-server/builder/dataviewer"
 	"opencsg.com/csghub-server/builder/store/database"
 	"opencsg.com/csghub-server/common/config"
 	"opencsg.com/csghub-server/common/types"
@@ -70,7 +71,7 @@ func newTestExecutor() (*ToolExecutor, *fakeDatasetSearcher, *fakeRepoFileReader
 	ds := &fakeDatasetSearcher{}
 	repo := &fakeRepoFileReader{}
 	tags := &fakeTagLister{}
-	exec := NewToolExecutor(ds, repo, tags, nil, nil, &config.Config{}, nil)
+	exec := NewToolExecutor(ds, repo, tags, nil, nil, nil, &config.Config{}, nil)
 	return exec, ds, repo, tags
 }
 
@@ -261,7 +262,7 @@ func TestParseDatasetQuery_BrowseIntentKeepsEmptyKeywords(t *testing.T) {
 	llmClient := mockllm.NewMockLLMSvcClient(t)
 	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(`{"intent":"browse","keywords":"","reason":"user wants to browse all datasets"}`, nil).Once()
-	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, llmClient, cfg, nil)
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
 
 	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "现在有哪些数据集"})
 	require.NoError(t, err)
@@ -279,7 +280,7 @@ func TestParseDatasetQuery_ZeroSizeBoundsAreDropped(t *testing.T) {
 	llmClient := mockllm.NewMockLLMSvcClient(t)
 	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(`{"intent":"browse","keywords":"","min_size_bytes":0,"max_size_bytes":0}`, nil).Once()
-	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, llmClient, cfg, nil)
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
 
 	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "现在有哪些数据集"})
 	require.NoError(t, err)
@@ -295,7 +296,7 @@ func TestParseDatasetQuery_SortWhitelist(t *testing.T) {
 		Return(`{"intent":"browse","keywords":"","sort":"most_download"}`, nil).Once()
 	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(`{"intent":"browse","keywords":"","sort":"download_count desc"}`, nil).Once()
-	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, llmClient, cfg, nil)
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
 
 	valid, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "下载最多的数据集"})
 	require.NoError(t, err)
@@ -395,7 +396,7 @@ func TestParseDatasetQuery_PromptContainsTagVocab(t *testing.T) {
 		{Category: "task", Name: "text-classification"},
 		{Category: "language", Name: "zh"},
 	}}
-	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, tags, nil, llmClient, cfg, nil)
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, tags, nil, nil, llmClient, cfg, nil)
 
 	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "中文数据集有哪些"})
 	require.NoError(t, err)
@@ -491,7 +492,7 @@ func TestSearchDatasets_SizeSortFillsSizesAndReorders(t *testing.T) {
 		total: 3,
 	}
 	stats := &fakeRepoSizeLister{sizes: map[int64]int64{1: 100, 2: 300, 3: 200}}
-	exec := NewToolExecutor(ds, &fakeRepoFileReader{}, &fakeTagLister{}, stats, nil, &config.Config{}, nil)
+	exec := NewToolExecutor(ds, &fakeRepoFileReader{}, &fakeTagLister{}, stats, nil, nil, &config.Config{}, nil)
 
 	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Sort: "largest", Per: 2})
 	require.NoError(t, err)
@@ -513,7 +514,7 @@ func TestParseDatasetQuery_DropsInvalidSortAndDates(t *testing.T) {
 	llmClient := mockllm.NewMockLLMSvcClient(t)
 	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
 		Return(`{"intent":"search","keywords":"","sort":"largest","created_after":"2025-01-01","created_before":"2025-13-40"}`, nil).Once()
-	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, llmClient, cfg, nil)
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
 
 	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "2025年之后最大的数据集"})
 	require.NoError(t, err)
@@ -521,4 +522,77 @@ func TestParseDatasetQuery_DropsInvalidSortAndDates(t *testing.T) {
 	require.Equal(t, "2025-01-01", result.CreatedAfter)
 	// an unparseable date must not fail the whole search
 	require.Empty(t, result.CreatedBefore)
+}
+
+type fakeDatasetViewer struct {
+	catalog *dataviewer.CatalogResult
+	rows    *dataviewer.RowsResult
+	catErr  error
+	rowsErr error
+}
+
+func (f *fakeDatasetViewer) GetCatalog(ctx context.Context, namespace, name string) (*dataviewer.CatalogResult, error) {
+	return f.catalog, f.catErr
+}
+
+func (f *fakeDatasetViewer) GetRows(ctx context.Context, namespace, name, configName, split string, per int) (*dataviewer.RowsResult, error) {
+	return f.rows, f.rowsErr
+}
+
+func TestGetDatasetDetail_EnrichesMetadataAndPreview(t *testing.T) {
+	ds := &fakeDatasetSearcher{datasets: []*types.Dataset{{
+		Path:          "opencompass/mmlu",
+		Name:          "mmlu",
+		Description:   "Massive Multitask Language Understanding",
+		License:       "MIT",
+		RepositoryID:  7,
+		DefaultBranch: "main",
+		CreatedAt:     time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC),
+		Tags: []types.RepoTag{
+			{Category: "task", Name: "text-classification"},
+			{Category: "license", Name: "mit"},
+		},
+	}}}
+	repo := &fakeRepoFileReader{content: "# mmlu readme"}
+	stats := &fakeRepoSizeLister{sizes: map[int64]int64{7: 1024}}
+	viewer := &fakeDatasetViewer{
+		catalog: &dataviewer.CatalogResult{
+			RowsNum: 100,
+			DatasetInfos: []dataviewer.DatasetInfoEntry{{
+				ConfigName: "default",
+				Splits:     []dataviewer.SplitInfo{{Name: "test", NumExamples: 100}},
+			}},
+		},
+		rows: &dataviewer.RowsResult{Columns: []string{"q", "a"}, Rows: [][]any{{"1+1?", "2"}}},
+	}
+	exec := NewToolExecutor(ds, repo, &fakeTagLister{}, stats, viewer, nil, &config.Config{}, nil)
+
+	detail, err := exec.GetDatasetDetail(context.Background(), GetDatasetDetailArgs{Namespace: "opencompass", Name: "mmlu"})
+	require.NoError(t, err)
+	require.Equal(t, "MIT", detail.License)
+	require.Equal(t, []string{"text-classification"}, detail.Tasks)
+	require.Equal(t, int64(1024), detail.Size)
+	require.Equal(t, int64(100), detail.RowsNum)
+	require.Equal(t, []SplitSummary{{Config: "default", Name: "test", Rows: 100}}, detail.Splits)
+	require.Equal(t, []string{"q", "a"}, detail.SampleColumns)
+	require.Equal(t, [][]any{{"1+1?", "2"}}, detail.SampleRows)
+	require.Equal(t, "# mmlu readme", detail.ReadmePreview)
+	require.Equal(t, "2024-01-02", detail.CreatedAt)
+}
+
+func TestGetDatasetDetail_ViewerFailureIsBestEffort(t *testing.T) {
+	ds := &fakeDatasetSearcher{datasets: []*types.Dataset{{
+		Path:          "opencompass/mmlu",
+		Name:          "mmlu",
+		RepositoryID:  7,
+		DefaultBranch: "main",
+	}}}
+	viewer := &fakeDatasetViewer{catErr: errors.New("dataviewer down")}
+	exec := NewToolExecutor(ds, &fakeRepoFileReader{}, &fakeTagLister{}, nil, viewer, nil, &config.Config{}, nil)
+
+	detail, err := exec.GetDatasetDetail(context.Background(), GetDatasetDetailArgs{Namespace: "opencompass", Name: "mmlu"})
+	require.NoError(t, err)
+	require.Empty(t, detail.Splits)
+	require.Zero(t, detail.RowsNum)
+	require.Empty(t, detail.SampleColumns)
 }

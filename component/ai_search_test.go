@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	mockllm "opencsg.com/csghub-server/_mocks/opencsg.com/csghub-server/builder/llm"
+	"opencsg.com/csghub-server/builder/dataviewer"
 	"opencsg.com/csghub-server/builder/store/database"
 	"opencsg.com/csghub-server/common/config"
 	"opencsg.com/csghub-server/common/types"
@@ -28,7 +29,25 @@ func (f *aiSearchFakeDatasets) Index(ctx context.Context, filter *types.RepoFilt
 }
 
 func (f *aiSearchFakeDatasets) Show(ctx context.Context, namespace, name, currentUser string, needOpWeight, needMultiSync bool) (*types.Dataset, error) {
-	return nil, errors.New("not implemented")
+	for _, ds := range f.datasets {
+		if ds.Path == namespace+"/"+name {
+			return ds, nil
+		}
+	}
+	return nil, errors.New("dataset not found")
+}
+
+type aiSearchFakeViewer struct {
+	catalog *dataviewer.CatalogResult
+	rows    *dataviewer.RowsResult
+}
+
+func (f *aiSearchFakeViewer) GetCatalog(ctx context.Context, namespace, name string) (*dataviewer.CatalogResult, error) {
+	return f.catalog, nil
+}
+
+func (f *aiSearchFakeViewer) GetRows(ctx context.Context, namespace, name, configName, split string, per int) (*dataviewer.RowsResult, error) {
+	return f.rows, nil
 }
 
 type aiSearchFakeRepo struct{}
@@ -47,7 +66,7 @@ func (f *aiSearchFakeTags) AllDatasetTags(ctx context.Context) ([]*database.Tag,
 
 func newAISearchTestComponent(cfg *config.Config, datasets []*types.Dataset, total int, llmClient *mockllm.MockLLMSvcClient) (AISearchComponent, *aiSearchFakeDatasets) {
 	ds := &aiSearchFakeDatasets{datasets: datasets, total: total}
-	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, &aiSearchFakeTags{}, nil, llmClient, cfg, nil)
+	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, &aiSearchFakeTags{}, nil, nil, llmClient, cfg, nil)
 	return NewAISearchComponentWithDeps(cfg, exec), ds
 }
 
@@ -232,7 +251,7 @@ func TestAISearchChat_TagsIntent(t *testing.T) {
 		{Category: "task", Name: "automatic-speech-recognition"},
 		{Category: "license", Name: "mit"},
 	}}
-	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, tags, nil, llmClient, cfg, nil)
+	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, tags, nil, nil, llmClient, cfg, nil)
 	comp := NewAISearchComponentWithDeps(cfg, exec)
 
 	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
@@ -276,4 +295,62 @@ func containsAll(s string, subs ...string) bool {
 		}
 	}
 	return true
+}
+
+func TestAISearchChat_DetailIntent(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	ds := &aiSearchFakeDatasets{
+		datasets: []*types.Dataset{{
+			Path:        "opencompass/mmlu",
+			Name:        "mmlu",
+			Description: "大规模多任务语言理解评测集",
+			License:     "MIT",
+			Tags:        []types.RepoTag{{Category: "task", Name: "text-classification"}},
+		}},
+		total: 1,
+	}
+	viewer := &aiSearchFakeViewer{
+		catalog: &dataviewer.CatalogResult{
+			RowsNum: 100,
+			DatasetInfos: []dataviewer.DatasetInfoEntry{{
+				ConfigName: "default",
+				Splits:     []dataviewer.SplitInfo{{Name: "test", NumExamples: 100}},
+			}},
+		},
+		rows: &dataviewer.RowsResult{Columns: []string{"q", "a"}, Rows: [][]any{{"1+1?", "2"}}},
+	}
+	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, &aiSearchFakeTags{}, nil, viewer, llmClient, cfg, nil)
+	comp := NewAISearchComponentWithDeps(cfg, exec)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"detail","dataset":"mmlu"}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "mmlu 这个数据集的基本信息"})
+	require.Len(t, events, 2)
+	text := events[0].Text
+	require.Contains(t, text, "数据集 opencompass/mmlu 的基本信息")
+	require.Contains(t, text, "用途：大规模多任务语言理解评测集")
+	require.Contains(t, text, "模态：文本")
+	require.Contains(t, text, "许可：MIT")
+	require.Contains(t, text, "default/test 共 100 行")
+	require.Contains(t, text, "q: 1+1?")
+	require.Equal(t, types.AIChatEventDatasets, events[1].Type)
+	require.Equal(t, "opencompass/mmlu", events[1].Datasets[0].Namespace+"/"+events[1].Datasets[0].Name)
+}
+
+func TestAISearchChat_DetailIntentNotFound(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	exec := mcpserver.NewToolExecutor(&aiSearchFakeDatasets{}, &aiSearchFakeRepo{}, &aiSearchFakeTags{}, nil, nil, llmClient, cfg, nil)
+	comp := NewAISearchComponentWithDeps(cfg, exec)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"detail","dataset":"no-such-dataset"}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "no-such-dataset 的用途"})
+	require.Len(t, events, 1)
+	require.Contains(t, events[0].Text, "没有找到名为「no-such-dataset」的数据集")
 }

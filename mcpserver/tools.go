@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"opencsg.com/csghub-server/builder/dataviewer"
 	"opencsg.com/csghub-server/builder/llm"
 	"opencsg.com/csghub-server/builder/store/database"
 	"opencsg.com/csghub-server/common/config"
@@ -45,6 +46,13 @@ type RepoSizeLister interface {
 	FindByRepositoryIDs(ctx context.Context, repoIDs []int64) ([]*database.RepositoryStatistics, error)
 }
 
+// DatasetViewer reads the converted preview (catalog and sample rows) of a
+// dataset; implemented by builder/dataviewer.DataviewerClient.
+type DatasetViewer interface {
+	GetCatalog(ctx context.Context, namespace, name string) (*dataviewer.CatalogResult, error)
+	GetRows(ctx context.Context, namespace, name, configName, split string, per int) (*dataviewer.RowsResult, error)
+}
+
 const (
 	// readmePreviewLimit caps how many readme bytes get_dataset_detail returns.
 	readmePreviewLimit = 4000
@@ -59,17 +67,19 @@ type ToolExecutor struct {
 	repo         RepoFileReader
 	tags         DatasetTagLister
 	repoStats    RepoSizeLister
+	viewer       DatasetViewer
 	llm          llm.LLMSvcClient
 	cfg          *config.Config
 	agentConfigs database.AgentConfigStore
 }
 
-func NewToolExecutor(datasets DatasetSearcher, repo RepoFileReader, tags DatasetTagLister, repoStats RepoSizeLister, llmClient llm.LLMSvcClient, cfg *config.Config, agentConfigs database.AgentConfigStore) *ToolExecutor {
+func NewToolExecutor(datasets DatasetSearcher, repo RepoFileReader, tags DatasetTagLister, repoStats RepoSizeLister, viewer DatasetViewer, llmClient llm.LLMSvcClient, cfg *config.Config, agentConfigs database.AgentConfigStore) *ToolExecutor {
 	return &ToolExecutor{
 		datasets:     datasets,
 		repo:         repo,
 		tags:         tags,
 		repoStats:    repoStats,
+		viewer:       viewer,
 		llm:          llmClient,
 		cfg:          cfg,
 		agentConfigs: agentConfigs,
@@ -423,9 +433,28 @@ type GetDatasetDetailArgs struct {
 
 type DatasetDetail struct {
 	types.DatasetSummary
-	ReadmePreview string `json:"readme_preview,omitempty"`
-	CreatedAt     string `json:"created_at,omitempty"`
+	License       string   `json:"license,omitempty"`
+	Tasks         []string `json:"tasks,omitempty"`
+	ReadmePreview string   `json:"readme_preview,omitempty"`
+	CreatedAt     string   `json:"created_at,omitempty"`
+	// Splits, RowsNum, SampleColumns and SampleRows come from the dataviewer
+	// preview conversion; they are only present when the dataset has been
+	// converted for preview.
+	Splits        []SplitSummary `json:"splits,omitempty"`
+	RowsNum       int64          `json:"rows_num,omitempty"`
+	SampleColumns []string       `json:"sample_columns,omitempty"`
+	SampleRows    [][]any        `json:"sample_rows,omitempty"`
 }
+
+// SplitSummary is one converted split of a dataset config.
+type SplitSummary struct {
+	Config string `json:"config"`
+	Name   string `json:"name"`
+	Rows   int    `json:"rows"`
+}
+
+// sampleRowCount caps how many sample rows get_dataset_detail embeds.
+const sampleRowCount = 3
 
 func (e *ToolExecutor) GetDatasetDetail(ctx context.Context, args GetDatasetDetailArgs) (*DatasetDetail, error) {
 	if args.Namespace == "" || args.Name == "" {
@@ -437,8 +466,17 @@ func (e *ToolExecutor) GetDatasetDetail(ctx context.Context, args GetDatasetDeta
 	}
 	detail := &DatasetDetail{
 		DatasetSummary: summarize(ds),
+		License:        ds.License,
 		CreatedAt:      ds.CreatedAt.Format(time.DateOnly),
 	}
+	for _, t := range ds.Tags {
+		if t.Category == "task" {
+			detail.Tasks = append(detail.Tasks, t.Name)
+		}
+	}
+	summaries := []types.DatasetSummary{detail.DatasetSummary}
+	e.fillSizes(ctx, []*types.Dataset{ds}, summaries)
+	detail.DatasetSummary = summaries[0]
 	readme, err := e.repo.FileRaw(ctx, &types.GetFileReq{
 		Namespace: args.Namespace,
 		Name:      args.Name,
@@ -453,7 +491,39 @@ func (e *ToolExecutor) GetDatasetDetail(ctx context.Context, args GetDatasetDeta
 	} else {
 		detail.ReadmePreview = readme
 	}
+	e.fillViewerInfo(ctx, args.Namespace, args.Name, detail)
 	return detail, nil
+}
+
+// fillViewerInfo adds the converted preview structure (splits, row count) and
+// a few sample rows to the detail. Best-effort: a missing or unconverted
+// preview leaves the fields empty.
+func (e *ToolExecutor) fillViewerInfo(ctx context.Context, namespace, name string, detail *DatasetDetail) {
+	if e.viewer == nil {
+		return
+	}
+	catalog, err := e.viewer.GetCatalog(ctx, namespace, name)
+	if err != nil {
+		slog.Debug("get dataset catalog failed", slog.String("dataset", namespace+"/"+name), slog.Any("error", err))
+		return
+	}
+	detail.RowsNum = catalog.RowsNum
+	for _, info := range catalog.DatasetInfos {
+		for _, sp := range info.Splits {
+			detail.Splits = append(detail.Splits, SplitSummary{Config: info.ConfigName, Name: sp.Name, Rows: sp.NumExamples})
+		}
+	}
+	if len(catalog.DatasetInfos) == 0 || len(catalog.DatasetInfos[0].Splits) == 0 {
+		return
+	}
+	first := catalog.DatasetInfos[0]
+	rows, err := e.viewer.GetRows(ctx, namespace, name, first.ConfigName, first.Splits[0].Name, sampleRowCount)
+	if err != nil {
+		slog.Debug("get dataset sample rows failed", slog.String("dataset", namespace+"/"+name), slog.Any("error", err))
+		return
+	}
+	detail.SampleColumns = rows.Columns
+	detail.SampleRows = rows.Rows
 }
 
 // ---------- parse_dataset_query ----------
@@ -467,9 +537,13 @@ type ParseDatasetQueryArgs struct {
 type ParseDatasetQueryResult struct {
 	// Intent is the parsed user intent: "search" (default, possibly with
 	// empty filters for browse/list-all), "browse" (list datasets without
-	// criteria), "tags" (the user asks which tags/categories exist) or
-	// "other" (off-topic, not about datasets). Empty means search.
-	Intent       string   `json:"intent,omitempty"`
+	// criteria), "tags" (the user asks which tags/categories exist), "detail"
+	// (the user asks for the basic info of one specific dataset) or "other"
+	// (off-topic, not about datasets). Empty means search.
+	Intent string `json:"intent,omitempty"`
+	// Dataset names one specific dataset (namespace/name or a bare name) when
+	// intent is "detail".
+	Dataset      string   `json:"dataset,omitempty"`
 	Keywords     string   `json:"keywords"`
 	Tags         []TagArg `json:"tags,omitempty"`
 	Modality     string   `json:"modality,omitempty"`
@@ -492,7 +566,8 @@ type ParseDatasetQueryResult struct {
 const parseQueryPrompt = `You convert natural-language dataset search queries into structured filters for the CSGHub dataset search tool.
 Current date: %s.
 Respond with a JSON object only, no markdown fences, no explanation. Schema:
-{"intent": "search | browse | tags | other",
+{"intent": "search | browse | tags | detail | other",
+ "dataset": "namespace/name or bare dataset name, only for intent=detail",
  "keywords": "space separated english keywords matched against dataset name and description",
  "tags": [{"category": "task|license|framework|industry|language", "name": "exact tag name"}],
  "modality": "image|audio|video|text|3d (optional, omit if unsure)",
@@ -501,7 +576,7 @@ Respond with a JSON object only, no markdown fences, no explanation. Schema:
  "created_after": "YYYY-MM-DD, omit unless the user constrains the creation/upload date", "created_before": "YYYY-MM-DD, omit unless the user constrains the creation/upload date",
  "sort": "trending|recently_update|most_download|most_favorite|most_star|largest|smallest (optional, only when the user asks for an ordering)",
  "reason": "one short sentence describing the user's search intent only; do NOT describe or assume the dataset's content"}
-Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "browse" ONLY when the user wants to list or browse datasets without any criteria (e.g. "有哪些数据集", "what datasets are available") — keywords and all filters MUST be empty for browse; a message that names any topic, modality or data type (e.g. "视频数据集", "图像分类的数据", "中文数据集有哪些") is always "search" with the corresponding keywords/modality/language filled in; a date or size constraint is a criterion too, so such queries are "search" (with empty keywords if there is nothing else, e.g. "2025年之后上传的数据集" -> intent=search, created_after=2025-01-01); use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
+Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "detail" when the user asks for the basic information of ONE specific named dataset — its purpose, modality, license, size or samples (e.g. "mmlu 这个数据集的基本信息", "介绍一下 ceval-exam", "opencompass/mmlu 的许可是什么", "这个数据集有什么用途" referring to a dataset named earlier) — set the dataset field to the mentioned name (keep namespace/name form if given, otherwise the bare name) and leave all filters empty; use "browse" ONLY when the user wants to list or browse datasets without any criteria (e.g. "有哪些数据集", "what datasets are available") — keywords and all filters MUST be empty for browse; a message that names any topic, modality or data type (e.g. "视频数据集", "图像分类的数据", "中文数据集有哪些") is always "search" with the corresponding keywords/modality/language filled in; a date or size constraint is a criterion too, so such queries are "search" (with empty keywords if there is nothing else, e.g. "2025年之后上传的数据集" -> intent=search, created_after=2025-01-01); use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
 Sort rules: ordering words are NOT search keywords — map them to the sort field instead (下载最多/最多下载/最热门 -> most_download, 收藏最多 -> most_favorite, 星标最多/最多 star -> most_star, 最近更新/最新 -> recently_update, 体积最大/数据量最大/最大的 -> largest, 体积最小/最小的 -> smallest, 热门趋势 -> trending). A query that only asks for an ordering (e.g. "下载最多的数据集有哪些", "most downloaded datasets") is "browse" with sort set; omit sort when the user does not ask for an ordering.
 Date rules: convert relative dates (上个月, 去年, 最近三个月) to absolute YYYY-MM-DD using the current date above; an open-ended range sets only one bound (2025年之后 -> created_after=2025-01-01).
 %sWhen the query mentions a task type, license, or content language that matches a known tag, emit it as a tag filter with the exact category and name from the vocabulary (文本分类 -> task/text-classification, 目标检测 -> task/object-detection, 中文 -> language/zh, 英文 -> language/en). Prefer the modality field over task tags for pure modality words (语音/音频 -> audio, 图像/图片 -> image, 视频 -> video, 文本 -> text).

@@ -6,6 +6,7 @@ import (
 	context "context"
 
 	mock "github.com/stretchr/testify/mock"
+	dataviewer "opencsg.com/csghub-server/builder/dataviewer"
 
 	types "opencsg.com/csghub-server/common/types"
 )
@@ -21,6 +22,129 @@ type MockDataviewerClient_Expecter struct {
 
 func (_m *MockDataviewerClient) EXPECT() *MockDataviewerClient_Expecter {
 	return &MockDataviewerClient_Expecter{mock: &_m.Mock}
+}
+
+// GetCatalog provides a mock function with given fields: ctx, namespace, name
+func (_m *MockDataviewerClient) GetCatalog(ctx context.Context, namespace string, name string) (*dataviewer.CatalogResult, error) {
+	ret := _m.Called(ctx, namespace, name)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetCatalog")
+	}
+
+	var r0 *dataviewer.CatalogResult
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, string, string) (*dataviewer.CatalogResult, error)); ok {
+		return rf(ctx, namespace, name)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, string, string) *dataviewer.CatalogResult); ok {
+		r0 = rf(ctx, namespace, name)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*dataviewer.CatalogResult)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, string, string) error); ok {
+		r1 = rf(ctx, namespace, name)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockDataviewerClient_GetCatalog_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetCatalog'
+type MockDataviewerClient_GetCatalog_Call struct {
+	*mock.Call
+}
+
+// GetCatalog is a helper method to define mock.On call
+//   - ctx context.Context
+//   - namespace string
+//   - name string
+func (_e *MockDataviewerClient_Expecter) GetCatalog(ctx interface{}, namespace interface{}, name interface{}) *MockDataviewerClient_GetCatalog_Call {
+	return &MockDataviewerClient_GetCatalog_Call{Call: _e.mock.On("GetCatalog", ctx, namespace, name)}
+}
+
+func (_c *MockDataviewerClient_GetCatalog_Call) Run(run func(ctx context.Context, namespace string, name string)) *MockDataviewerClient_GetCatalog_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(string), args[2].(string))
+	})
+	return _c
+}
+
+func (_c *MockDataviewerClient_GetCatalog_Call) Return(_a0 *dataviewer.CatalogResult, _a1 error) *MockDataviewerClient_GetCatalog_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockDataviewerClient_GetCatalog_Call) RunAndReturn(run func(context.Context, string, string) (*dataviewer.CatalogResult, error)) *MockDataviewerClient_GetCatalog_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
+// GetRows provides a mock function with given fields: ctx, namespace, name, configName, split, per
+func (_m *MockDataviewerClient) GetRows(ctx context.Context, namespace string, name string, configName string, split string, per int) (*dataviewer.RowsResult, error) {
+	ret := _m.Called(ctx, namespace, name, configName, split, per)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetRows")
+	}
+
+	var r0 *dataviewer.RowsResult
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, string, string, string, string, int) (*dataviewer.RowsResult, error)); ok {
+		return rf(ctx, namespace, name, configName, split, per)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, string, string, string, string, int) *dataviewer.RowsResult); ok {
+		r0 = rf(ctx, namespace, name, configName, split, per)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*dataviewer.RowsResult)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, string, string, string, string, int) error); ok {
+		r1 = rf(ctx, namespace, name, configName, split, per)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockDataviewerClient_GetRows_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetRows'
+type MockDataviewerClient_GetRows_Call struct {
+	*mock.Call
+}
+
+// GetRows is a helper method to define mock.On call
+//   - ctx context.Context
+//   - namespace string
+//   - name string
+//   - configName string
+//   - split string
+//   - per int
+func (_e *MockDataviewerClient_Expecter) GetRows(ctx interface{}, namespace interface{}, name interface{}, configName interface{}, split interface{}, per interface{}) *MockDataviewerClient_GetRows_Call {
+	return &MockDataviewerClient_GetRows_Call{Call: _e.mock.On("GetRows", ctx, namespace, name, configName, split, per)}
+}
+
+func (_c *MockDataviewerClient_GetRows_Call) Run(run func(ctx context.Context, namespace string, name string, configName string, split string, per int)) *MockDataviewerClient_GetRows_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(string), args[2].(string), args[3].(string), args[4].(string), args[5].(int))
+	})
+	return _c
+}
+
+func (_c *MockDataviewerClient_GetRows_Call) Return(_a0 *dataviewer.RowsResult, _a1 error) *MockDataviewerClient_GetRows_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockDataviewerClient_GetRows_Call) RunAndReturn(run func(context.Context, string, string, string, string, int) (*dataviewer.RowsResult, error)) *MockDataviewerClient_GetRows_Call {
+	_c.Call.Return(run)
+	return _c
 }
 
 // TriggerWorkflow provides a mock function with given fields: ctx, req

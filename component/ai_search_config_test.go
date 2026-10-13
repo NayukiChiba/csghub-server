@@ -73,7 +73,7 @@ func (f *fakeAgentConfigStore) GetConfigValue(ctx context.Context, name string, 
 }
 
 func newAISearchConfigTestComponent(cfg *config.Config, store database.AgentConfigStore, llmClient *mockllm.MockLLMSvcClient) AISearchConfigComponent {
-	exec := mcpserver.NewToolExecutor(&aiSearchFakeDatasets{}, &aiSearchFakeRepo{}, &aiSearchFakeTags{}, nil, llmClient, cfg, store)
+	exec := mcpserver.NewToolExecutor(&aiSearchFakeDatasets{}, &aiSearchFakeRepo{}, &aiSearchFakeTags{}, nil, nil, llmClient, cfg, store)
 	return NewAISearchConfigComponentWithDeps(cfg, store, exec, llmClient)
 }
 

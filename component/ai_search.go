@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"opencsg.com/csghub-server/builder/dataviewer"
 	"opencsg.com/csghub-server/builder/llm"
 	"opencsg.com/csghub-server/builder/store/database"
 	"opencsg.com/csghub-server/common/config"
@@ -38,7 +39,7 @@ func NewDatasetToolExecutor(cfg *config.Config) (*mcpserver.ToolExecutor, error)
 	if err != nil {
 		return nil, fmt.Errorf("create repo component: %w", err)
 	}
-	return mcpserver.NewToolExecutor(dsComp, repoComp, database.NewTagStore(), database.NewRepositoryStatisticsStore(), llm.NewClient(), cfg, database.NewAgentConfigStore()), nil
+	return mcpserver.NewToolExecutor(dsComp, repoComp, database.NewTagStore(), database.NewRepositoryStatisticsStore(), dataviewer.NewDataviewerClient(cfg), llm.NewClient(), cfg, database.NewAgentConfigStore()), nil
 }
 
 func NewAISearchComponent(cfg *config.Config) (AISearchComponent, error) {
@@ -92,6 +93,10 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 			return fmt.Errorf("list dataset tags: %w", err)
 		}
 		return emit(types.AIChatEvent{Type: types.AIChatEventText, Text: composeTagsAnswer(tags)})
+	}
+
+	if parsed.Intent == "detail" && strings.TrimSpace(parsed.Dataset) != "" {
+		return c.chatDatasetDetail(ctx, parsed.Dataset, emit)
 	}
 
 	result, err := c.exec.SearchDatasets(ctx, mcpserver.SearchDatasetsArgs{
@@ -208,6 +213,189 @@ func sortSuffix(sort string) string {
 // offTopicAnswer is the fixed refusal for messages unrelated to datasets
 // (intent "other"); the chat never searches or lists datasets for these.
 const offTopicAnswer = "我是数据集搜索助手，只能帮你查找和筛选数据集哦～可以试试问我：「现在有哪些数据集」「语音数据集」「数据集有哪些标签」。"
+
+// chatDatasetDetail answers questions about one specific dataset: it resolves
+// the (possibly bare) dataset name, loads its metadata plus the converted
+// preview, and composes a structured summary. The dataset card event lets the
+// frontend link straight to the dataset page.
+func (c *aiSearchComponentImpl) chatDatasetDetail(ctx context.Context, ref string, emit func(types.AIChatEvent) error) error {
+	notFound := types.AIChatEvent{Type: types.AIChatEventText, Text: fmt.Sprintf("没有找到名为「%s」的数据集。可以试试完整的「命名空间/名称」，或者告诉我关键词让我帮你搜索。", strings.TrimSpace(ref))}
+	namespace, name, err := c.resolveDatasetRef(ctx, ref)
+	if err != nil {
+		return emit(notFound)
+	}
+	detail, err := c.exec.GetDatasetDetail(ctx, mcpserver.GetDatasetDetailArgs{Namespace: namespace, Name: name})
+	if err != nil {
+		return emit(notFound)
+	}
+	if err := emit(types.AIChatEvent{Type: types.AIChatEventText, Text: composeDetailAnswer(detail)}); err != nil {
+		return err
+	}
+	return emit(types.AIChatEvent{Type: types.AIChatEventDatasets, Datasets: []types.DatasetSummary{detail.DatasetSummary}})
+}
+
+// resolveDatasetRef turns a detail-intent dataset reference into a
+// namespace/name pair. A "namespace/name" reference is used as-is; a bare
+// name is resolved through search, preferring an exact name match.
+func (c *aiSearchComponentImpl) resolveDatasetRef(ctx context.Context, ref string) (string, string, error) {
+	ref = strings.TrimSpace(strings.Trim(ref, "「」\"'`"))
+	if ns, name, ok := strings.Cut(ref, "/"); ok {
+		if ns = strings.TrimSpace(ns); ns != "" {
+			if name = strings.TrimSpace(name); name != "" {
+				return ns, name, nil
+			}
+		}
+	}
+	if ref == "" {
+		return "", "", fmt.Errorf("empty dataset reference")
+	}
+	result, err := c.exec.SearchDatasets(ctx, mcpserver.SearchDatasetsArgs{Keywords: ref, Per: defaultPer})
+	if err != nil {
+		return "", "", fmt.Errorf("resolve dataset %q: %w", ref, err)
+	}
+	for i := range result.Datasets {
+		if strings.EqualFold(result.Datasets[i].Name, ref) {
+			return result.Datasets[i].Namespace, result.Datasets[i].Name, nil
+		}
+	}
+	if len(result.Datasets) > 0 {
+		return result.Datasets[0].Namespace, result.Datasets[0].Name, nil
+	}
+	return "", "", fmt.Errorf("dataset %q not found", ref)
+}
+
+// defaultPer is the page size for name-resolution searches in detail flow.
+const defaultPer = 10
+
+// detailPurposePreview caps how many readme runes stand in for a missing
+// description in the detail answer.
+const detailPurposePreview = 200
+
+// composeDetailAnswer renders the structured basic-info answer for one
+// dataset: purpose, tasks/modality, license, size and a few sample rows.
+func composeDetailAnswer(d *mcpserver.DatasetDetail) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "数据集 %s/%s 的基本信息：", d.Namespace, d.Name)
+	b.WriteString("\n用途：" + detailPurpose(d))
+	if len(d.Tasks) > 0 {
+		b.WriteString("\n任务类型：" + strings.Join(d.Tasks, "、"))
+	}
+	if m := modalityFromTasks(d.Tasks); m != "" {
+		b.WriteString("\n模态：" + m)
+	}
+	license := strings.TrimSpace(d.License)
+	if license == "" {
+		license = "未标注"
+	}
+	b.WriteString("\n许可：" + license)
+	b.WriteString("\n数据规模：" + detailSize(d))
+	if len(d.SampleColumns) > 0 && len(d.SampleRows) > 0 {
+		b.WriteString("\n样例数据：")
+		for _, row := range d.SampleRows {
+			b.WriteString("\n" + formatSampleRow(d.SampleColumns, row))
+		}
+	}
+	fmt.Fprintf(&b, "\n下载量 %d 次 · 创建于 %s", d.Downloads, d.CreatedAt)
+	return b.String()
+}
+
+func detailPurpose(d *mcpserver.DatasetDetail) string {
+	if desc := strings.TrimSpace(d.Description); desc != "" {
+		return desc
+	}
+	if readme := strings.TrimSpace(d.ReadmePreview); readme != "" {
+		return truncateRunes(readme, detailPurposePreview)
+	}
+	return "（暂无描述）"
+}
+
+// maxSplitsInDetail caps how many splits the size line lists.
+const maxSplitsInDetail = 6
+
+func detailSize(d *mcpserver.DatasetDetail) string {
+	var parts []string
+	if d.Size > 0 {
+		parts = append(parts, "存储体积 "+formatBytes(d.Size))
+	}
+	if d.RowsNum > 0 {
+		parts = append(parts, fmt.Sprintf("共 %d 行", d.RowsNum))
+	}
+	splits := d.Splits
+	if len(splits) > maxSplitsInDetail {
+		splits = splits[:maxSplitsInDetail]
+	}
+	for _, sp := range splits {
+		parts = append(parts, fmt.Sprintf("%s/%s 共 %d 行", sp.Config, sp.Name, sp.Rows))
+	}
+	if len(d.Splits) > maxSplitsInDetail {
+		parts = append(parts, "等")
+	}
+	if len(parts) == 0 {
+		return "（暂未统计）"
+	}
+	return strings.Join(parts, "；")
+}
+
+// sampleCellLimit caps one sample cell so long texts stay readable in chat.
+const sampleCellLimit = 60
+
+func formatSampleRow(cols []string, row []any) string {
+	cells := make([]string, 0, len(row))
+	for i, v := range row {
+		cell := truncateRunes(fmt.Sprint(v), sampleCellLimit)
+		if i < len(cols) {
+			cell = cols[i] + ": " + cell
+		}
+		cells = append(cells, cell)
+	}
+	return strings.Join(cells, " | ")
+}
+
+func truncateRunes(s string, maxRunes int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes]) + "…"
+}
+
+// taskModalityNames maps task-tag prefixes to display modality names.
+var taskModalityNames = map[string]string{
+	"image": "图像",
+	"audio": "音频",
+	"video": "视频",
+	"text":  "文本",
+	"3d":    "3D",
+}
+
+func modalityFromTasks(tasks []string) string {
+	var mods []string
+	seen := make(map[string]bool)
+	for _, t := range tasks {
+		prefix, _, _ := strings.Cut(t, "-")
+		if name, ok := taskModalityNames[prefix]; ok && !seen[name] {
+			seen[name] = true
+			mods = append(mods, name)
+		}
+	}
+	return strings.Join(mods, "、")
+}
+
+var byteUnitNames = []string{"Bytes", "KB", "MB", "GB", "TB", "PB"}
+
+func formatBytes(size int64) string {
+	f := float64(size)
+	i := 0
+	for f >= 1024 && i < len(byteUnitNames)-1 {
+		f /= 1024
+		i++
+	}
+	if i == 0 {
+		return fmt.Sprintf("%d Bytes", size)
+	}
+	return fmt.Sprintf("%.1f %s", f, byteUnitNames[i])
+}
 
 // tagCategoryDisplayNames maps tag categories to Chinese display names.
 var tagCategoryDisplayNames = map[string]string{
