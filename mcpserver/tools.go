@@ -313,6 +313,27 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		if total == 0 && i < len(attempts)-1 {
 			continue
 		}
+		// The strict first attempt ANDs the text groups with LLM-guessed tag
+		// filters; an under-filled page means the tag join cut away genuine
+		// text matches (many datasets lack the guessed tag). Top up with the
+		// same strict text search without the tag filters, tag-backed hits
+		// first. This is not "relaxed": the text match stays a strict AND.
+		if i == 0 && len(args.Tags) > 0 && len(allGroups) > 0 && total > 0 && total < per {
+			extra, extraTotal, err := e.datasets.Index(ctx, newFilter(allGroups, false, true, false), queryPer, queryPage, false)
+			if err != nil {
+				return nil, fmt.Errorf("search datasets without tag filters: %w", err)
+			}
+			seen := make(map[string]bool, len(datasets))
+			for _, ds := range datasets {
+				seen[ds.Path] = true
+			}
+			for _, ds := range extra {
+				if !seen[ds.Path] {
+					datasets = append(datasets, ds)
+				}
+			}
+			total = extraTotal
+		}
 		result := &SearchDatasetsResult{Total: total, Relaxed: att.relaxed && total > 0}
 		for _, ds := range datasets {
 			result.Datasets = append(result.Datasets, summarize(ds))

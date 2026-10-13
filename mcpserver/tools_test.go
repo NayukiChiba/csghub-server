@@ -596,3 +596,56 @@ func TestGetDatasetDetail_ViewerFailureIsBestEffort(t *testing.T) {
 	require.Zero(t, detail.RowsNum)
 	require.Empty(t, detail.SampleColumns)
 }
+
+// A strict search whose page is under-filled by the LLM-guessed tag join is
+// topped up with the same strict text search without the tag filters, so
+// datasets that match the text but lack the guessed tag are not cut away.
+func TestSearchDatasets_UnderfilledTagSearchMergesTextMatches(t *testing.T) {
+	tagged := &types.Dataset{Path: "csg_opencompass/ceval-exam", Name: "ceval-exam"}
+	textOnly := &types.Dataset{Path: "csg_opencompass/ai2_arc", Name: "ai2_arc"}
+	ds := &fakeDatasetSearcher{
+		indexFn: func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+			if len(filter.Tags) > 0 {
+				return []*types.Dataset{tagged}, 1, nil
+			}
+			return []*types.Dataset{tagged, textOnly}, 2, nil
+		},
+	}
+	exec := NewToolExecutor(ds, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, nil, &config.Config{}, nil)
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "多选题",
+		Tags:     []TagArg{{Category: "task", Name: "multiple-choice"}},
+		Per:      10,
+	})
+	require.NoError(t, err)
+	require.False(t, result.Relaxed)
+	require.Equal(t, 2, result.Total)
+	require.Len(t, result.Datasets, 2)
+	// tag-backed hit first, then the text-only match
+	require.Equal(t, "ceval-exam", result.Datasets[0].Name)
+	require.Equal(t, "ai2_arc", result.Datasets[1].Name)
+}
+
+// A full strict page needs no top-up: the no-tag query must not run.
+func TestSearchDatasets_FullTagSearchDoesNotMerge(t *testing.T) {
+	ds := &fakeDatasetSearcher{
+		indexFn: func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+			require.NotEmpty(t, filter.Tags, "the no-tag top-up query must not run")
+			return []*types.Dataset{
+				{Path: "root/a", Name: "a"},
+				{Path: "root/b", Name: "b"},
+			}, 2, nil
+		},
+	}
+	exec := NewToolExecutor(ds, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, nil, &config.Config{}, nil)
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "demo",
+		Tags:     []TagArg{{Category: "task", Name: "multiple-choice"}},
+		Per:      2,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, result.Total)
+	require.Len(t, result.Datasets, 2)
+}
