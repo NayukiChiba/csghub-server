@@ -186,7 +186,11 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	if m := strings.ToLower(strings.TrimSpace(args.Modality)); m != "" {
 		auxGroups = append(auxGroups, expandToken(m))
 	}
-	if lang := strings.ToLower(strings.TrimSpace(args.Language)); lang != "" {
+	// Chinese/English get a structured content-language filter: English
+	// datasets never say "english" in name/description, so full-text matching
+	// cannot express the condition. Other languages keep the text fallback.
+	contentLang := contentLangCode(args.Language)
+	if lang := strings.ToLower(strings.TrimSpace(args.Language)); lang != "" && contentLang == "" {
 		auxGroups = append(auxGroups, expandToken(lang))
 	}
 
@@ -219,7 +223,10 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 			search = ""
 			groups = nil
 		} else if search == "" && len(groups) > 0 {
-			search = strings.ToLower(strings.TrimSpace(args.Modality + " " + args.Language))
+			search = strings.ToLower(strings.TrimSpace(args.Modality))
+			if contentLang == "" {
+				search = strings.ToLower(strings.TrimSpace(search + " " + args.Language))
+			}
 		}
 		filter := &types.RepoFilter{
 			Search:        search,
@@ -231,6 +238,7 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 			CreatedBefore: createdBefore,
 			UpdatedAfter:  updatedAfter,
 			UpdatedBefore: updatedBefore,
+			ContentLang:   contentLang,
 			Sort:          args.Sort,
 		}
 		if !dropTags {

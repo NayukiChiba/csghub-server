@@ -179,6 +179,21 @@ func expandToken(token string) []string {
 	return []string{token}
 }
 
+// contentLangCode maps a language filter value onto the detected content
+// language column (zh/en) by reusing the language synonym groups. Returns ""
+// when the value has no structured equivalent (e.g. french) — full-text
+// matching remains the fallback for those.
+func contentLangCode(language string) string {
+	group := expandToken(strings.ToLower(strings.TrimSpace(language)))
+	switch {
+	case slices.Contains(group, "chinese"):
+		return "zh"
+	case slices.Contains(group, "english"):
+		return "en"
+	}
+	return ""
+}
+
 // HasSearchTerms reports whether the raw message contains at least one term
 // from the synonym vocabulary (e.g. 中文, 视频, mit). Unknown raw words do
 // not count — "现在有哪些数据集" must stay a browse query. Used to catch LLM

@@ -125,9 +125,11 @@ func TestAISearchChat_SingleParseThenSearch(t *testing.T) {
 	require.Equal(t, types.AIChatEventDatasets, events[1].Type)
 	require.Len(t, events[1].Datasets, 1)
 
-	// parsed filters are forwarded to the search
+	// parsed filters are forwarded to the search; chinese maps onto the
+	// structured ContentLang column instead of a full-text group
 	require.Equal(t, "speech", ds.lastFilter.Search)
-	require.Len(t, ds.lastFilter.SearchGroups, 3)
+	require.Len(t, ds.lastFilter.SearchGroups, 2)
+	require.Equal(t, "zh", ds.lastFilter.ContentLang)
 }
 
 func TestAISearchChat_FallbackWhenLLMFails(t *testing.T) {

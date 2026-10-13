@@ -99,14 +99,15 @@ func TestSearchDatasets_BuildsFilter(t *testing.T) {
 	require.Equal(t, "root", result.Datasets[0].Namespace)
 	require.Equal(t, "speech-zh", result.Datasets[0].Name)
 
-	// strict attempt: keyword, modality and language become AND-combined
-	// synonym groups; Search keeps the raw keywords
+	// strict attempt: keyword and modality become AND-combined synonym
+	// groups; chinese maps onto the structured ContentLang column instead
+	// of a full-text group; Search keeps the raw keywords
 	require.Equal(t, "speech", ds.lastFilter.Search)
 	require.False(t, ds.lastFilter.SearchAny)
-	require.Len(t, ds.lastFilter.SearchGroups, 3)
+	require.Len(t, ds.lastFilter.SearchGroups, 2)
 	require.Contains(t, ds.lastFilter.SearchGroups[0], "speech")
 	require.Contains(t, ds.lastFilter.SearchGroups[1], "音频")
-	require.Contains(t, ds.lastFilter.SearchGroups[2], "中文")
+	require.Equal(t, "zh", ds.lastFilter.ContentLang)
 	require.Equal(t, &maxSize, ds.lastFilter.RepoSizeMax)
 	require.Equal(t, "trending", ds.lastFilter.Sort)
 }
@@ -856,4 +857,45 @@ func TestSearchDatasetsByDate_MapsDateField(t *testing.T) {
 	require.Error(t, err)
 	_, err = exec.SearchDatasetsByDate(context.Background(), SearchDatasetsByDateArgs{DateField: "created"})
 	require.Error(t, err)
+}
+
+// Chinese/English language filters become a structured content-language
+// constraint (English datasets never say "english" in name/description);
+// other languages keep the full-text fallback.
+func TestSearchDatasets_LanguageMapsToContentLang(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.datasets = []*types.Dataset{{Path: "root/iris", Name: "iris"}}
+	ds.total = 1
+
+	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "文本分类",
+		Language: "english",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "en", ds.lastFilter.ContentLang)
+	for _, group := range ds.lastFilter.SearchGroups {
+		require.NotContains(t, group, "english")
+	}
+
+	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "中文"})
+	require.NoError(t, err)
+	require.Equal(t, "zh", ds.lastFilter.ContentLang)
+
+	// no structured equivalent: french stays a full-text group
+	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "french"})
+	require.NoError(t, err)
+	require.Empty(t, ds.lastFilter.ContentLang)
+	require.Contains(t, ds.lastFilter.SearchGroups, expandToken("french"))
+}
+
+// A language-only query filters by content language on the plain list path.
+func TestSearchDatasets_LanguageOnlyUsesContentLang(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.datasets = []*types.Dataset{{Path: "root/iris", Name: "iris"}}
+	ds.total = 1
+
+	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "英文"})
+	require.NoError(t, err)
+	require.Equal(t, "en", ds.lastFilter.ContentLang)
+	require.Empty(t, ds.lastFilter.SearchGroups)
 }
