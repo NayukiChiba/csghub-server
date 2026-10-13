@@ -370,6 +370,10 @@ type RepoFilter struct {
 	// UpdatedAfter/UpdatedBefore bound repository.updated_at (inclusive).
 	UpdatedAfter  *time.Time
 	UpdatedBefore *time.Time
+	// ContentLang filters by the detected content language of the repository
+	// description (zh/en); full-text search cannot express "english datasets"
+	// because English text never contains the word "english".
+	ContentLang string
 	// SearchGroups holds pre-tokenized query term groups for full-text
 	// search: terms inside a group are OR-combined (synonyms), groups are
 	// combined with AND by default, or with OR when SearchAny is true
