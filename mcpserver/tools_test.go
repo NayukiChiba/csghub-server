@@ -669,3 +669,40 @@ func TestSearchDatasets_FullTagSearchDoesNotMerge(t *testing.T) {
 	require.Equal(t, 2, result.Total)
 	require.Len(t, result.Datasets, 2)
 }
+
+// When the text condition adds nothing beyond the tag join (e.g. "文本分类"
+// only matches Chinese descriptions), the tags-only superset tops the page up
+// with every dataset carrying the tag.
+func TestSearchDatasets_UnderfilledTagSearchMergesTagsOnlyMatches(t *testing.T) {
+	ceval := &types.Dataset{Path: "csg_opencompass/ceval-exam", Name: "ceval-exam"}
+	ds := &fakeDatasetSearcher{
+		indexFn: func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+			switch {
+			case filter.Search == "" && len(filter.Tags) > 0:
+				// tags-only join: every dataset carrying text-classification
+				return []*types.Dataset{ceval,
+					{Path: "root/rotten_tomatoes", Name: "rotten_tomatoes"},
+					{Path: "root/cornell-movie-review-data-rotten_tomatoes", Name: "cornell-movie-review-data-rotten_tomatoes"},
+					{Path: "root/scikit-learn-iris", Name: "scikit-learn-iris"}}, 4, nil
+			case len(filter.Tags) > 0:
+				return []*types.Dataset{ceval}, 1, nil
+			default:
+				// text search without tags: only the Chinese description matches
+				return []*types.Dataset{ceval}, 1, nil
+			}
+		},
+	}
+	exec := NewToolExecutor(ds, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, nil, &config.Config{}, nil)
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "文本分类",
+		Tags:     []TagArg{{Category: "task", Name: "text-classification"}},
+		Per:      10,
+	})
+	require.NoError(t, err)
+	require.False(t, result.Relaxed)
+	require.Equal(t, 4, result.Total)
+	require.Len(t, result.Datasets, 4)
+	require.Equal(t, "ceval-exam", result.Datasets[0].Name)
+	require.Equal(t, "scikit-learn-iris", result.Datasets[3].Name)
+}

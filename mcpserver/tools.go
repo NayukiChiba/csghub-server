@@ -326,25 +326,17 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 			continue
 		}
 		// The strict first attempt ANDs the text groups with LLM-guessed tag
-		// filters; an under-filled page means the tag join cut away genuine
-		// text matches (many datasets lack the guessed tag). Top up with the
-		// same strict text search without the tag filters, tag-backed hits
-		// first. This is not "relaxed": the text match stays a strict AND.
+		// filters; an under-filled page means the AND cut away genuine
+		// matches. Top up from the two single-constraint supersets — text
+		// search without tag filters, then the tags-only join — tag-backed
+		// hits first. This is not "relaxed": every returned dataset still
+		// satisfies at least one strict constraint.
 		if i == 0 && len(args.Tags) > 0 && len(allGroups) > 0 && total > 0 && total < per {
-			extra, extraTotal, err := e.datasets.Index(ctx, newFilter(allGroups, false, true, false), queryPer, queryPage, false)
+			var err error
+			datasets, total, err = e.topUpUnderfilled(ctx, newFilter, allGroups, datasets, total, per, queryPer, queryPage)
 			if err != nil {
-				return nil, fmt.Errorf("search datasets without tag filters: %w", err)
+				return nil, err
 			}
-			seen := make(map[string]bool, len(datasets))
-			for _, ds := range datasets {
-				seen[ds.Path] = true
-			}
-			for _, ds := range extra {
-				if !seen[ds.Path] {
-					datasets = append(datasets, ds)
-				}
-			}
-			total = extraTotal
 		}
 		result := &SearchDatasetsResult{Total: total, Relaxed: att.relaxed && total > 0}
 		for _, ds := range datasets {
@@ -414,6 +406,40 @@ func sortDatasetsBySize(datasets []types.DatasetSummary, sort string) {
 		}
 		return cmp.Compare(b.Size, a.Size)
 	})
+}
+
+// topUpUnderfilled supplements an under-filled strict text+tag page from the
+// two single-constraint supersets: first the same strict text search without
+// tag filters, then the tags-only join. Existing hits keep their order; new
+// hits append. The total is the largest superset count observed, so the
+// answer never reports fewer matches than a single-constraint query found.
+func (e *ToolExecutor) topUpUnderfilled(ctx context.Context, newFilter func(groups [][]string, any, dropTags, tagsOnly bool) *types.RepoFilter, allGroups [][]string, datasets []*types.Dataset, total, per, queryPer, queryPage int) ([]*types.Dataset, int, error) {
+	seen := make(map[string]bool, len(datasets))
+	for _, ds := range datasets {
+		seen[ds.Path] = true
+	}
+	topUps := []*types.RepoFilter{
+		newFilter(allGroups, false, true, false),
+		newFilter(nil, false, false, true),
+	}
+	for _, filter := range topUps {
+		if len(datasets) >= per {
+			break
+		}
+		extra, extraTotal, err := e.datasets.Index(ctx, filter, queryPer, queryPage, false)
+		if err != nil {
+			return nil, 0, fmt.Errorf("top up search datasets: %w", err)
+		}
+		total = max(total, extraTotal)
+		for _, ds := range extra {
+			if !seen[ds.Path] {
+				seen[ds.Path] = true
+				datasets = append(datasets, ds)
+			}
+		}
+	}
+	total = max(total, len(datasets))
+	return datasets, total, nil
 }
 
 // slicePage extracts the requested page from a wider pre-fetched window.
