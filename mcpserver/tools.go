@@ -155,10 +155,6 @@ type SearchDatasetsArgs struct {
 type SearchDatasetsResult struct {
 	Total    int                    `json:"total"`
 	Datasets []types.DatasetSummary `json:"datasets"`
-	// Relaxed is true when the strict term-group search found nothing and the
-	// result comes from the OR-combined fallback (lower precision, ranked by
-	// relevance). Agents should mention this when presenting results.
-	Relaxed bool `json:"relaxed,omitempty"`
 }
 
 func summarize(ds *types.Dataset) types.DatasetSummary {
@@ -270,20 +266,21 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 
 	allGroups := append(append([][]string{}, kwGroups...), auxGroups...)
 
-	// Precision-to-recall cascade:
-	//  1. strict AND over keyword + modality/language groups
+	// Precision cascade with strict AND semantics only. The user's criteria
+	// are AND-connected by intent; when a combination does not exist the
+	// answer must say so instead of silently dropping a core condition
+	// (an earlier OR relaxation answered "多模态评估" with pure-text
+	// benchmarks). The only droppable constraints between attempts are the
+	// LLM-inferred ones (modality/language groups, guessed tags):
+	//  1. strict AND over keyword + modality/language groups (+ tag filters)
 	//  2. strict AND over keyword groups only (auxiliary groups dropped)
 	//  3. strict AND over auxiliary groups only (keywords dropped) — keywords
 	//     are the least reliable channel when the LLM also produced exact tag
 	//     filters from the real vocabulary
 	//  4. tags only — exact tag joins with no text search at all
-	//  5. relaxed OR over all groups, ranked by relevance
-	//  6. relaxed OR without tag filters — tags are model-guessed and many
-	//     datasets carry no tags at all, so they must not be a hard cutoff
 	type attempt struct {
 		groups   [][]string
 		any      bool
-		relaxed  bool
 		dropTags bool
 		tagsOnly bool
 	}
@@ -299,14 +296,10 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		if len(args.Tags) > 0 {
 			attempts = append(attempts, attempt{tagsOnly: true})
 		}
-		attempts = append(attempts, attempt{groups: allGroups, any: true, relaxed: true})
 	} else if len(args.Tags) > 0 {
 		attempts = append(attempts, attempt{tagsOnly: true})
 	} else {
 		attempts = append(attempts, attempt{})
-	}
-	if len(args.Tags) > 0 && len(allGroups) > 0 {
-		attempts = append(attempts, attempt{groups: allGroups, any: true, relaxed: true, dropTags: true})
 	}
 
 	// Size orderings are also applied client-side: the full-text search path
@@ -338,7 +331,7 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 				return nil, err
 			}
 		}
-		result := &SearchDatasetsResult{Total: total, Relaxed: att.relaxed && total > 0}
+		result := &SearchDatasetsResult{Total: total}
 		for _, ds := range datasets {
 			result.Datasets = append(result.Datasets, summarize(ds))
 		}

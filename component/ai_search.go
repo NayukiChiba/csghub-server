@@ -184,13 +184,53 @@ func composeChatAnswer(parsed *mcpserver.ParseDatasetQueryResult, result *mcpser
 	case isBrowseIntent(parsed):
 		fmt.Fprintf(&b, "平台目前共有 %d 个数据集%s：", result.Total, sortSuffix(parsed.Sort))
 	case result.Total == 0:
-		b.WriteString("没有找到符合条件的数据集。建议放宽筛选条件（去掉模态、语言或大小限制），或换个关键词再试。")
-	case result.Relaxed:
-		fmt.Fprintf(&b, "严格筛选没有完全匹配的结果，放宽条件后为您找到 %d 个相关数据集（按相关度排序）：", result.Total)
+		if c := describeCriteria(parsed); c != "" {
+			fmt.Fprintf(&b, "%s 的组合在平台上不存在，没有找到同时满足这些条件的数据集。可以减少条件或换个关键词再试。", c)
+		} else {
+			b.WriteString("没有找到符合条件的数据集。建议减少筛选条件，或换个关键词再试。")
+		}
 	default:
 		fmt.Fprintf(&b, "为您找到 %d 个相关数据集%s：", result.Total, sortSuffix(parsed.Sort))
 	}
 	return b.String()
+}
+
+// describeCriteria renders the AND-connected criteria of a parsed query for
+// the zero-result message, so the user sees exactly which combination does
+// not exist instead of a generic "not found".
+func describeCriteria(parsed *mcpserver.ParseDatasetQueryResult) string {
+	var parts []string
+	if kw := strings.TrimSpace(parsed.Keywords); kw != "" {
+		parts = append(parts, "关键词「"+kw+"」")
+	}
+	for _, t := range parsed.Tags {
+		parts = append(parts, "标签「"+t.Category+"/"+t.Name+"」")
+	}
+	if parsed.Modality != "" {
+		parts = append(parts, "模态「"+parsed.Modality+"」")
+	}
+	if parsed.Language != "" {
+		parts = append(parts, "语言「"+parsed.Language+"」")
+	}
+	if parsed.MinSizeBytes != nil {
+		parts = append(parts, "大小 ≥ "+formatBytes(*parsed.MinSizeBytes))
+	}
+	if parsed.MaxSizeBytes != nil {
+		parts = append(parts, "大小 ≤ "+formatBytes(*parsed.MaxSizeBytes))
+	}
+	if parsed.CreatedAfter != "" {
+		parts = append(parts, "创建于 "+parsed.CreatedAfter+" 之后")
+	}
+	if parsed.CreatedBefore != "" {
+		parts = append(parts, "创建于 "+parsed.CreatedBefore+" 之前")
+	}
+	if parsed.UpdatedAfter != "" {
+		parts = append(parts, "更新于 "+parsed.UpdatedAfter+" 之后")
+	}
+	if parsed.UpdatedBefore != "" {
+		parts = append(parts, "更新于 "+parsed.UpdatedBefore+" 之前")
+	}
+	return strings.Join(parts, " + ")
 }
 
 // sortSuffix notes the active ordering in the answer so "最大的数据集" is

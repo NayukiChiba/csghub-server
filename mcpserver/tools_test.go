@@ -98,7 +98,6 @@ func TestSearchDatasets_BuildsFilter(t *testing.T) {
 	require.Len(t, result.Datasets, 1)
 	require.Equal(t, "root", result.Datasets[0].Namespace)
 	require.Equal(t, "speech-zh", result.Datasets[0].Name)
-	require.False(t, result.Relaxed)
 
 	// strict attempt: keyword, modality and language become AND-combined
 	// synonym groups; Search keeps the raw keywords
@@ -128,13 +127,15 @@ func TestSearchDatasets_CascadeDropsAuxGroups(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, 1, result.Total)
-	require.False(t, result.Relaxed)
 	require.Len(t, ds.filters, 2)
 	require.Len(t, ds.filters[0].SearchGroups, 2)
 	require.Len(t, ds.filters[1].SearchGroups, 1)
 }
 
-func TestSearchDatasets_RelaxedFallback(t *testing.T) {
+// There is no OR relaxation: the user's criteria are AND-connected by
+// intent, so a combination that matches nothing returns an empty result
+// instead of dropping a core condition.
+func TestSearchDatasets_NoRelaxedFallback(t *testing.T) {
 	exec, ds, _, _ := newTestExecutor()
 	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
 		if filter.SearchAny {
@@ -148,11 +149,13 @@ func TestSearchDatasets_RelaxedFallback(t *testing.T) {
 		Modality: "audio",
 	})
 	require.NoError(t, err)
-	require.Equal(t, 1, result.Total)
-	require.True(t, result.Relaxed)
-	require.True(t, ds.lastFilter.SearchAny)
-	// strict, aux-dropped, relaxed
-	require.Len(t, ds.filters, 3)
+	require.Equal(t, 0, result.Total)
+	require.Empty(t, result.Datasets)
+	for _, filter := range ds.filters {
+		require.False(t, filter.SearchAny, "no attempt may relax the AND semantics")
+	}
+	// strict, aux-dropped; no relaxed attempt
+	require.Len(t, ds.filters, 2)
 }
 
 func TestSearchDatasets_ModalityOnlySynthesizesSearch(t *testing.T) {
@@ -182,9 +185,10 @@ func TestSearchDatasets_TagsAndPaginationCaps(t *testing.T) {
 	require.Equal(t, "image-classification", ds.lastFilter.Tags[0].Name)
 }
 
-func TestSearchDatasets_TagFilterDroppedAsLastResort(t *testing.T) {
+// When every strict attempt (text+tag, then tags-only) comes back empty the
+// result stays empty: the tag filter is never silently dropped to zero-AND.
+func TestSearchDatasets_StrictAttemptsExhaustedReturnsEmpty(t *testing.T) {
 	exec, ds, _, _ := newTestExecutor()
-	// tag-filtered attempts find nothing; the tagless relaxed attempt hits
 	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
 		if len(filter.Tags) > 0 {
 			return nil, 0, nil
@@ -197,9 +201,13 @@ func TestSearchDatasets_TagFilterDroppedAsLastResort(t *testing.T) {
 		Tags:     []TagArg{{Category: "task", Name: "automatic-speech-recognition"}},
 	})
 	require.NoError(t, err)
-	require.Equal(t, 1, result.Total)
-	require.True(t, result.Relaxed)
-	require.Empty(t, ds.lastFilter.Tags)
+	require.Equal(t, 0, result.Total)
+	require.Empty(t, result.Datasets)
+	// text+tag and tags-only, both keeping the tag filter
+	require.Len(t, ds.filters, 2)
+	for _, filter := range ds.filters {
+		require.NotEmpty(t, filter.Tags)
+	}
 }
 
 func TestListDatasetTags_FilterByCategory(t *testing.T) {
@@ -324,10 +332,10 @@ func TestSearchDatasets_ZeroSizeBoundsAreIgnored(t *testing.T) {
 }
 
 // When the LLM produced exact tag filters, a tags-only strict attempt runs
-// before the relaxed OR fallback: keywords are the least reliable channel
-// (e.g. "许可证" matches nothing in name/description), while tags come from
-// the real vocabulary.
-func TestSearchDatasets_TagsOnlyAttemptBeforeRelaxed(t *testing.T) {
+// before giving up: keywords are the least reliable channel (e.g. "许可证"
+// matches nothing in name/description), while tags come from the real
+// vocabulary.
+func TestSearchDatasets_TagsOnlyAttemptBeforeEmpty(t *testing.T) {
 	exec, ds, _, _ := newTestExecutor()
 	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
 		if filter.Search == "" && len(filter.Tags) > 0 {
@@ -343,7 +351,6 @@ func TestSearchDatasets_TagsOnlyAttemptBeforeRelaxed(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, 1, result.Total)
-	require.False(t, result.Relaxed)
 	// the winning attempt is tags-only: no text search, tag filter kept
 	require.Empty(t, ds.lastFilter.Search)
 	require.Empty(t, ds.lastFilter.SearchGroups)
@@ -639,7 +646,6 @@ func TestSearchDatasets_UnderfilledTagSearchMergesTextMatches(t *testing.T) {
 		Per:      10,
 	})
 	require.NoError(t, err)
-	require.False(t, result.Relaxed)
 	require.Equal(t, 2, result.Total)
 	require.Len(t, result.Datasets, 2)
 	// tag-backed hit first, then the text-only match
@@ -700,7 +706,6 @@ func TestSearchDatasets_UnderfilledTagSearchMergesTagsOnlyMatches(t *testing.T) 
 		Per:      10,
 	})
 	require.NoError(t, err)
-	require.False(t, result.Relaxed)
 	require.Equal(t, 4, result.Total)
 	require.Len(t, result.Datasets, 4)
 	require.Equal(t, "ceval-exam", result.Datasets[0].Name)

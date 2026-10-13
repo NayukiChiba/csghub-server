@@ -101,6 +101,9 @@ func TestAISearchChat_ZeroResults(t *testing.T) {
 	events := collectEvents(t, comp, &types.AIChatRequest{Message: "火星土壤样本"})
 	require.Len(t, events, 1)
 	require.Contains(t, events[0].Text, "没有找到")
+	// the failing AND-combination is spelled out, not a generic message
+	require.Contains(t, events[0].Text, "关键词「火星土壤样本」")
+	require.Contains(t, events[0].Text, "组合在平台上不存在")
 }
 
 func TestAISearchChat_SingleParseThenSearch(t *testing.T) {
