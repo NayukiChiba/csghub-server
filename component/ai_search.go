@@ -226,8 +226,21 @@ func (c *aiSearchComponentImpl) chatDatasetDetail(ctx context.Context, ref strin
 	}
 	detail, err := c.exec.GetDatasetDetail(ctx, mcpserver.GetDatasetDetailArgs{Namespace: namespace, Name: name})
 	if err != nil {
+		// An explicit namespace/name that does not exist may be a namespace the
+		// LLM guessed; retry resolving the bare name through search.
+		if _, bare, ok := strings.Cut(strings.TrimSpace(ref), "/"); ok && strings.TrimSpace(bare) != "" {
+			if ns, nm, rerr := c.resolveDatasetRef(ctx, bare); rerr == nil {
+				if detail, err = c.exec.GetDatasetDetail(ctx, mcpserver.GetDatasetDetailArgs{Namespace: ns, Name: nm}); err == nil {
+					return c.emitDatasetDetail(detail, emit)
+				}
+			}
+		}
 		return emit(notFound)
 	}
+	return c.emitDatasetDetail(detail, emit)
+}
+
+func (c *aiSearchComponentImpl) emitDatasetDetail(detail *mcpserver.DatasetDetail, emit func(types.AIChatEvent) error) error {
 	if err := emit(types.AIChatEvent{Type: types.AIChatEventText, Text: composeDetailAnswer(detail)}); err != nil {
 		return err
 	}

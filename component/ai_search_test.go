@@ -354,3 +354,28 @@ func TestAISearchChat_DetailIntentNotFound(t *testing.T) {
 	require.Len(t, events, 1)
 	require.Contains(t, events[0].Text, "没有找到名为「no-such-dataset」的数据集")
 }
+
+func TestAISearchChat_DetailIntentWrongNamespaceFallsBackToBareName(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	ds := &aiSearchFakeDatasets{
+		datasets: []*types.Dataset{{
+			Path:        "csg_opencompass/mmlu",
+			Name:        "mmlu",
+			Description: "大规模多任务语言理解评测集",
+		}},
+		total: 1,
+	}
+	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, &aiSearchFakeTags{}, nil, nil, llmClient, cfg, nil)
+	comp := NewAISearchComponentWithDeps(cfg, exec)
+
+	// the LLM guessed a namespace that does not exist on this instance
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"detail","dataset":"opencompass/mmlu"}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "mmlu 这个数据集的基本信息"})
+	require.Len(t, events, 2)
+	require.Contains(t, events[0].Text, "数据集 csg_opencompass/mmlu 的基本信息")
+	require.Equal(t, "csg_opencompass/mmlu", events[1].Datasets[0].Namespace+"/"+events[1].Datasets[0].Name)
+}
