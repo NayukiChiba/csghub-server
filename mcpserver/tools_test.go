@@ -286,6 +286,25 @@ func TestParseDatasetQuery_ZeroSizeBoundsAreDropped(t *testing.T) {
 	require.Nil(t, result.MaxSizeBytes)
 }
 
+func TestParseDatasetQuery_SortWhitelist(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"browse","keywords":"","sort":"most_download"}`, nil).Once()
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"browse","keywords":"","sort":"download_count desc"}`, nil).Once()
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, llmClient, cfg, nil)
+
+	valid, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "下载最多的数据集"})
+	require.NoError(t, err)
+	require.Equal(t, "most_download", valid.Sort)
+
+	invalid, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "下载最多的数据集"})
+	require.NoError(t, err)
+	require.Empty(t, invalid.Sort)
+}
+
 func TestSearchDatasets_ZeroSizeBoundsAreIgnored(t *testing.T) {
 	exec, ds, _, _ := newTestExecutor()
 	ds.datasets = []*types.Dataset{{Path: "root/demo", Name: "demo"}}

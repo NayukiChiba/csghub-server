@@ -101,6 +101,7 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		Language:     parsed.Language,
 		MinSizeBytes: parsed.MinSizeBytes,
 		MaxSizeBytes: parsed.MaxSizeBytes,
+		Sort:         parsed.Sort,
 		Per:          10,
 	})
 	if err != nil {
