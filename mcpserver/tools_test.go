@@ -929,3 +929,33 @@ func TestSearchDatasets_StripsRepeatedLanguageFromKeywords(t *testing.T) {
 	require.Empty(t, ds.lastFilter.Search)
 	require.Empty(t, ds.lastFilter.SearchGroups)
 }
+
+// A language tag from the parser is redundant with the structured
+// content-language filter and must not exclude datasets lacking the tag.
+func TestSearchDatasets_DropsLanguageTagWhenContentLangSet(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.datasets = []*types.Dataset{{Path: "root/iris", Name: "iris"}}
+	ds.total = 1
+
+	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "text classification",
+		Language: "english",
+		Tags: []TagArg{
+			{Category: "language", Name: "en"},
+			{Category: "task", Name: "text-classification"},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "en", ds.lastFilter.ContentLang)
+	require.Len(t, ds.lastFilter.Tags, 1)
+	require.Equal(t, "text-classification", ds.lastFilter.Tags[0].Name)
+
+	// without a structured language the language tag stays
+	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "text classification",
+		Tags:     []TagArg{{Category: "language", Name: "en"}},
+	})
+	require.NoError(t, err)
+	require.Len(t, ds.lastFilter.Tags, 1)
+	require.Equal(t, "language", ds.lastFilter.Tags[0].Category)
+}

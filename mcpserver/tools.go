@@ -252,6 +252,13 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		}
 		if !dropTags {
 			for _, t := range args.Tags {
+				// language tags are guesses that mirrored repos rarely carry;
+				// when the structured content-language filter is active it
+				// decides language alone, so a bogus "language/en" requirement
+				// must not exclude datasets that simply lack the tag.
+				if contentLang != "" && strings.EqualFold(t.Category, "language") {
+					continue
+				}
 				filter.Tags = append(filter.Tags, types.TagReq{
 					Category: t.Category,
 					Name:     t.Name,
