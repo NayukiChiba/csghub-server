@@ -454,7 +454,9 @@ func TestParseDatasetQuery_PromptContainsTagVocab(t *testing.T) {
 	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "中文数据集有哪些"})
 	require.NoError(t, err)
 	require.Equal(t, "chinese", result.Language)
-	require.Len(t, result.Tags, 1)
+	// the LLM's language tag duplicates the language field and is dropped;
+	// the structured content-language filter owns that dimension
+	require.Empty(t, result.Tags)
 }
 
 func TestExecute_Dispatch(t *testing.T) {
@@ -896,11 +898,50 @@ func TestSearchDatasets_LanguageMapsToContentLang(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "zh", ds.lastFilter.ContentLang)
 
-	// no structured equivalent: french stays a full-text group
-	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "french", LanguageHard: true})
+	// no structured equivalent: a soft language stays a full-text group
+	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "french"})
 	require.NoError(t, err)
 	require.Empty(t, ds.lastFilter.ContentLang)
 	require.Contains(t, ds.lastFilter.SearchGroups, expandToken("french"))
+}
+
+// A user-stated language outside zh/en routes through the language tag
+// vocabulary instead of full-text: "日语数据集" as text groups matched mmlu
+// and humaneval, which merely mention the language in the README.
+func TestSearchDatasets_HardLanguageRoutesThroughTag(t *testing.T) {
+	exec, ds, _, tags := newTestExecutor()
+	tags.tags = []*database.Tag{{Category: "language", Name: "ja"}}
+	ds.datasets = []*types.Dataset{{Path: "root/jsquad", Name: "jsquad"}}
+	ds.total = 1
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "日语", Language: "日语", LanguageHard: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.NotEmpty(t, ds.filters)
+	// the strict attempt carries the hard language tag
+	require.Contains(t, ds.filters[0].Tags, types.TagReq{Category: "language", Name: "ja"})
+	for _, f := range ds.filters {
+		// the language word itself must never become a full-text group
+		for _, g := range f.SearchGroups {
+			require.NotContains(t, g, "日语")
+			require.NotContains(t, g, "japanese")
+		}
+	}
+}
+
+// When the tag vocabulary cannot express the hard language either, the
+// honest answer is zero results — not full-text false positives.
+func TestSearchDatasets_HardLanguageWithoutTagReturnsEmpty(t *testing.T) {
+	exec, ds, _, tags := newTestExecutor()
+	tags.tags = []*database.Tag{{Category: "language", Name: "en"}}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "日语", LanguageHard: true})
+	require.NoError(t, err)
+	require.Equal(t, 0, result.Total)
+	require.Empty(t, result.Datasets)
+	require.Empty(t, ds.filters)
 }
 
 // With an explicit size bound, size-descriptor keywords ("small tiny size")

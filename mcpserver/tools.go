@@ -159,7 +159,7 @@ type SearchDatasetsArgs struct {
 	CreatedBefore string `json:"created_before,omitempty" jsonschema:"only datasets created on or before this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
 	UpdatedAfter  string `json:"updated_after,omitempty" jsonschema:"only datasets updated on or after this date, YYYY-MM-DD; omit unless the user constrains the update date"`
 	UpdatedBefore string `json:"updated_before,omitempty" jsonschema:"only datasets updated on or before this date, YYYY-MM-DD; omit unless the user constrains the update date"`
-	Sort          string `json:"sort,omitempty" jsonschema:"sort order: trending, recently_update, most_download, most_favorite, most_star, largest (biggest repo size first) or smallest"`
+	Sort          string `json:"sort,omitempty" jsonschema:"sort order: trending, recently_update, most_download, most_favorite, most_star, largest (biggest repo size first), smallest, oldest (created first) or newest"`
 	Page          int    `json:"page,omitempty" jsonschema:"page number, starting at 1"`
 	Per           int    `json:"per,omitempty" jsonschema:"page size, max 50"`
 }
@@ -224,12 +224,34 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		// the bound itself, not dataset content.
 		keywords = stripSizeDescriptorTerms(keywords)
 	}
+	// A user-stated language outside zh/en has no structured content_lang
+	// equivalent, and full-text cannot express it either: "日语数据集" would
+	// match datasets that merely mention the language in the README (mmlu,
+	// humaneval). Route it through the language tag vocabulary instead; when
+	// the vocabulary has no tag for it, answer honestly with zero results.
+	langViaTag := false
+	if args.LanguageHard && contentLang == "" {
+		tagName := ""
+		if e.tags != nil {
+			if vocab, err := e.tags.AllDatasetTags(ctx); err == nil {
+				tagName = languageTagName(vocab, args.Language)
+			}
+		}
+		if tagName == "" {
+			return &SearchDatasetsResult{}, nil
+		}
+		args.Tags = append(args.Tags, TagArg{Category: "language", Name: tagName, Hard: true})
+		langViaTag = true
+		// the tag expresses the constraint precisely; the language word in
+		// the keywords would only full-text filter everything away
+		keywords = stripLanguageTerms(keywords, args.Language)
+	}
 	kwGroups := buildKeywordGroups(keywords, args.KeywordExpansions)
 	var modalityGroups, langGroups [][]string
 	if m := strings.ToLower(strings.TrimSpace(args.Modality)); m != "" {
 		modalityGroups = append(modalityGroups, expandToken(m))
 	}
-	if lang := strings.ToLower(strings.TrimSpace(args.Language)); lang != "" && contentLang == "" {
+	if lang := strings.ToLower(strings.TrimSpace(args.Language)); lang != "" && contentLang == "" && !langViaTag {
 		langGroups = append(langGroups, expandToken(lang))
 	}
 	auxGroups := append(slices.Clone(modalityGroups), langGroups...)
@@ -619,6 +641,8 @@ var clientSideSorts = map[string]bool{
 	"most_download":   true,
 	"most_favorite":   true,
 	"recently_update": true,
+	"oldest":          true,
+	"newest":          true,
 }
 
 // sortMergedDatasets re-sorts the merged result window by the requested
@@ -639,6 +663,10 @@ func sortMergedDatasets(datasets []*types.Dataset, summaries []types.DatasetSumm
 			return a.Likes > b.Likes
 		case "recently_update":
 			return a.UpdatedAt.After(b.UpdatedAt)
+		case "oldest":
+			return a.CreatedAt.Before(b.CreatedAt)
+		case "newest":
+			return a.CreatedAt.After(b.CreatedAt)
 		}
 		return false
 	}
@@ -949,10 +977,10 @@ Respond with a JSON object only, no markdown fences, no explanation. Schema:
  "min_size_bytes": "number, omit unless the user specifies a size", "max_size_bytes": "number, omit unless the user specifies a size",
  "created_after": "YYYY-MM-DD, omit unless the user constrains the creation/upload date", "created_before": "YYYY-MM-DD, omit unless the user constrains the creation/upload date",
  "updated_after": "YYYY-MM-DD, omit unless the user constrains the update date", "updated_before": "YYYY-MM-DD, omit unless the user constrains the update date",
- "sort": "trending|recently_update|most_download|most_favorite|most_star|largest|smallest (optional, only when the user asks for an ordering)",
+ "sort": "trending|recently_update|most_download|most_favorite|most_star|largest|smallest|oldest|newest (optional, only when the user asks for an ordering)",
  "reason": "one short sentence describing the user's search intent only; do NOT describe or assume the dataset's content"}
 Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "detail" when the user asks for the basic information of ONE specific named dataset — its purpose, modality, license, size or samples (e.g. "mmlu 这个数据集的基本信息", "介绍一下 ceval-exam", "opencompass/mmlu 的许可是什么", "这个数据集有什么用途" referring to a dataset named earlier) — set the dataset field to the name exactly as the user wrote it: the bare name unless the user explicitly wrote namespace/name, NEVER guess or invent a namespace; leave all filters empty; use "browse" ONLY when the user wants to list or browse datasets without any criteria (e.g. "有哪些数据集", "what datasets are available") — keywords and all filters MUST be empty for browse; a message that names any topic, modality or data type (e.g. "视频数据集", "图像分类的数据", "中文数据集有哪些") is always "search" with the corresponding keywords/modality/language filled in; a date or size constraint is a criterion too, so such queries are "search" (with empty keywords if there is nothing else, e.g. "2025年之后上传的数据集" -> intent=search, created_after=2025-01-01); use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
-Sort rules: ordering words are NOT search keywords — map them to the sort field instead (下载最多/最多下载/最热门 -> most_download, 收藏最多 -> most_favorite, 星标最多/最多 star -> most_star, 最近更新/最新 -> recently_update, 体积最大/数据量最大/最大的 -> largest, 体积最小/最小的 -> smallest, 热门趋势 -> trending). A query that only asks for an ordering (e.g. "下载最多的数据集有哪些", "most downloaded datasets") is "browse" with sort set; omit sort when the user does not ask for an ordering.
+Sort rules: ordering words are NOT search keywords — map them to the sort field instead (下载最多/最多下载/最热门 -> most_download, 收藏最多 -> most_favorite, 星标最多/最多 star -> most_star, 最近更新/最新 -> recently_update, 体积最大/数据量最大/最大的 -> largest, 体积最小/最小的 -> smallest, 创建最早/最早创建/最早上传 -> oldest, 最新创建/最新上传 -> newest, 热门趋势 -> trending). A query that only asks for an ordering (e.g. "下载最多的数据集有哪些", "most downloaded datasets") is "browse" with sort set; omit sort when the user does not ask for an ordering.
 Date rules: convert relative dates (上个月, 去年, 最近三个月) to absolute YYYY-MM-DD using the current date above; an open-ended range sets only one bound (2025年之后 -> created_after=2025-01-01). Distinguish creation from update: use created_after/created_before ONLY for creation/upload phrasing (创建/上传/导入/发布); use updated_after/updated_before for update phrasing (更新/最近更新, e.g. "今天更新的数据集" -> updated_after=<today>); when the user asks for recently updated datasets without a concrete date, set sort=recently_update and leave all date bounds empty.
 Size rules: convert sizes to bytes with 1024-based units (10kb -> 10240, 1.5GB -> 1610612736); 小于10kb -> max_size_bytes=10240, 大于2MB -> min_size_bytes=2097152.
 Follow-up rules: the user message may start with 对话上下文 (earlier conversation turns) followed by 当前问题 (the question to parse). When 当前问题 refers back to the previous results without stating new filter criteria (e.g. "最大的数据集是谁", "哪个最小", "下载量最高的是谁", "它们有中文的吗"), the user is still asking about those results: keep the earlier search's topic in keywords (normalized as usual) and inherit the filter conditions (size, dates, modality, language, tags) from the earlier user turns; drop an inherited condition only when 当前问题 states a different one. When 当前问题 introduces a new topic, use only its own criteria — never treat history text as new keywords then.
@@ -1049,15 +1077,39 @@ func applyDateConstraint(parsed *ParseDatasetQueryResult, query string) {
 // synonym vocabulary (recognizedTopicTerms) and only when the current message
 // carries no search terms of its own — raw history text is too noisy to
 // transfer verbatim, and a topic switch must start clean. Tags the user
-// stated earlier and the LLM repeated softly are upgraded to Hard. Only
-// deterministic extraction is used; constraints the LLM guessed for earlier
-// turns are not replayed.
+// stated earlier and the LLM repeated softly are upgraded to Hard. When the
+// follow-up names a new non-language topic ("那语音的呢" after an image
+// search), it is a topic switch: tags are reset to the ones the current
+// message states explicitly and no earlier tags are inherited — a stale Hard
+// tag would contradict the new topic. Only deterministic extraction is used;
+// constraints the LLM guessed for earlier turns are not replayed.
 func inheritHistoryConstraints(parsed *ParseDatasetQueryResult, raw string, history []string, vocab []*database.Tag) {
-	if len(history) == 0 || parsed.Fallback {
+	if len(history) == 0 {
 		return
 	}
+	// Fallback parses (LLM down) inherit too: their keywords are the raw
+	// message, which blocks keyword inheritance on its own, while the
+	// deterministic size/date/modality/tag constraints from earlier turns
+	// keep the follow-up scoped instead of widening to the whole catalog.
 	now := time.Now()
 	inheritKeywords := strings.TrimSpace(parsed.Keywords) == "" && !HasSearchTerms(raw)
+	topicSwitch := hasNonLanguageTopicTerms(raw)
+	if topicSwitch {
+		// keep only the tags the current message states explicitly; the LLM
+		// copies earlier tags into follow-ups, which pin the new topic back
+		// to the old one
+		explicitNow := matchExplicitTags(raw, vocab)
+		kept := parsed.Tags[:0]
+		for _, t := range parsed.Tags {
+			for _, et := range explicitNow {
+				if t.Category == et.Category && t.Name == et.Name {
+					kept = append(kept, et)
+					break
+				}
+			}
+		}
+		parsed.Tags = kept
+	}
 	for i := len(history) - 1; i >= 0; i-- {
 		msg := strings.TrimSpace(history[i])
 		if msg == "" {
@@ -1084,16 +1136,18 @@ func inheritHistoryConstraints(parsed *ParseDatasetQueryResult, raw string, hist
 				parsed.Language, parsed.LanguageHard = l, true
 			}
 		}
-		explicit := matchExplicitTags(msg, vocab)
-		if len(parsed.Tags) == 0 {
-			parsed.Tags = explicit
-		} else {
-			// a tag the user typed earlier stays user-stated when the LLM
-			// repeats it for the follow-up (LLM copies arrive soft)
-			for j := range parsed.Tags {
-				for _, et := range explicit {
-					if parsed.Tags[j].Category == et.Category && parsed.Tags[j].Name == et.Name {
-						parsed.Tags[j].Hard = true
+		if !topicSwitch {
+			explicit := matchExplicitTags(msg, vocab)
+			if len(parsed.Tags) == 0 {
+				parsed.Tags = explicit
+			} else {
+				// a tag the user typed earlier stays user-stated when the LLM
+				// repeats it for the follow-up (LLM copies arrive soft)
+				for j := range parsed.Tags {
+					for _, et := range explicit {
+						if parsed.Tags[j].Category == et.Category && parsed.Tags[j].Name == et.Name {
+							parsed.Tags[j].Hard = true
+						}
 					}
 				}
 			}
@@ -1189,6 +1243,13 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	if _, err := parseDateBound(parsed.UpdatedBefore, true); err != nil {
 		parsed.UpdatedBefore = ""
 	}
+	// LLM-emitted language tags duplicate the language field; that dimension
+	// is owned by the structured content-language filter and the deterministic
+	// language-tag route. Keeping the tag would show a criterion the search
+	// deliberately skips ("标签「language/en」 + 语言「english」").
+	parsed.Tags = slices.DeleteFunc(parsed.Tags, func(t TagArg) bool {
+		return strings.EqualFold(t.Category, "language")
+	})
 	// Expansions are a best-effort recall aid: normalize them and drop junk
 	// entries rather than failing the search on malformed LLM output.
 	parsed.KeywordExpansions = sanitizeKeywordExpansions(parsed.KeywordExpansions)

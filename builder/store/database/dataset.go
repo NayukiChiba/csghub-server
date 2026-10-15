@@ -19,6 +19,8 @@ var sortBy = map[string]string{
 	"most_download":   "download_count DESC NULLS LAST",
 	"most_favorite":   "likes DESC NULLS LAST",
 	"most_star":       "star_count DESC NULLS LAST",
+	"oldest":          "created_at ASC NULLS LAST",
+	"newest":          "created_at DESC NULLS LAST",
 	// Size orderings require the range_repository_statistics join added by
 	// applyRepoRangeFilters; repoOrderBy restricts them to dataset queries.
 	"largest":  "range_repository_statistics.total_size DESC NULLS LAST",

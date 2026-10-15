@@ -188,10 +188,41 @@ func TestInheritHistoryConstraints(t *testing.T) {
 		require.True(t, p.Tags[0].Hard)
 	})
 
-	t.Run("fallback results and empty history are left alone", func(t *testing.T) {
+	t.Run("topic switch drops stale llm-carried tags", func(t *testing.T) {
+		// "那语音的呢" after an image search: the LLM copied the image tag
+		// into the follow-up; the new topic must start clean instead of
+		// pinning the audio query back to image datasets
+		imageVocab := []*database.Tag{{Category: "task", Name: "image-classification"}}
+		p := &ParseDatasetQueryResult{Tags: []TagArg{{Category: "task", Name: "image-classification"}}}
+		inheritHistoryConstraints(p, "那语音的呢", []string{"图像分类数据集"}, imageVocab)
+		require.Empty(t, p.Tags)
+
+		// a tag the current message states explicitly survives the reset
+		mcVocab := append([]*database.Tag{{Category: "task", Name: "multiple-choice"}}, imageVocab...)
+		p = &ParseDatasetQueryResult{Tags: []TagArg{
+			{Category: "task", Name: "image-classification"},
+			{Category: "task", Name: "multiple-choice"},
+		}}
+		inheritHistoryConstraints(p, "那语音的多选题呢", []string{"图像分类数据集"}, mcVocab)
+		require.Equal(t, []TagArg{{Category: "task", Name: "multiple-choice", Hard: true}}, p.Tags)
+	})
+
+	t.Run("language-only follow-up is not a topic switch", func(t *testing.T) {
+		// "它们里面有英文的吗" refines the current results: history tags stay
+		p := &ParseDatasetQueryResult{Tags: []TagArg{{Category: "task", Name: "multiple-choice"}}}
+		inheritHistoryConstraints(p, "它们里面有英文的吗", []string{"多选题数据集"}, vocab)
+		require.Len(t, p.Tags, 1)
+		require.True(t, p.Tags[0].Hard)
+	})
+
+	t.Run("fallback keeps its raw keywords but still inherits filters", func(t *testing.T) {
+		// the LLM is down for a follow-up: the raw message stays the keywords
+		// while the deterministic history constraints keep the scope
 		p := &ParseDatasetQueryResult{Fallback: true, Keywords: "最大的呢"}
 		inheritHistoryConstraints(p, "最大的呢", []string{"小于10kb的数据集"}, nil)
-		require.Nil(t, p.MaxSizeBytes)
+		require.Equal(t, "最大的呢", p.Keywords)
+		require.NotNil(t, p.MaxSizeBytes)
+		require.Equal(t, int64(10240), *p.MaxSizeBytes)
 
 		p = &ParseDatasetQueryResult{}
 		inheritHistoryConstraints(p, "最大的是谁", nil, nil)
@@ -205,6 +236,38 @@ func TestRecognizedTopicTerms(t *testing.T) {
 	require.Equal(t, "", recognizedTopicTerms("火星土壤样本数据集"))
 	require.Equal(t, "", recognizedTopicTerms("小于10kb的数据集有哪些"))
 	require.Equal(t, "", recognizedTopicTerms(""))
+}
+
+func TestHasNonLanguageTopicTerms(t *testing.T) {
+	require.True(t, hasNonLanguageTopicTerms("那语音的呢"))
+	require.True(t, hasNonLanguageTopicTerms("那视频的呢"))
+	require.True(t, hasNonLanguageTopicTerms("英文的语音数据集"))
+	// language-only phrasings refine the current scope, they do not switch
+	require.False(t, hasNonLanguageTopicTerms("它们里面有英文的吗"))
+	require.False(t, hasNonLanguageTopicTerms("有日语的吗"))
+	require.False(t, hasNonLanguageTopicTerms("最大的是谁"))
+	require.False(t, hasNonLanguageTopicTerms("火星土壤样本"))
+}
+
+func TestLanguageTagName(t *testing.T) {
+	vocab := []*database.Tag{
+		{Category: "task", Name: "text-classification"},
+		{Category: "language", Name: "en"},
+		{Category: "language", Name: "ja"},
+	}
+	require.Equal(t, "ja", languageTagName(vocab, "japanese"))
+	require.Equal(t, "ja", languageTagName(vocab, "日语"))
+	require.Equal(t, "en", languageTagName(vocab, "英文"))
+	require.Equal(t, "", languageTagName(vocab, "法语"))
+	require.Equal(t, "", languageTagName(vocab, "klingon"))
+}
+
+func TestStripLanguageTerms(t *testing.T) {
+	require.Equal(t, "", stripLanguageTerms("日语", "japanese"))
+	require.Equal(t, "分类", stripLanguageTerms("日文 分类", "日文"))
+	// a different language is kept
+	require.Equal(t, "中文", stripLanguageTerms("中文", "english"))
+	require.Equal(t, "corpus", stripLanguageTerms("corpus", "french"))
 }
 
 func TestAllTagsHard(t *testing.T) {

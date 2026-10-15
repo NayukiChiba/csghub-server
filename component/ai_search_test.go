@@ -452,3 +452,21 @@ func TestHistoryUserMessages(t *testing.T) {
 	require.Equal(t, []string{"小于10kb的数据集有哪些", "最大的是谁"}, historyUserMessages(history))
 	require.Nil(t, historyUserMessages(nil))
 }
+
+// A same-day date window reads as one day, not as a confusing "之后 + 之前"
+// pair ("今天创建的数据集" produced both bounds at the same date).
+func TestDescribeCriteria_SameDayWindowCollapses(t *testing.T) {
+	p := &mcpserver.ParseDatasetQueryResult{CreatedAfter: "2026-10-15", CreatedBefore: "2026-10-15"}
+	require.Equal(t, "创建于 2026-10-15 当天", describeCriteria(p))
+
+	p = &mcpserver.ParseDatasetQueryResult{UpdatedAfter: "2026-10-15", UpdatedBefore: "2026-10-15"}
+	require.Equal(t, "更新于 2026-10-15 当天", describeCriteria(p))
+
+	p = &mcpserver.ParseDatasetQueryResult{CreatedAfter: "2026-10-01", CreatedBefore: "2026-10-15"}
+	require.Equal(t, "创建于 2026-10-01 之后 + 创建于 2026-10-15 之前", describeCriteria(p))
+}
+
+func TestSortSuffix_CreationTimeSorts(t *testing.T) {
+	require.Equal(t, "（按创建时间从早到晚排序）", sortSuffix("oldest"))
+	require.Equal(t, "（按创建时间从晚到早排序）", sortSuffix("newest"))
+}

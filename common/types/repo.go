@@ -139,10 +139,10 @@ const (
 var (
 	Sorts   = []string{"trending", "recently_update", "most_download", "most_favorite", "most_star"}
 	Sources = []string{"opencsg", "huggingface", "local"}
-	// DatasetSorts extends Sorts with repository-size orderings; only dataset
-	// queries back them with the repository_statistics join, so other repo
-	// types must not accept them.
-	DatasetSorts = []string{"trending", "recently_update", "most_download", "most_favorite", "most_star", "largest", "smallest"}
+	// DatasetSorts extends Sorts with repository-size and creation-time
+	// orderings; only dataset queries back the size ones with the
+	// repository_statistics join, so other repo types must not accept them.
+	DatasetSorts = []string{"trending", "recently_update", "most_download", "most_favorite", "most_star", "largest", "smallest", "oldest", "newest"}
 )
 
 type RepoRequest struct {

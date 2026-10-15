@@ -5,6 +5,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"opencsg.com/csghub-server/builder/store/database"
 )
 
 // querySynonymGroups lists domain synonyms for dataset search. Terms inside
@@ -131,8 +133,20 @@ func splitQueryTokens(keywords string) []string {
 // segmentCJK greedily splits an unspaced (mostly Chinese) token against the
 // synonym keys, e.g. "图像分类" -> ["图像", "分类"]. Consecutive unmatched
 // runes are merged into one raw term. Returns nil when no key matches,
-// meaning the token should be used as-is.
+// meaning the token should be used as-is. Pure-ASCII tokens are never split:
+// shredding an English word into short keys produces false hits ("demo" ->
+// "de" + "mo" would suddenly look like a German language constraint).
 func segmentCJK(token string) []string {
+	hasCJK := false
+	for _, r := range token {
+		if unicode.Is(unicode.Han, r) {
+			hasCJK = true
+			break
+		}
+	}
+	if !hasCJK {
+		return nil
+	}
 	var (
 		parts   []string
 		pending strings.Builder
@@ -206,23 +220,7 @@ func stripContentLangTerms(keywords string, contentLang string) string {
 	if marker == "" {
 		return keywords
 	}
-	var kept []string
-	for _, token := range splitQueryTokens(strings.ToLower(keywords)) {
-		if token == "" {
-			continue
-		}
-		segments := segmentCJK(token)
-		if segments == nil {
-			segments = []string{token}
-		}
-		for _, seg := range segments {
-			if slices.Contains(expandToken(seg), marker) {
-				continue
-			}
-			kept = append(kept, seg)
-		}
-	}
-	return strings.Join(kept, " ")
+	return stripLanguageTerms(keywords, marker)
 }
 
 // sizeDescriptorTokens describe the size constraint itself rather than dataset
@@ -311,6 +309,82 @@ func recognizedTopicTerms(message string) string {
 	return strings.Join(kept, " ")
 }
 
+// hasNonLanguageTopicTerms reports whether the message carries recognized
+// content terms other than language names — a sign the user is shifting
+// topic ("那语音的呢" after an image search) rather than refining the current
+// result set with another constraint ("它们里面有英文的吗").
+func hasNonLanguageTopicTerms(message string) bool {
+	for _, token := range splitQueryTokens(strings.ToLower(message)) {
+		if token == "" || queryStopwords[token] {
+			continue
+		}
+		segments := segmentCJK(token)
+		if segments == nil {
+			segments = []string{token}
+		}
+		for _, seg := range segments {
+			if queryStopwords[seg] {
+				continue
+			}
+			group, ok := synonymIndex[seg]
+			if !ok {
+				continue
+			}
+			if len(group) > 0 && languageCanonicalNames[group[0]] {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// stripLanguageTerms removes keyword tokens naming the given language: when
+// the language is enforced by a structured filter (content_lang) or a
+// language tag, keeping the language word as a full-text group would require
+// documents to literally contain it ("日语" appears in no Japanese dataset's
+// README). Tokens naming a different language are kept.
+func stripLanguageTerms(keywords string, language string) string {
+	want := expandToken(strings.ToLower(strings.TrimSpace(language)))
+	if len(want) == 0 {
+		return keywords
+	}
+	var kept []string
+	for _, token := range splitQueryTokens(strings.ToLower(keywords)) {
+		if token == "" {
+			continue
+		}
+		segments := segmentCJK(token)
+		if segments == nil {
+			segments = []string{token}
+		}
+		for _, seg := range segments {
+			if slices.Contains(expandToken(seg), want[0]) {
+				continue
+			}
+			kept = append(kept, seg)
+		}
+	}
+	return strings.Join(kept, " ")
+}
+
+// languageTagName resolves a requested language to a tag of the language
+// category in the vocabulary: the HF-style codes (en/ja/de) share synonym
+// groups with the names users type (英文/japanese). Returns "" when the
+// vocabulary has no tag for the language.
+func languageTagName(vocab []*database.Tag, language string) string {
+	want := expandToken(strings.ToLower(strings.TrimSpace(language)))
+	for _, t := range vocab {
+		if t.Category != "language" {
+			continue
+		}
+		if slices.Contains(expandToken(strings.ToLower(t.Name)), want[0]) {
+			return t.Name
+		}
+	}
+	return ""
+}
+
 // queryStopwords are tokens that carry no filtering meaning in a dataset
 // search context (the user is already searching datasets). They are dropped
 // so "语音数据集" behaves like "语音". Question phrasings are stopwords too:
@@ -327,8 +401,20 @@ var queryStopwords = map[string]bool{
 	"什么":       true,
 	"呢":        true,
 	"吗":        true,
+	"的":        true,
 	"一下":       true,
 	"推荐":       true,
+	"基本信息":     true,
+	"介绍":       true,
+	"介绍一下":     true,
+	"怎么样":      true,
+	// follow-up phrasings: "它们里面有英文的吗" must reduce to 英文, not
+	// full-text AND terms that match nothing
+	"它们":  true,
+	"他们":  true,
+	"里面":  true,
+	"之中":  true,
+	"有":   true,
 }
 
 // segmentKeysByLen extends synonymKeysByLen with the stopwords so unspaced

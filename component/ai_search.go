@@ -246,17 +246,25 @@ func describeCriteria(parsed *mcpserver.ParseDatasetQueryResult) string {
 	if parsed.MaxSizeBytes != nil {
 		parts = append(parts, "大小 ≤ "+formatBytes(*parsed.MaxSizeBytes))
 	}
-	if parsed.CreatedAfter != "" {
-		parts = append(parts, "创建于 "+parsed.CreatedAfter+" 之后")
+	if parsed.CreatedAfter != "" && parsed.CreatedAfter == parsed.CreatedBefore {
+		parts = append(parts, "创建于 "+parsed.CreatedAfter+" 当天")
+	} else {
+		if parsed.CreatedAfter != "" {
+			parts = append(parts, "创建于 "+parsed.CreatedAfter+" 之后")
+		}
+		if parsed.CreatedBefore != "" {
+			parts = append(parts, "创建于 "+parsed.CreatedBefore+" 之前")
+		}
 	}
-	if parsed.CreatedBefore != "" {
-		parts = append(parts, "创建于 "+parsed.CreatedBefore+" 之前")
-	}
-	if parsed.UpdatedAfter != "" {
-		parts = append(parts, "更新于 "+parsed.UpdatedAfter+" 之后")
-	}
-	if parsed.UpdatedBefore != "" {
-		parts = append(parts, "更新于 "+parsed.UpdatedBefore+" 之前")
+	if parsed.UpdatedAfter != "" && parsed.UpdatedAfter == parsed.UpdatedBefore {
+		parts = append(parts, "更新于 "+parsed.UpdatedAfter+" 当天")
+	} else {
+		if parsed.UpdatedAfter != "" {
+			parts = append(parts, "更新于 "+parsed.UpdatedAfter+" 之后")
+		}
+		if parsed.UpdatedBefore != "" {
+			parts = append(parts, "更新于 "+parsed.UpdatedBefore+" 之前")
+		}
 	}
 	return strings.Join(parts, " + ")
 }
@@ -277,6 +285,10 @@ func sortSuffix(sort string) string {
 		return "（按星标数排序）"
 	case "recently_update":
 		return "（按最近更新排序）"
+	case "oldest":
+		return "（按创建时间从早到晚排序）"
+	case "newest":
+		return "（按创建时间从晚到早排序）"
 	default:
 		return ""
 	}

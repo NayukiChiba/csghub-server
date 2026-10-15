@@ -34,3 +34,12 @@ func TestRepoOrderBy_NativeAndUnknownSorts(t *testing.T) {
 	require.Empty(t, repoOrderBy(types.DatasetRepo, "no-such-sort", false))
 	require.Empty(t, repoOrderBy(types.DatasetRepo, "", false))
 }
+
+// Creation-time orderings are plain created_at columns, valid for every repo
+// type and unchanged under GROUP BY dedup (it lives in the select list).
+func TestRepoOrderBy_CreationTimeSorts(t *testing.T) {
+	require.Equal(t, "created_at ASC NULLS LAST", repoOrderBy(types.DatasetRepo, "oldest", false))
+	require.Equal(t, "created_at DESC NULLS LAST", repoOrderBy(types.DatasetRepo, "newest", false))
+	require.Equal(t, "created_at ASC NULLS LAST", repoOrderBy(types.DatasetRepo, "oldest", true))
+	require.Equal(t, "created_at ASC NULLS LAST", repoOrderBy(types.ModelRepo, "oldest", false))
+}
