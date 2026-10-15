@@ -5,7 +5,6 @@
 package mcpserver
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -251,7 +250,7 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	if err != nil {
 		return nil, err
 	}
-	sizeSort := args.Sort == "largest" || args.Sort == "smallest"
+	clientSort := clientSideSorts[args.Sort]
 
 	newFilter := func(att searchAttempt) *types.RepoFilter {
 		groups, any, dropTags, tagsOnly := att.groups, att.any, att.dropTags, att.tagsOnly
@@ -443,11 +442,13 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		}
 	}
 
-	// Size orderings are also applied client-side: the full-text search path
-	// ranks by relevance and ignores SQL ORDER BY, so a single wider window
-	// is fetched and re-sorted by size before paging.
+	// Deterministic orderings are also applied client-side: the full-text
+	// search path ranks by relevance and ignores SQL ORDER BY, and an
+	// under-filled page merges batches from several queries whose internal
+	// ordering does not survive concatenation. A single wider window is
+	// fetched and re-sorted by the requested field before paging.
 	queryPer, queryPage := per, page
-	if sizeSort {
+	if clientSort {
 		queryPer, queryPage = maxPerPage, 1
 	}
 	for i, att := range attempts {
@@ -513,8 +514,8 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 			result.Datasets = append(result.Datasets, summarize(ds))
 		}
 		e.fillSizes(ctx, datasets, result.Datasets)
-		if sizeSort {
-			sortDatasetsBySize(result.Datasets, args.Sort)
+		if clientSort {
+			sortMergedDatasets(datasets, result.Datasets, args.Sort)
 			result.Datasets = slicePage(result.Datasets, per, page)
 		}
 		return result, nil
@@ -606,13 +607,63 @@ func (e *ToolExecutor) fillSizes(ctx context.Context, datasets []*types.Dataset,
 	}
 }
 
-func sortDatasetsBySize(datasets []types.DatasetSummary, sort string) {
-	slices.SortFunc(datasets, func(a, b types.DatasetSummary) int {
-		if sort == "smallest" {
-			return cmp.Compare(a.Size, b.Size)
+// clientSideSorts are the deterministic orderings re-sorted in memory after
+// the cascade: the full-text path ranks by relevance (ignoring SQL ORDER BY)
+// and under-filled pages merge batches from several queries, so only a
+// client-side pass guarantees the requested global order. trending and
+// most_star stay SQL-side — the recom score and the repository star count
+// are not loaded onto types.Dataset here.
+var clientSideSorts = map[string]bool{
+	"largest":         true,
+	"smallest":        true,
+	"most_download":   true,
+	"most_favorite":   true,
+	"recently_update": true,
+}
+
+// sortMergedDatasets re-sorts the merged result window by the requested
+// deterministic ordering. datasets and summaries are parallel slices (one
+// summary per dataset, sizes already filled); both are reordered together.
+// The sort is stable, so ties keep the cascade order (strict matches first).
+func sortMergedDatasets(datasets []*types.Dataset, summaries []types.DatasetSummary, sort string) {
+	less := func(i, j int) bool {
+		a, b := datasets[i], datasets[j]
+		switch sort {
+		case "smallest":
+			return summaries[i].Size < summaries[j].Size
+		case "largest":
+			return summaries[i].Size > summaries[j].Size
+		case "most_download":
+			return a.Downloads > b.Downloads
+		case "most_favorite":
+			return a.Likes > b.Likes
+		case "recently_update":
+			return a.UpdatedAt.After(b.UpdatedAt)
 		}
-		return cmp.Compare(b.Size, a.Size)
+		return false
+	}
+	perm := make([]int, len(datasets))
+	for i := range perm {
+		perm[i] = i
+	}
+	slices.SortStableFunc(perm, func(x, y int) int {
+		switch {
+		case less(x, y):
+			return -1
+		case less(y, x):
+			return 1
+		default:
+			return 0
+		}
 	})
+	sortedDs := make([]*types.Dataset, len(datasets))
+	sortedSummaries := make([]types.DatasetSummary, len(summaries))
+	for to, from := range perm {
+		sortedDs[to] = datasets[from]
+		sortedSummaries[to] = summaries[from]
+	}
+	copy(datasets, sortedDs)
+	copy(summaries, sortedSummaries)
 }
 
 // topUpUnderfilled supplements an under-filled strict text+tag page from the

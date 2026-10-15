@@ -1307,6 +1307,43 @@ func TestSearchDatasets_RetryTierTopsUpUnderfilled(t *testing.T) {
 	require.Len(t, result.Datasets, 4)
 }
 
+// A deterministic ordering must survive the top-up merge: each query batch is
+// internally ordered by SQL, but concatenating batches interleaves them
+// (多选题 follow-up "下载量最大的呢": ai2_arc with 1 download landed behind the
+// NULL-download tag carriers because it arrived via the tag-less superset).
+// The client-side re-sort restores the global order.
+func TestSearchDatasets_MostDownloadReordersMergedTopUp(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	carrier := &types.Dataset{Path: "csg_opencompass/ceval-exam", Name: "ceval-exam", Downloads: 0}
+	textOnly := []*types.Dataset{
+		carrier,
+		{Path: "csg_opencompass/mmlu", Name: "mmlu", Downloads: 0},
+		{Path: "csg_opencompass/ai2_arc", Name: "ai2_arc", Downloads: 1},
+		{Path: "csg_opencompass/commonsense_qa", Name: "commonsense_qa", Downloads: 0},
+	}
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		switch {
+		case filter.Search == "" && len(filter.Tags) > 0:
+			return []*types.Dataset{carrier}, 1, nil // tags-only join
+		case len(filter.Tags) > 0:
+			return []*types.Dataset{carrier}, 1, nil // text AND tag: carrier only
+		case len(filter.SearchGroups) > 0:
+			return textOnly, 4, nil // tag-less text superset
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "多选题",
+		Tags:     []TagArg{{Category: "task", Name: "multiple-choice", Hard: true}},
+		Sort:     "most_download",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 4, result.Total)
+	require.Len(t, result.Datasets, 4)
+	require.Equal(t, "ai2_arc", result.Datasets[0].Name)
+}
+
 // Deterministic extraction pins what the user typed even when the LLM
 // contradicts or omits it: modality from the message wins over the LLM's
 // guess, and a vocabulary tag the user's words fully cover is added as Hard.
