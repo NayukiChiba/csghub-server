@@ -77,11 +77,14 @@ type LLMToolCall struct {
 }
 
 type LLMReqBody struct {
-	Model       string       `json:"model"`
-	Messages    []LLMMessage `json:"messages"`
-	Stream      bool         `json:"stream"`
-	Temperature float64      `json:"temperature"`
-	MaxTokens   int          `json:"max_tokens,omitempty"`
+	Model    string       `json:"model"`
+	Messages []LLMMessage `json:"messages"`
+	Stream   bool         `json:"stream"`
+	// Temperature is omitted when zero: some providers (e.g. Kimi) reject an
+	// explicit temperature other than their fixed default, and callers that
+	// leave it unset typically mean "provider default" anyway.
+	Temperature float64 `json:"temperature,omitempty"`
+	MaxTokens   int     `json:"max_tokens,omitempty"`
 	// Tools lists the functions the model may call; empty disables tool calling.
 	Tools   []LLMTool `json:"tools,omitempty"`
 	RawJSON string    `json:"-"`
