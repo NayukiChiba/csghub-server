@@ -225,6 +225,40 @@ func stripContentLangTerms(keywords string, contentLang string) string {
 	return strings.Join(kept, " ")
 }
 
+// sizeDescriptorTokens describe the size constraint itself rather than dataset
+// content. When the query carries an explicit size bound they are dropped from
+// the keywords: "small tiny size" as full-text groups would filter for
+// READMEs literally containing those words (小于10kb -> only the dataset whose
+// README says "dimension" survived).
+var sizeDescriptorTokens = map[string]bool{
+	"small": true, "tiny": true, "little": true, "mini": true,
+	"big": true, "large": true, "huge": true,
+	"size": true, "volume": true, "extent": true, "dimension": true,
+	"小": true, "大": true, "大小": true, "尺寸": true, "体积": true, "容量": true,
+}
+
+// stripSizeDescriptorTerms removes size-descriptor tokens from keywords;
+// CJK tokens are segmented so "大模型" keeps 模型 while dropping 大.
+func stripSizeDescriptorTerms(keywords string) string {
+	var kept []string
+	for _, token := range splitQueryTokens(strings.ToLower(keywords)) {
+		if token == "" {
+			continue
+		}
+		segments := segmentCJK(token)
+		if segments == nil {
+			segments = []string{token}
+		}
+		for _, seg := range segments {
+			if sizeDescriptorTokens[seg] {
+				continue
+			}
+			kept = append(kept, seg)
+		}
+	}
+	return strings.Join(kept, " ")
+}
+
 // HasSearchTerms reports whether the raw message contains at least one term
 // from the synonym vocabulary (e.g. 中文, 视频, mit). Unknown raw words do
 // not count — "现在有哪些数据集" must stay a browse query. Used to catch LLM

@@ -220,6 +220,11 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		// itself would match nothing real.
 		keywords = stripContentLangTerms(keywords, contentLang)
 	}
+	if (args.MinSizeBytes != nil && *args.MinSizeBytes > 0) || (args.MaxSizeBytes != nil && *args.MaxSizeBytes > 0) {
+		// With an explicit size bound, size words in the keywords describe
+		// the bound itself, not dataset content.
+		keywords = stripSizeDescriptorTerms(keywords)
+	}
 	kwGroups := buildKeywordGroups(keywords, args.KeywordExpansions)
 	var modalityGroups, langGroups [][]string
 	if m := strings.ToLower(strings.TrimSpace(args.Modality)); m != "" {
@@ -263,10 +268,18 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		// attempts must keep Search empty so the store takes the plain
 		// tag-join path instead of a full-text match on the raw keywords.
 		search := strings.ToLower(strings.TrimSpace(keywords))
-		if tagsOnly {
+		switch {
+		case tagsOnly:
 			search = ""
 			groups = nil
-		} else if search == "" && len(groups) > 0 {
+		case len(groups) == 0:
+			// The keywords reduced to pure stopwords ("数据集", "dataset"), so
+			// no text constraint remains; mirroring the raw words into Search
+			// would full-text filter on the stopword itself (小于10kb:
+			// imagefolder was excluded because its empty README never says
+			// "dataset"). Empty Search takes the plain list path.
+			search = ""
+		case search == "":
 			search = strings.ToLower(strings.TrimSpace(args.Modality))
 			if contentLang == "" && !att.noLang {
 				search = strings.ToLower(strings.TrimSpace(search + " " + args.Language))
@@ -334,9 +347,10 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	}
 
 	// buildTier assembles one cascade pass. withLang=false produces the
-	// language-relaxed retry pass: same tiers minus the language text group,
-	// with noLang set so newFilter also drops the structured content_lang
-	// filter.
+	// language-free pass: same tiers minus the language text group, with
+	// noLang set so newFilter also drops the structured content_lang filter.
+	// For LLM-guessed (soft) languages this pass runs FIRST; for hard
+	// languages it never runs.
 	buildTier := func(withLang bool) []searchAttempt {
 		aux := modalityGroups
 		if withLang {
@@ -406,16 +420,27 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	//     multiple-choice tag while several READMEs describe the task)
 	//  5. tags only — exact tag joins with no text search at all; only when
 	//     there are no content keywords, or every tag is user-stated (Hard)
-	// An LLM-guessed language is soft like the other inferred constraints: the
-	// cascade runs first with it, then retries every tier without it (语音 ->
-	// librispeech, an English README the LLM labeled "chinese"). A language the
-	// user typed (LanguageHard) is never dropped.
-	attempts := buildTier(true)
-	if args.Language != "" && !args.LanguageHard && (contentLang != "" || len(langGroups) > 0) {
-		attempts = append(attempts, buildTier(false)...)
+	// An LLM-guessed language is the softest constraint of all: the model
+	// almost always derives it from the query's own language, not from any
+	// user intent, and applying it as a filter silently drops matching
+	// datasets whenever at least one result survives (小于10kb: guessing
+	// "chinese" cut the 2.4–4.7 KB English-README datasets from the answer).
+	// So a soft language never filters the primary pass — the cascade runs
+	// WITHOUT it first and only retries with it when nothing matched. A
+	// language the user typed (LanguageHard) always filters.
+	langSoft := args.Language != "" && !args.LanguageHard && (contentLang != "" || len(langGroups) > 0)
+	var attempts []searchAttempt
+	if langSoft {
+		attempts = buildTier(false)
+		attempts = append(attempts, buildTier(true)...)
+	} else {
+		attempts = buildTier(true)
 	}
 	if len(attempts) == 0 {
-		attempts = append(attempts, searchAttempt{})
+		attempts = append(attempts, searchAttempt{noLang: langSoft})
+		if langSoft {
+			attempts = append(attempts, searchAttempt{})
+		}
 	}
 
 	// Size orderings are also applied client-side: the full-text search path

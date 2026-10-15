@@ -90,6 +90,7 @@ func TestSearchDatasets_BuildsFilter(t *testing.T) {
 		Keywords:     "speech",
 		Modality:     "audio",
 		Language:     "chinese",
+		LanguageHard: true,
 		MaxSizeBytes: &maxSize,
 		Sort:         "trending",
 	})
@@ -100,8 +101,8 @@ func TestSearchDatasets_BuildsFilter(t *testing.T) {
 	require.Equal(t, "speech-zh", result.Datasets[0].Name)
 
 	// strict attempt: keyword and modality become AND-combined synonym
-	// groups; chinese maps onto the structured ContentLang column instead
-	// of a full-text group; Search keeps the raw keywords
+	// groups; user-stated chinese maps onto the structured ContentLang
+	// column instead of a full-text group; Search keeps the raw keywords
 	require.Equal(t, "speech", ds.lastFilter.Search)
 	require.False(t, ds.lastFilter.SearchAny)
 	require.Len(t, ds.lastFilter.SearchGroups, 2)
@@ -883,7 +884,7 @@ func TestSearchDatasets_LanguageMapsToContentLang(t *testing.T) {
 
 	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
 		Keywords: "文本分类",
-		Language: "english",
+		Language: "english", LanguageHard: true,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "en", ds.lastFilter.ContentLang)
@@ -891,15 +892,58 @@ func TestSearchDatasets_LanguageMapsToContentLang(t *testing.T) {
 		require.NotContains(t, group, "english")
 	}
 
-	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "中文"})
+	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "中文", LanguageHard: true})
 	require.NoError(t, err)
 	require.Equal(t, "zh", ds.lastFilter.ContentLang)
 
 	// no structured equivalent: french stays a full-text group
-	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "french"})
+	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "french", LanguageHard: true})
 	require.NoError(t, err)
 	require.Empty(t, ds.lastFilter.ContentLang)
 	require.Contains(t, ds.lastFilter.SearchGroups, expandToken("french"))
+}
+
+// With an explicit size bound, size-descriptor keywords ("small tiny size")
+// describe the bound, not the content: they must not become full-text groups
+// (小于10kb once answered with only the dataset whose README says "dimension").
+func TestSearchDatasets_SizeBoundStripsSizeDescriptorKeywords(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.datasets = []*types.Dataset{{Path: "root/tiny-video", Name: "tiny-video"}}
+	ds.total = 1
+
+	maxSize := int64(10240)
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "small tiny size",
+		KeywordExpansions: []KeywordExpansion{
+			{Term: "small", Equivalents: []string{"little", "mini"}},
+		},
+		MaxSizeBytes: &maxSize,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.Equal(t, "", ds.lastFilter.Search)
+	require.Empty(t, ds.lastFilter.SearchGroups)
+	require.Equal(t, &maxSize, ds.lastFilter.RepoSizeMax)
+}
+
+// Keywords that are pure stopwords ("dataset", "数据集") must not become a
+// full-text filter of their own: 小于10kb asked with keywords="dataset"
+// excluded imagefolder because its empty README never contains the word.
+func TestSearchDatasets_StopwordOnlyKeywordsTakePlainPath(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.datasets = []*types.Dataset{{Path: "root/imagefolder", Name: "imagefolder"}}
+	ds.total = 1
+
+	maxSize := int64(10240)
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords:     "dataset",
+		MaxSizeBytes: &maxSize,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.Equal(t, "", ds.lastFilter.Search, "stopword-only keywords must not reach the full-text branch")
+	require.Empty(t, ds.lastFilter.SearchGroups)
+	require.Equal(t, &maxSize, ds.lastFilter.RepoSizeMax)
 }
 
 // A language-only query filters by content language on the plain list path.
@@ -908,7 +952,7 @@ func TestSearchDatasets_LanguageOnlyUsesContentLang(t *testing.T) {
 	ds.datasets = []*types.Dataset{{Path: "root/iris", Name: "iris"}}
 	ds.total = 1
 
-	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "英文"})
+	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{Language: "英文", LanguageHard: true})
 	require.NoError(t, err)
 	require.Equal(t, "en", ds.lastFilter.ContentLang)
 	require.Empty(t, ds.lastFilter.SearchGroups)
@@ -923,7 +967,7 @@ func TestSearchDatasets_StripsRepeatedLanguageFromKeywords(t *testing.T) {
 
 	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
 		Keywords: "English text classification",
-		Language: "english",
+		Language: "english", LanguageHard: true,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "en", ds.lastFilter.ContentLang)
@@ -936,7 +980,7 @@ func TestSearchDatasets_StripsRepeatedLanguageFromKeywords(t *testing.T) {
 	// keywords that are only the language reduce to a content-lang browse
 	_, err = exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
 		Keywords: "英文",
-		Language: "english",
+		Language: "english", LanguageHard: true,
 	})
 	require.NoError(t, err)
 	require.Equal(t, "en", ds.lastFilter.ContentLang)
@@ -953,7 +997,7 @@ func TestSearchDatasets_DropsLanguageTagWhenContentLangSet(t *testing.T) {
 
 	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
 		Keywords: "text classification",
-		Language: "english",
+		Language: "english", LanguageHard: true,
 		Tags: []TagArg{
 			{Category: "language", Name: "en"},
 			{Category: "task", Name: "text-classification"},
@@ -1159,10 +1203,11 @@ func TestSearchDatasets_HardTagsAllowTagsOnlyFallback(t *testing.T) {
 	require.Equal(t, "root/imagefolder", result.Datasets[0].Namespace+"/"+result.Datasets[0].Name)
 }
 
-// An LLM-guessed language narrows the first pass, then the cascade retries
-// without it: 语音 matches the English-README librispeech dataset even though
-// the LLM labeled the query "chinese".
-func TestSearchDatasets_SoftLanguageRelaxedOnRetry(t *testing.T) {
+// An LLM-guessed language never filters the primary pass: it is derived from
+// the query language, not user intent, and would silently drop matching
+// datasets (小于10kb: guessing "chinese" cut English-README datasets under the
+// size bound). The first attempt carries no content_lang filter.
+func TestSearchDatasets_SoftLanguageSkippedInPrimaryPass(t *testing.T) {
 	exec, ds, _, _ := newTestExecutor()
 	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
 		if filter.ContentLang == "" && len(filter.SearchGroups) > 0 {
@@ -1176,15 +1221,32 @@ func TestSearchDatasets_SoftLanguageRelaxedOnRetry(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, 1, result.Total)
-	// the language filter must lead (precision) and be retried without (recall)
-	require.Equal(t, "zh", ds.filters[0].ContentLang)
-	var sawRelaxed bool
-	for _, f := range ds.filters[1:] {
-		if f.ContentLang == "" {
-			sawRelaxed = true
+	require.Equal(t, "", ds.filters[0].ContentLang, "soft language must not filter the primary pass")
+}
+
+// The soft language is still there as a tiebreaker of last resort: when the
+// language-free pass matches nothing, the cascade retries with it.
+func TestSearchDatasets_SoftLanguageAsLastResort(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if filter.ContentLang == "zh" {
+			return []*types.Dataset{{Path: "csg_opencompass/ceval-exam", Name: "ceval-exam"}}, 1, nil
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "多选题", Language: "chinese",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	var sawLang bool
+	for _, f := range ds.filters {
+		if f.ContentLang == "zh" {
+			sawLang = true
 		}
 	}
-	require.True(t, sawRelaxed, "soft language should be retried without the content_lang filter")
+	require.True(t, sawLang, "soft language should still be retried when nothing else matches")
 }
 
 // A language the user typed verbatim (LanguageHard) is never relaxed away.
