@@ -1258,7 +1258,7 @@ func (s *repoStoreImpl) publicToUser(ctx context.Context, repoType types.Reposit
 	}
 
 	if needDistinct {
-		q.Distinct()
+		applyRepoDedup(q, repoType, filter.Sort)
 	}
 
 	filter.Search = strings.TrimSpace(filter.Search)
@@ -1279,7 +1279,7 @@ func (s *repoStoreImpl) publicToUser(ctx context.Context, repoType types.Reposit
 		return
 	}
 
-	q.Order(repoOrderBy(repoType, filter.Sort))
+	applyRepoOrder(q, repoType, filter.Sort, needDistinct)
 
 	count, err = s.countRepoList(ctx, q, per, page)
 	err = errorx.HandleDBError(err, errorx.Ctx().
@@ -1615,7 +1615,7 @@ func (s *repoStoreImpl) publicToUserV2(ctx context.Context, repoType types.Repos
 	}
 
 	if needDistinct {
-		q.Distinct()
+		applyRepoDedup(q, repoType, filter.Sort)
 	}
 
 	filter.Search = strings.TrimSpace(filter.Search)
@@ -1633,7 +1633,7 @@ func (s *repoStoreImpl) publicToUserV2(ctx context.Context, repoType types.Repos
 		return
 	}
 
-	q.Order(repoOrderBy(repoType, filter.Sort))
+	applyRepoOrder(q, repoType, filter.Sort, needDistinct)
 
 	count, err = q.Count(ctx)
 	err = errorx.HandleDBError(err, errorx.Ctx().
@@ -2106,16 +2106,56 @@ func applyRepoRangeFilters(q *bun.SelectQuery, repoType types.RepositoryType, re
 // repoOrderBy resolves the ORDER BY expression for a repository list query.
 // Size orderings are only valid for dataset queries: other repo types never
 // get the range_repository_statistics join, so the expression is dropped to
-// avoid emitting SQL that references a missing table alias.
-func repoOrderBy(repoType types.RepositoryType, sort string) string {
+// avoid emitting SQL that references a missing table alias. When the query
+// dedups via GROUP BY (needDistinct with a size ordering, see
+// applyRepoDedup), the aggregate form is used: SELECT DISTINCT/GROUP BY
+// cannot ORDER BY a joined column outside the select list, and the
+// default-branch join yields exactly one stats row per repository, so
+// MAX/MIN over it is exact.
+func repoOrderBy(repoType types.RepositoryType, sort string, needDistinct bool) string {
 	expr, ok := sortBy[sort]
 	if !ok {
 		return ""
 	}
-	if (sort == "largest" || sort == "smallest") && repoType != types.DatasetRepo {
-		return ""
+	if sort == "largest" || sort == "smallest" {
+		if repoType != types.DatasetRepo {
+			return ""
+		}
+		if needDistinct {
+			fn, dir := "MAX", "DESC"
+			if sort == "smallest" {
+				fn, dir = "MIN", "ASC"
+			}
+			return fn + "(range_repository_statistics.total_size) " + dir + " NULLS LAST"
+		}
 	}
 	return expr
+}
+
+// applyRepoOrder applies the resolved ordering to the query. The aggregate
+// form used under GROUP BY dedup contains parentheses, which bun's Order
+// would misquote as a dotted identifier, so it must go in raw via OrderExpr.
+func applyRepoOrder(q *bun.SelectQuery, repoType types.RepositoryType, sort string, needDistinct bool) {
+	ob := repoOrderBy(repoType, sort, needDistinct)
+	if ob == "" {
+		return
+	}
+	if needDistinct && (sort == "largest" || sort == "smallest") {
+		q.OrderExpr(ob)
+		return
+	}
+	q.Order(ob)
+}
+
+// applyRepoDedup removes the duplicate rows produced by the tag joins. With a
+// size ordering the dedup switches from DISTINCT to GROUP BY on the primary
+// key so the ordering can use an aggregate (see repoOrderBy).
+func applyRepoDedup(q *bun.SelectQuery, repoType types.RepositoryType, sort string) {
+	if repoType == types.DatasetRepo && (sort == "largest" || sort == "smallest") {
+		q.Group("repository.id")
+		return
+	}
+	q.Distinct()
 }
 
 func buildLikeQuery(q *bun.SelectQuery, filter *types.RepoFilter, limit int) {
@@ -2296,7 +2336,7 @@ func (s *repoStoreImpl) ListRepoByDeployType(ctx context.Context, repoType types
 			q.Join("LEFT JOIN (" + subQuery.String() + ") AS recom_repo_scores ON repository.id = recom_repo_scores.repository_id")
 			q.ColumnExpr(`COALESCE(recom_repo_scores.score, 0) AS popularity`)
 		}
-		if ob := repoOrderBy(repoType, sort); ob != "" {
+		if ob := repoOrderBy(repoType, sort, false); ob != "" {
 			orderBy = ob
 		}
 	}
