@@ -333,8 +333,6 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		args.MaxSizeBytes = nil
 	}
 
-	allGroups := append(append([][]string{}, kwGroups...), auxGroups...)
-
 	// buildTier assembles one cascade pass. withLang=false produces the
 	// language-relaxed retry pass: same tiers minus the language text group,
 	// with noLang set so newFilter also drops the structured content_lang
@@ -433,18 +431,27 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		if err != nil {
 			return nil, fmt.Errorf("search datasets: %w", err)
 		}
+		slog.Debug("ai search attempt", slog.Int("seq", i), slog.Any("groups", att.groups),
+			slog.Bool("drop_tags", att.dropTags), slog.Bool("tags_only", att.tagsOnly), slog.Bool("no_lang", att.noLang),
+			slog.Any("tags", filter.Tags), slog.String("content_lang", filter.ContentLang), slog.String("search", filter.Search),
+			slog.Int("total", total))
 		if total == 0 && i < len(attempts)-1 {
 			continue
 		}
-		// The strict first attempt ANDs the text groups with LLM-guessed tag
-		// filters; an under-filled page means the AND cut away genuine
-		// matches. Top up from the two single-constraint supersets — text
-		// search without tag filters, then the tags-only join — tag-backed
-		// hits first. This is not "relaxed": every returned dataset still
-		// satisfies at least one strict constraint.
-		if i == 0 && len(args.Tags) > 0 && len(allGroups) > 0 && total > 0 && total < per {
+		// Any text attempt carrying tag filters ANDs them with the groups; an
+		// under-filled page means the AND cut away genuine matches (only a
+		// minority of datasets carry the tag even when their README describes
+		// the task — 多选题: ceval-exam carries multiple-choice while mmlu,
+		// ai2_arc and commonsense_qa only mention it in the README). Top up
+		// from the two single-constraint supersets — the same text groups
+		// without tag filters, then the tags-only join — tag-backed hits
+		// first. This is not "relaxed": every returned dataset still satisfies
+		// at least one strict constraint. Applies at every cascade position,
+		// not just the strict first attempt: a language-relaxed retry tier
+		// hits the same tag-coverage wall.
+		if len(args.Tags) > 0 && len(att.groups) > 0 && !att.dropTags && !att.tagsOnly && total > 0 && total < per {
 			var err error
-			datasets, total, err = e.topUpUnderfilled(ctx, newFilter, allGroups, datasets, total, per, queryPer, queryPage)
+			datasets, total, err = e.topUpUnderfilled(ctx, newFilter, att, datasets, total, per, queryPer, queryPage)
 			if err != nil {
 				return nil, err
 			}
@@ -588,14 +595,14 @@ func sortDatasetsBySize(datasets []types.DatasetSummary, sort string) {
 // tag filters, then the tags-only join. Existing hits keep their order; new
 // hits append. The total is the largest superset count observed, so the
 // answer never reports fewer matches than a single-constraint query found.
-func (e *ToolExecutor) topUpUnderfilled(ctx context.Context, newFilter func(att searchAttempt) *types.RepoFilter, allGroups [][]string, datasets []*types.Dataset, total, per, queryPer, queryPage int) ([]*types.Dataset, int, error) {
+func (e *ToolExecutor) topUpUnderfilled(ctx context.Context, newFilter func(att searchAttempt) *types.RepoFilter, won searchAttempt, datasets []*types.Dataset, total, per, queryPer, queryPage int) ([]*types.Dataset, int, error) {
 	seen := make(map[string]bool, len(datasets))
 	for _, ds := range datasets {
 		seen[ds.Path] = true
 	}
 	topUps := []*types.RepoFilter{
-		newFilter(searchAttempt{groups: allGroups, dropTags: true}),
-		newFilter(searchAttempt{tagsOnly: true}),
+		newFilter(searchAttempt{groups: won.groups, dropTags: true, noLang: won.noLang}),
+		newFilter(searchAttempt{tagsOnly: true, noLang: won.noLang}),
 	}
 	for _, filter := range topUps {
 		if len(datasets) >= per {

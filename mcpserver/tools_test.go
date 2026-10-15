@@ -1205,6 +1205,46 @@ func TestSearchDatasets_HardLanguageNeverDropped(t *testing.T) {
 	}
 }
 
+// A language-relaxed retry tier hits the same tag-coverage wall as the strict
+// first attempt: the all-groups retry ANDs the hard tag and only the tag
+// carrier survives (1), so the under-filled page must be topped up from the
+// tag-less text superset (4). 多选题: ceval-exam carries the multiple-choice
+// tag; mmlu/ai2_arc/commonsense_qa only describe it in the README.
+func TestSearchDatasets_RetryTierTopsUpUnderfilled(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	carrier := &types.Dataset{Path: "csg_opencompass/ceval-exam", Name: "ceval-exam"}
+	textOnly := []*types.Dataset{
+		carrier,
+		{Path: "csg_opencompass/mmlu", Name: "mmlu"},
+		{Path: "csg_opencompass/ai2_arc", Name: "ai2_arc"},
+		{Path: "csg_opencompass/commonsense_qa", Name: "commonsense_qa"},
+	}
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if filter.ContentLang == "en" {
+			return nil, 0, nil // every candidate is zh; the LLM guessed "english"
+		}
+		switch {
+		case filter.Search == "" && len(filter.Tags) > 0:
+			return []*types.Dataset{carrier}, 1, nil // tags-only join
+		case len(filter.Tags) > 0:
+			return []*types.Dataset{carrier}, 1, nil // text AND tag: carrier only
+		case len(filter.SearchGroups) > 0:
+			return textOnly, 4, nil // tag-less text superset
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "multiple-choice questions",
+		Modality: "text",
+		Language: "english",
+		Tags:     []TagArg{{Category: "task", Name: "multiple-choice", Hard: true}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 4, result.Total)
+	require.Len(t, result.Datasets, 4)
+}
+
 // Deterministic extraction pins what the user typed even when the LLM
 // contradicts or omits it: modality from the message wins over the LLM's
 // guess, and a vocabulary tag the user's words fully cover is added as Hard.
