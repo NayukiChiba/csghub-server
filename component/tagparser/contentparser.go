@@ -66,3 +66,44 @@ func metaText(readme string) string {
 
 	return splits[1]
 }
+
+const maxExtractedDescriptionRunes = 500
+
+// ExtractDescription derives a short plain-text description from a README: the
+// frontmatter is stripped (same "---" convention as metaText), then the first
+// paragraph that is not a heading, image, HTML block or table row is returned
+// with whitespace collapsed, truncated to maxExtractedDescriptionRunes runes.
+// Returns "" when the README has no usable prose.
+func ExtractDescription(readme string) string {
+	body := readme
+	if splits := strings.Split(readme, "---"); len(splits) >= 3 {
+		body = strings.Join(splits[2:], "---")
+	}
+
+	var b strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			if b.Len() > 0 {
+				break // first prose paragraph ends at the blank line
+			}
+			continue
+		}
+		if b.Len() == 0 {
+			switch line[0] {
+			case '#', '!', '<', '|':
+				continue
+			}
+		}
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(line)
+	}
+
+	runes := []rune(b.String())
+	if len(runes) > maxExtractedDescriptionRunes {
+		return string(runes[:maxExtractedDescriptionRunes])
+	}
+	return string(runes)
+}

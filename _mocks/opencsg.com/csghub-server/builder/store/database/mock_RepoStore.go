@@ -84,6 +84,55 @@ func (_c *MockRepoStore_All_Call) RunAndReturn(run func(context.Context) ([]*dat
 	return _c
 }
 
+// BackfillReadmeMeta provides a mock function with given fields: ctx, repoID, description, readme
+func (_m *MockRepoStore) BackfillReadmeMeta(ctx context.Context, repoID int64, description string, readme string) error {
+	ret := _m.Called(ctx, repoID, description, readme)
+
+	if len(ret) == 0 {
+		panic("no return value specified for BackfillReadmeMeta")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, int64, string, string) error); ok {
+		r0 = rf(ctx, repoID, description, readme)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// MockRepoStore_BackfillReadmeMeta_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'BackfillReadmeMeta'
+type MockRepoStore_BackfillReadmeMeta_Call struct {
+	*mock.Call
+}
+
+// BackfillReadmeMeta is a helper method to define mock.On call
+//   - ctx context.Context
+//   - repoID int64
+//   - description string
+//   - readme string
+func (_e *MockRepoStore_Expecter) BackfillReadmeMeta(ctx interface{}, repoID interface{}, description interface{}, readme interface{}) *MockRepoStore_BackfillReadmeMeta_Call {
+	return &MockRepoStore_BackfillReadmeMeta_Call{Call: _e.mock.On("BackfillReadmeMeta", ctx, repoID, description, readme)}
+}
+
+func (_c *MockRepoStore_BackfillReadmeMeta_Call) Run(run func(ctx context.Context, repoID int64, description string, readme string)) *MockRepoStore_BackfillReadmeMeta_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(int64), args[2].(string), args[3].(string))
+	})
+	return _c
+}
+
+func (_c *MockRepoStore_BackfillReadmeMeta_Call) Return(_a0 error) *MockRepoStore_BackfillReadmeMeta_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *MockRepoStore_BackfillReadmeMeta_Call) RunAndReturn(run func(context.Context, int64, string, string) error) *MockRepoStore_BackfillReadmeMeta_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // BatchCreateRepoTags provides a mock function with given fields: ctx, repoTags
 func (_m *MockRepoStore) BatchCreateRepoTags(ctx context.Context, repoTags []database.RepositoryTag) error {
 	ret := _m.Called(ctx, repoTags)

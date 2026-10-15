@@ -21,6 +21,10 @@ func formatCategoryName(name string) string {
 		return categoryNameTask
 	case strings.EqualFold(name, "task_categories"):
 		return categoryNameTask
+	// HF cards also carry finer-grained task_ids (e.g. multiple-choice next to
+	// the broader question-answering task_category); they are task tags too
+	case strings.EqualFold(name, "task_ids"):
+		return categoryNameTask
 	case strings.EqualFold(name, "pipeline_tag"):
 		return categoryNameTask
 

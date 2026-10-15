@@ -170,6 +170,20 @@ func (c *tagComponentImpl) UpdateMetaTags(ctx context.Context, tagScope types.Ta
 		return nil, fmt.Errorf("failed to find repo, cause: %w", err)
 	}
 
+	// Repos whose description/readme columns are empty are invisible to
+	// full-text search; backfill them from the README body so tag-carrying
+	// repos stay discoverable. Best-effort: tag updates must not fail on this.
+	if content != "" && (repo.Description == "" || repo.Readme == "") {
+		description := ""
+		if repo.Description == "" {
+			description = tagparser.ExtractDescription(content)
+		}
+		if err := c.repoStore.BackfillReadmeMeta(ctx, repo.ID, description, content); err != nil {
+			slog.Warn("failed to backfill repo description/readme from README",
+				slog.String("namespace", namespace), slog.String("name", name), slog.Any("error", err))
+		}
+	}
+
 	metaTags := append(tagsMatched, tagToCreate...)
 	var repoTags []*database.RepositoryTag
 	repoTags, err = c.tagStore.SetMetaTags(ctx, repoType, namespace, name, metaTags)

@@ -136,6 +136,48 @@ func TestTagComponent_UpdateMetaTags(t *testing.T) {
 	require.Equal(t, []*database.RepositoryTag(nil), data)
 }
 
+func TestTagComponent_UpdateMetaTags_BackfillsEmptyReadmeMeta(t *testing.T) {
+	ctx := context.TODO()
+	tc := initializeTestTagComponent(ctx, t)
+
+	const content = "# Image Folder\n\nAn image folder dataset with metadata.\n"
+	tc.mocks.stores.TagMock().EXPECT().AllDatasetTags(ctx).Return([]*database.Tag{}, nil)
+	tc.mocks.stores.TagMock().EXPECT().SaveTags(ctx, []*database.Tag(nil)).Return(nil)
+	tc.mocks.stores.RepoMock().EXPECT().FindByPath(ctx, types.DatasetRepo, "ns", "n").Return(
+		&database.Repository{ID: 1, Description: "", Readme: ""}, nil,
+	)
+	// empty description/readme columns are backfilled from the README body
+	tc.mocks.stores.RepoMock().EXPECT().BackfillReadmeMeta(
+		ctx, int64(1), "An image folder dataset with metadata.", content,
+	).Return(nil)
+	tc.mocks.stores.TagMock().EXPECT().SetMetaTags(
+		ctx, types.DatasetRepo, "ns", "n", []*database.Tag(nil),
+	).Return(nil, nil)
+	tc.mocks.stores.RepoMock().EXPECT().UpdateLicenseByTag(ctx, int64(1)).Return(nil)
+
+	_, err := tc.UpdateMetaTags(ctx, types.DatasetTagScope, "ns", "n", content)
+	require.Nil(t, err)
+}
+
+func TestTagComponent_UpdateMetaTags_KeepsExistingReadmeMeta(t *testing.T) {
+	ctx := context.TODO()
+	tc := initializeTestTagComponent(ctx, t)
+
+	tc.mocks.stores.TagMock().EXPECT().AllDatasetTags(ctx).Return([]*database.Tag{}, nil)
+	tc.mocks.stores.TagMock().EXPECT().SaveTags(ctx, []*database.Tag(nil)).Return(nil)
+	// both columns already filled: no BackfillReadmeMeta expectation
+	tc.mocks.stores.RepoMock().EXPECT().FindByPath(ctx, types.DatasetRepo, "ns", "n").Return(
+		&database.Repository{ID: 1, Description: "d", Readme: "r"}, nil,
+	)
+	tc.mocks.stores.TagMock().EXPECT().SetMetaTags(
+		ctx, types.DatasetRepo, "ns", "n", []*database.Tag(nil),
+	).Return(nil, nil)
+	tc.mocks.stores.RepoMock().EXPECT().UpdateLicenseByTag(ctx, int64(1)).Return(nil)
+
+	_, err := tc.UpdateMetaTags(ctx, types.DatasetTagScope, "ns", "n", "# T\n\nbody")
+	require.Nil(t, err)
+}
+
 func TestTagComponent_UpdateLibraryTags(t *testing.T) {
 	ctx := context.TODO()
 	tc := initializeTestTagComponent(ctx, t)

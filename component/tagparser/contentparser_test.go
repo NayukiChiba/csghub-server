@@ -1,6 +1,7 @@
 package tagparser
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -54,6 +55,70 @@ func TestTagParser_MetaText(t *testing.T) {
 		t.Errorf("expected %s, got %s", actualMeta, testMeta)
 		t.Fail()
 	}
+}
+
+func TestTagParser_ExtractDescription(t *testing.T) {
+	cases := []struct {
+		name   string
+		readme string
+		want   string
+	}{
+		{
+			name:   "strips frontmatter and takes first prose paragraph",
+			readme: readme,
+			want:   "SkyPile-150B is a comprehensive, large-scale Chinese dataset specifically designed for the pre-training of large language models. It is derived from a broad array of publicly accessible Chinese Internet web pages. Rigorous filtering, extensive deduplication, and thorough sensitive data filtering have been employed to ensure its quality. Furthermore, we have utilized advanced tools such as fastText and BERT to filter out low-quality data.",
+		},
+		{
+			name:   "skips headings images html and tables",
+			readme: "# Title\n\n![badge](x.svg)\n<center>hi</center>\n| a | b |\n\nReal description here.\n\nSecond paragraph.",
+			want:   "Real description here.",
+		},
+		{
+			name:   "no frontmatter uses whole readme",
+			readme: "# T\n\nplain body text",
+			want:   "plain body text",
+		},
+		{
+			name:   "empty readme",
+			readme: "",
+			want:   "",
+		},
+		{
+			name:   "only headings",
+			readme: "---\ntask_categories:\n- x\n---\n# Just A Title\n",
+			want:   "",
+		},
+		{
+			name:   "truncates to 500 runes",
+			readme: strings.Repeat("字", 600),
+			want:   strings.Repeat("字", 500),
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			require.Equal(t, c.want, ExtractDescription(c.readme))
+		})
+	}
+}
+
+func TestTagParser_MetaTags_TaskIDsBecomeTaskTags(t *testing.T) {
+	// HF cards carry fine-grained task_ids next to broad task_categories;
+	// both are task tags (e.g. multiple-choice under question-answering)
+	const card = `
+---
+task_categories:
+- question-answering
+task_ids:
+- multiple-choice
+language:
+- en
+---
+# Demo
+`
+	metaTags, err := MetaTags(card)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"question-answering", "multiple-choice"}, metaTags["task"])
+	require.ElementsMatch(t, []string{"en"}, metaTags["language"])
 }
 
 func TestTagParser_MetaTags(t *testing.T) {

@@ -160,6 +160,9 @@ type RepoStore interface {
 	UpdateOrCreateRepo(ctx context.Context, input Repository) (*Repository, error)
 	UpdateLicenseByTag(ctx context.Context, repoID int64) error
 	UpdateLicenseCompliance(ctx context.Context, repoID int64, license *string, status types.ComplianceStatus, permission types.CommercialPermission) error
+	// BackfillReadmeMeta fills empty description/readme columns from the README
+	// content; existing non-empty values are never overwritten.
+	BackfillReadmeMeta(ctx context.Context, repoID int64, description, readme string) error
 	CountByRepoType(ctx context.Context, repoType types.RepositoryType) (int, error)
 	GetRepoWithoutRuntimeByID(ctx context.Context, rfID int64, paths []string, batchSize, batch int) ([]Repository, error)
 	GetRepoWithRuntimeByID(ctx context.Context, rfID int64, paths []string) ([]Repository, error)
@@ -2506,6 +2509,20 @@ func (s *repoStoreImpl) UpdateLicenseCompliance(
 	if err == nil {
 		err = assertAffectedOneRow(result, nil)
 	}
+	return errorx.HandleDBError(err, errorx.Ctx().Set("id", repoID))
+}
+
+func (s *repoStoreImpl) BackfillReadmeMeta(ctx context.Context, repoID int64, description, readme string) error {
+	// CASE guards keep any existing non-empty value; the WHERE clause makes the
+	// update a no-op when both columns are already filled (zero rows affected
+	// is expected, so no assertAffectedOneRow). Both columns are nullzero, so
+	// empty may be stored as NULL.
+	_, err := s.db.Operator.Core.NewUpdate().Model((*Repository)(nil)).
+		Set("description = CASE WHEN COALESCE(description, '') = '' THEN ? ELSE description END", description).
+		Set("readme = CASE WHEN COALESCE(readme, '') = '' THEN ? ELSE readme END", readme).
+		Where("id = ?", repoID).
+		Where("COALESCE(description, '') = '' OR COALESCE(readme, '') = ''").
+		Exec(ctx)
 	return errorx.HandleDBError(err, errorx.Ctx().Set("id", repoID))
 }
 
