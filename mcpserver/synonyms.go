@@ -284,6 +284,33 @@ func HasSearchTerms(message string) bool {
 	return false
 }
 
+// recognizedTopicTerms extracts the synonym-covered terms of a message as a
+// keywords string, dropping stopwords and unrecognized runs. Follow-up
+// questions inherit this as their keywords: raw history text is too noisy to
+// transfer verbatim ("文本分类的簌俱寂" contains a typo run that would AND
+// into zero matches), while the recognized terms (文本 分类) carry the topic.
+func recognizedTopicTerms(message string) string {
+	var kept []string
+	for _, token := range splitQueryTokens(strings.ToLower(message)) {
+		if token == "" || queryStopwords[token] {
+			continue
+		}
+		segments := segmentCJK(token)
+		if segments == nil {
+			segments = []string{token}
+		}
+		for _, seg := range segments {
+			if queryStopwords[seg] {
+				continue
+			}
+			if _, ok := synonymIndex[seg]; ok {
+				kept = append(kept, seg)
+			}
+		}
+	}
+	return strings.Join(kept, " ")
+}
+
 // queryStopwords are tokens that carry no filtering meaning in a dataset
 // search context (the user is already searching datasets). They are dropped
 // so "语音数据集" behaves like "语音". Question phrasings are stopwords too:

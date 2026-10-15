@@ -122,7 +122,7 @@ func TestInheritHistoryConstraints(t *testing.T) {
 
 	t.Run("follow-up inherits the size bound from history", func(t *testing.T) {
 		p := &ParseDatasetQueryResult{Sort: "largest"}
-		inheritHistoryConstraints(p, []string{"小于10kb的数据集有哪些"}, nil)
+		inheritHistoryConstraints(p, "最大的是谁", []string{"小于10kb的数据集有哪些"}, nil)
 		require.NotNil(t, p.MaxSizeBytes)
 		require.Equal(t, int64(10240), *p.MaxSizeBytes)
 	})
@@ -130,48 +130,81 @@ func TestInheritHistoryConstraints(t *testing.T) {
 	t.Run("current message's own bound wins", func(t *testing.T) {
 		own := int64(20480)
 		p := &ParseDatasetQueryResult{MaxSizeBytes: &own}
-		inheritHistoryConstraints(p, []string{"小于10kb的数据集"}, nil)
+		inheritHistoryConstraints(p, "最大的是谁", []string{"小于10kb的数据集"}, nil)
 		require.Equal(t, int64(20480), *p.MaxSizeBytes)
 	})
 
 	t.Run("modality is inherited as hard; the current one wins", func(t *testing.T) {
 		p := &ParseDatasetQueryResult{Sort: "largest"}
-		inheritHistoryConstraints(p, []string{"语音数据集有哪些"}, nil)
+		inheritHistoryConstraints(p, "最大的是谁", []string{"语音数据集有哪些"}, nil)
 		require.Equal(t, "audio", p.Modality)
 		require.True(t, p.ModalityHard)
 
 		p = &ParseDatasetQueryResult{Modality: "image", ModalityHard: true}
-		inheritHistoryConstraints(p, []string{"语音数据集有哪些"}, nil)
+		inheritHistoryConstraints(p, "那视频的呢", []string{"语音数据集有哪些"}, nil)
 		require.Equal(t, "image", p.Modality)
 	})
 
 	t.Run("language, tags and dates are inherited", func(t *testing.T) {
 		p := &ParseDatasetQueryResult{}
-		inheritHistoryConstraints(p, []string{"10.12之后上传的多选题数据集"}, vocab)
+		inheritHistoryConstraints(p, "最大的是谁", []string{"10.12之后上传的多选题数据集"}, vocab)
 		require.Equal(t, []TagArg{{Category: "task", Name: "multiple-choice", Hard: true}}, p.Tags)
 		require.Equal(t, "2026-10-12", p.CreatedAfter)
 
 		p = &ParseDatasetQueryResult{}
-		inheritHistoryConstraints(p, []string{"英文的文本分类"}, nil)
+		inheritHistoryConstraints(p, "最大的是谁", []string{"英文的文本分类"}, nil)
 		require.Equal(t, "english", p.Language)
 		require.True(t, p.LanguageHard)
 	})
 
-	t.Run("keywords are never inherited", func(t *testing.T) {
-		p := &ParseDatasetQueryResult{}
-		inheritHistoryConstraints(p, []string{"火星土壤样本数据集"}, nil)
+	t.Run("recognized topic terms are inherited as keywords", func(t *testing.T) {
+		p := &ParseDatasetQueryResult{Sort: "most_download"}
+		inheritHistoryConstraints(p, "下载量最高的是谁", []string{"文本分类的簌俱寂有哪些"}, nil)
+		require.Equal(t, "文本 分类", p.Keywords)
+	})
+
+	t.Run("keywords stay empty when the follow-up has its own terms or llm keywords", func(t *testing.T) {
+		// 那视频的呢 switches topic: the inherited 图像/分类 terms must not
+		// poison the video query
+		p := &ParseDatasetQueryResult{Modality: "video", ModalityHard: true}
+		inheritHistoryConstraints(p, "那视频的呢", []string{"图像分类数据集"}, nil)
 		require.Empty(t, p.Keywords)
+
+		p = &ParseDatasetQueryResult{Keywords: "llm supplied"}
+		inheritHistoryConstraints(p, "最大的是谁", []string{"语音数据集"}, nil)
+		require.Equal(t, "llm supplied", p.Keywords)
+	})
+
+	t.Run("unrecognized history text yields no keywords", func(t *testing.T) {
+		p := &ParseDatasetQueryResult{}
+		inheritHistoryConstraints(p, "最大的是谁", []string{"火星土壤样本数据集"}, nil)
+		require.Empty(t, p.Keywords)
+	})
+
+	t.Run("llm-repeated history tag is upgraded to hard", func(t *testing.T) {
+		p := &ParseDatasetQueryResult{Tags: []TagArg{{Category: "task", Name: "multiple-choice"}}}
+		inheritHistoryConstraints(p, "下载量最高的呢", []string{"多选题数据集"}, vocab)
+		require.Len(t, p.Tags, 1)
+		require.True(t, p.Tags[0].Hard)
 	})
 
 	t.Run("fallback results and empty history are left alone", func(t *testing.T) {
 		p := &ParseDatasetQueryResult{Fallback: true, Keywords: "最大的呢"}
-		inheritHistoryConstraints(p, []string{"小于10kb的数据集"}, nil)
+		inheritHistoryConstraints(p, "最大的呢", []string{"小于10kb的数据集"}, nil)
 		require.Nil(t, p.MaxSizeBytes)
 
 		p = &ParseDatasetQueryResult{}
-		inheritHistoryConstraints(p, nil, nil)
+		inheritHistoryConstraints(p, "最大的是谁", nil, nil)
 		require.Nil(t, p.MaxSizeBytes)
 	})
+}
+
+func TestRecognizedTopicTerms(t *testing.T) {
+	require.Equal(t, "文本 分类", recognizedTopicTerms("文本分类的簌俱寂有哪些"))
+	require.Equal(t, "语音", recognizedTopicTerms("语音数据集"))
+	require.Equal(t, "", recognizedTopicTerms("火星土壤样本数据集"))
+	require.Equal(t, "", recognizedTopicTerms("小于10kb的数据集有哪些"))
+	require.Equal(t, "", recognizedTopicTerms(""))
 }
 
 func TestAllTagsHard(t *testing.T) {
