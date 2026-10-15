@@ -33,6 +33,7 @@ var querySynonymGroups = [][]string{
 	{"translation", "translate", "翻译"},
 	{"summarization", "summary", "摘要", "总结"},
 	{"qa", "question answering", "问答"},
+	{"multiple choice", "multiple-choice", "mcq", "多选题", "多项选择"},
 	{"sentiment", "情感"},
 	{"generation", "generate", "生成"},
 	{"dialogue", "dialog", "conversation", "chat", "对话", "聊天"},

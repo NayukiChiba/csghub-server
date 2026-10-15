@@ -1086,3 +1086,186 @@ func TestSearchDatasets_KeywordsRetriedWithoutTags(t *testing.T) {
 	require.Empty(t, filters[len(filters)-1].Tags)
 	require.NotEmpty(t, filters[len(filters)-1].Search)
 }
+
+// A modality the user typed verbatim (ModalityHard) must survive the whole
+// cascade: the keyword-only fallback that drops auxiliary groups is exactly
+// what answered "多模态评估" with text-only benchmarks when the LLM kept
+// "multimodal" only in the modality field.
+func TestSearchDatasets_HardModalitySkipsKeywordOnlyFallback(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "evaluation benchmark", Modality: "multimodal", ModalityHard: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, result.Total)
+	require.NotEmpty(t, ds.filters)
+	for _, f := range ds.filters {
+		flat := ""
+		for _, g := range f.SearchGroups {
+			flat += strings.Join(g, " ") + "\n"
+		}
+		require.Contains(t, flat, "multimodal", "no attempt may drop the hard modality")
+	}
+}
+
+// The same query with a soft (LLM-inferred) modality keeps the keyword-only
+// fallback — it is the recall path for good guesses.
+func TestSearchDatasets_SoftModalityKeepsKeywordOnlyFallback(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		return nil, 0, nil
+	}
+
+	_, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "evaluation benchmark", Modality: "multimodal",
+	})
+	require.NoError(t, err)
+	var sawKeywordOnly bool
+	for _, f := range ds.filters {
+		flat := ""
+		for _, g := range f.SearchGroups {
+			flat += strings.Join(g, " ") + "\n"
+		}
+		if !strings.Contains(flat, "multimodal") && strings.Contains(flat, "evaluation") {
+			sawKeywordOnly = true
+		}
+	}
+	require.True(t, sawKeywordOnly, "soft modality should allow the keyword-only attempt")
+}
+
+// When every tag is user-stated (Hard), a tags-only fallback is allowed even
+// with keywords present: keyword search cannot reach datasets whose
+// name/description/README is empty even though they carry the exact tag.
+func TestSearchDatasets_HardTagsAllowTagsOnlyFallback(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if filter.Search == "" && len(filter.Tags) > 0 {
+			return []*types.Dataset{{Path: "root/imagefolder", Name: "imagefolder"}}, 1, nil
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "图像分类",
+		Tags:     []TagArg{{Category: "task", Name: "image-classification", Hard: true}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	require.Equal(t, "tags", result.MatchMode)
+	require.Equal(t, "root/imagefolder", result.Datasets[0].Namespace+"/"+result.Datasets[0].Name)
+}
+
+// An LLM-guessed language narrows the first pass, then the cascade retries
+// without it: 语音 matches the English-README librispeech dataset even though
+// the LLM labeled the query "chinese".
+func TestSearchDatasets_SoftLanguageRelaxedOnRetry(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if filter.ContentLang == "" && len(filter.SearchGroups) > 0 {
+			return []*types.Dataset{{Path: "root/librispeech", Name: "librispeech"}}, 1, nil
+		}
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "语音 音频", Modality: "audio", ModalityHard: true, Language: "chinese",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Total)
+	// the language filter must lead (precision) and be retried without (recall)
+	require.Equal(t, "zh", ds.filters[0].ContentLang)
+	var sawRelaxed bool
+	for _, f := range ds.filters[1:] {
+		if f.ContentLang == "" {
+			sawRelaxed = true
+		}
+	}
+	require.True(t, sawRelaxed, "soft language should be retried without the content_lang filter")
+}
+
+// A language the user typed verbatim (LanguageHard) is never relaxed away.
+func TestSearchDatasets_HardLanguageNeverDropped(t *testing.T) {
+	exec, ds, _, _ := newTestExecutor()
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		return nil, 0, nil
+	}
+
+	result, err := exec.SearchDatasets(context.Background(), SearchDatasetsArgs{
+		Keywords: "文本分类", Language: "english", LanguageHard: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 0, result.Total)
+	require.NotEmpty(t, ds.filters)
+	for _, f := range ds.filters {
+		require.Equal(t, "en", f.ContentLang, "no attempt may drop the hard language")
+	}
+}
+
+// Deterministic extraction pins what the user typed even when the LLM
+// contradicts or omits it: modality from the message wins over the LLM's
+// guess, and a vocabulary tag the user's words fully cover is added as Hard.
+func TestParseDatasetQuery_ExplicitConstraintsOverrideLLM(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"image classification","modality":"text"}`, nil).Once()
+	tags := &fakeTagLister{tags: []*database.Tag{{Category: "task", Name: "image-classification"}}}
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, tags, nil, nil, llmClient, cfg, nil)
+
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "图像分类数据集"})
+	require.NoError(t, err)
+	require.False(t, result.Fallback)
+	require.Equal(t, "image", result.Modality)
+	require.True(t, result.ModalityHard)
+	require.Len(t, result.Tags, 1)
+	require.Equal(t, "image-classification", result.Tags[0].Name)
+	require.True(t, result.Tags[0].Hard)
+}
+
+// The LLM-failure fallback keeps the user's explicit constraints: 多模态评估
+// stays gated even without a working parser.
+func TestParseDatasetQuery_FallbackKeepsExplicitConstraints(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return("", errors.New("llm down")).Once()
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
+
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: "多模态评估数据集"})
+	require.NoError(t, err)
+	require.True(t, result.Fallback)
+	require.Equal(t, "multimodal", result.Modality)
+	require.True(t, result.ModalityHard)
+}
+
+// Deterministic extraction runs against the current message (RawQuery), not
+// the history-folded query: an earlier turn's modality must not leak into the
+// follow-up's constraints.
+func TestParseDatasetQuery_ExplicitConstraintsUseRawQuery(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"video"}`, nil).Once()
+	exec := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient, cfg, nil)
+
+	ctxQuery := "对话上下文：\n用户：有没有图像数据集\n助手：为您找到 1 个\n当前问题：那视频的呢？"
+	result, err := exec.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: ctxQuery, RawQuery: "那视频的呢？"})
+	require.NoError(t, err)
+	require.Equal(t, "video", result.Modality)
+
+	// without RawQuery the folded history wins (first modality found)
+	llmClient2 := mockllm.NewMockLLMSvcClient(t)
+	llmClient2.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"video"}`, nil).Once()
+	exec2 := NewToolExecutor(&fakeDatasetSearcher{}, &fakeRepoFileReader{}, &fakeTagLister{}, nil, nil, llmClient2, cfg, nil)
+	result2, err := exec2.ParseDatasetQuery(context.Background(), ParseDatasetQueryArgs{Query: ctxQuery})
+	require.NoError(t, err)
+	require.Equal(t, "image", result2.Modality)
+}

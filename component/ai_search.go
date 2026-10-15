@@ -69,6 +69,9 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 
 	parsed, err := c.exec.ParseDatasetQuery(ctx, mcpserver.ParseDatasetQueryArgs{
 		Query: contextualQuery(req.History, message),
+		// deterministic constraint extraction must see the current message,
+		// not the folded history
+		RawQuery: message,
 	})
 	if err != nil || parsed == nil {
 		// ParseDatasetQuery already falls back to keyword search on LLM
@@ -108,7 +111,9 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		KeywordExpansions: parsed.KeywordExpansions,
 		Tags:              parsed.Tags,
 		Modality:          parsed.Modality,
+		ModalityHard:      parsed.ModalityHard,
 		Language:          parsed.Language,
+		LanguageHard:      parsed.LanguageHard,
 		MinSizeBytes:      parsed.MinSizeBytes,
 		MaxSizeBytes:      parsed.MaxSizeBytes,
 		CreatedAfter:      parsed.CreatedAfter,
@@ -196,6 +201,9 @@ func composeChatAnswer(parsed *mcpserver.ParseDatasetQueryResult, result *mcpser
 		}
 	default:
 		fmt.Fprintf(&b, "为您找到 %d 个相关数据集%s：", result.Total, sortSuffix(parsed.Sort))
+		if result.MatchMode == "tags" {
+			b.WriteString("\n注：这些内容中没有直接出现您说的关键词，是按数据集标签匹配到的。")
+		}
 	}
 	return b.String()
 }

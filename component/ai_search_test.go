@@ -21,10 +21,15 @@ type aiSearchFakeDatasets struct {
 	total    int
 	// lastFilter records the filter of the most recent Index call
 	lastFilter *types.RepoFilter
+	// indexFn, when set, overrides the static datasets/total response
+	indexFn func(filter *types.RepoFilter) ([]*types.Dataset, int, error)
 }
 
 func (f *aiSearchFakeDatasets) Index(ctx context.Context, filter *types.RepoFilter, per, page int, needOpWeight bool) ([]*types.Dataset, int, error) {
 	f.lastFilter = filter
+	if f.indexFn != nil {
+		return f.indexFn(filter)
+	}
 	return f.datasets, f.total, nil
 }
 
@@ -208,8 +213,10 @@ func TestAISearchChat_BrowseIntentWithKeywordsStillSearches(t *testing.T) {
 }
 
 // A browse misclassification over a message that still contains known domain
-// terms (e.g. "中文数据集有哪些" -> browse with empty filters) falls back to
-// a keyword search over the raw message instead of listing every dataset.
+// terms (e.g. "中文数据集有哪些" -> browse with empty filters) must not list
+// every dataset: deterministic extraction pins the content-language filter
+// the user stated, so the search is scoped to Chinese datasets even though
+// the LLM produced no criteria.
 func TestAISearchChat_BrowseMisclassificationWithTermsStillSearches(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
@@ -224,9 +231,8 @@ func TestAISearchChat_BrowseMisclassificationWithTermsStillSearches(t *testing.T
 	require.Len(t, events, 2)
 	require.Contains(t, events[0].Text, "为您找到 1 个")
 	require.NotContains(t, events[0].Text, "平台目前共有")
-	// raw message became the search keywords
-	require.Equal(t, "中文数据集有哪些", ds.lastFilter.Search)
-	require.NotEmpty(t, ds.lastFilter.SearchGroups)
+	// the user's "中文" became the structured language filter
+	require.Equal(t, "zh", ds.lastFilter.ContentLang)
 }
 
 // "现在有哪些数据集" contains no known domain term; browse stays browse.
@@ -403,4 +409,34 @@ func TestAISearchChat_KeywordExpansionsPassThrough(t *testing.T) {
 	require.Len(t, ds.lastFilter.SearchGroups, 1)
 	require.Contains(t, ds.lastFilter.SearchGroups[0], "多选题")
 	require.Contains(t, ds.lastFilter.SearchGroups[0], "multiple choice")
+}
+
+// When keyword search cannot reach a dataset that carries the exact tag the
+// user asked for (empty name/description/README), the tag-only fallback must
+// fire AND the answer must say the match came from tags, not content.
+func TestAISearchChat_TagOnlyMatchIsLabeled(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	ds := &aiSearchFakeDatasets{}
+	ds.indexFn = func(filter *types.RepoFilter) ([]*types.Dataset, int, error) {
+		if filter.Search == "" && len(filter.Tags) > 0 {
+			return []*types.Dataset{{Path: "root/imagefolder", Name: "imagefolder"}}, 1, nil
+		}
+		return nil, 0, nil
+	}
+	tags := &aiSearchFakeTags{tags: []*database.Tag{{Category: "task", Name: "image-classification"}}}
+	exec := mcpserver.NewToolExecutor(ds, &aiSearchFakeRepo{}, tags, nil, nil, llmClient, cfg, nil)
+	comp := NewAISearchComponentWithDeps(cfg, exec)
+
+	// the LLM forgets the tag; deterministic extraction adds it (hard)
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"search","keywords":"图像分类","reason":"图像分类数据集"}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "图像分类数据集"})
+	require.Len(t, events, 2)
+	require.Contains(t, events[0].Text, "为您找到 1 个")
+	require.Contains(t, events[0].Text, "按数据集标签匹配")
+	require.Equal(t, types.AIChatEventDatasets, events[1].Type)
+	require.Equal(t, "root/imagefolder", events[1].Datasets[0].Namespace+"/"+events[1].Datasets[0].Name)
 }

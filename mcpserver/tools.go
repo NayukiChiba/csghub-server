@@ -135,6 +135,11 @@ type TagArg struct {
 	Category string `json:"category" jsonschema:"tag category, e.g. task, license, framework, industry, program_language"`
 	Name     string `json:"name" jsonschema:"exact tag name; call list_dataset_tags first to discover valid values"`
 	Group    string `json:"group,omitempty" jsonschema:"optional tag group"`
+	// Hard marks a tag the user stated verbatim (matched deterministically
+	// against the tag vocabulary), as opposed to an LLM-inferred guess. When
+	// every tag is hard, a tag-only fallback search is allowed even with
+	// keywords present — the tag IS the user's own constraint.
+	Hard bool `json:"hard,omitempty" jsonschema:"set when the tag comes from the user's own words rather than inference"`
 }
 
 type SearchDatasetsArgs struct {
@@ -142,21 +147,31 @@ type SearchDatasetsArgs struct {
 	KeywordExpansions []KeywordExpansion `json:"keyword_expansions,omitempty" jsonschema:"equivalent expressions for keywords (e.g. the english form of a chinese term); OR-combined with the source keyword to widen full-text recall"`
 	Tags              []TagArg           `json:"tags,omitempty" jsonschema:"exact tag filters (AND-combined); discover valid values with list_dataset_tags"`
 	Modality          string             `json:"modality,omitempty" jsonschema:"data modality filter: image, audio, video, text, 3d or multimodal; expanded to synonyms and matched against name and description"`
-	Language          string             `json:"language,omitempty" jsonschema:"natural language of the dataset content, e.g. chinese, english, 中文; expanded to synonyms"`
-	MinSizeBytes      *int64             `json:"min_size_bytes,omitempty" jsonschema:"minimum repository size in bytes; omit unless the user specifies a size"`
-	MaxSizeBytes      *int64             `json:"max_size_bytes,omitempty" jsonschema:"maximum repository size in bytes; omit unless the user specifies a size"`
-	CreatedAfter      string             `json:"created_after,omitempty" jsonschema:"only datasets created on or after this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
-	CreatedBefore     string             `json:"created_before,omitempty" jsonschema:"only datasets created on or before this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
-	UpdatedAfter      string             `json:"updated_after,omitempty" jsonschema:"only datasets updated on or after this date, YYYY-MM-DD; omit unless the user constrains the update date"`
-	UpdatedBefore     string             `json:"updated_before,omitempty" jsonschema:"only datasets updated on or before this date, YYYY-MM-DD; omit unless the user constrains the update date"`
-	Sort              string             `json:"sort,omitempty" jsonschema:"sort order: trending, recently_update, most_download, most_favorite, most_star, largest (biggest repo size first) or smallest"`
-	Page              int                `json:"page,omitempty" jsonschema:"page number, starting at 1"`
-	Per               int                `json:"per,omitempty" jsonschema:"page size, max 50"`
+	// ModalityHard marks the modality as user-stated verbatim; a hard modality
+	// is never relaxed away by the fallback cascade.
+	ModalityHard bool   `json:"modality_hard,omitempty" jsonschema:"set when the modality word appeared in the user's query itself"`
+	Language     string `json:"language,omitempty" jsonschema:"natural language of the dataset content, e.g. chinese, english, 中文; expanded to synonyms"`
+	// LanguageHard marks the language as user-stated verbatim; a hard language
+	// is never relaxed away by the fallback cascade.
+	LanguageHard  bool   `json:"language_hard,omitempty" jsonschema:"set when the language word appeared in the user's query itself"`
+	MinSizeBytes  *int64 `json:"min_size_bytes,omitempty" jsonschema:"minimum repository size in bytes; omit unless the user specifies a size"`
+	MaxSizeBytes  *int64 `json:"max_size_bytes,omitempty" jsonschema:"maximum repository size in bytes; omit unless the user specifies a size"`
+	CreatedAfter  string `json:"created_after,omitempty" jsonschema:"only datasets created on or after this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
+	CreatedBefore string `json:"created_before,omitempty" jsonschema:"only datasets created on or before this date, YYYY-MM-DD; omit unless the user constrains the creation date"`
+	UpdatedAfter  string `json:"updated_after,omitempty" jsonschema:"only datasets updated on or after this date, YYYY-MM-DD; omit unless the user constrains the update date"`
+	UpdatedBefore string `json:"updated_before,omitempty" jsonschema:"only datasets updated on or before this date, YYYY-MM-DD; omit unless the user constrains the update date"`
+	Sort          string `json:"sort,omitempty" jsonschema:"sort order: trending, recently_update, most_download, most_favorite, most_star, largest (biggest repo size first) or smallest"`
+	Page          int    `json:"page,omitempty" jsonschema:"page number, starting at 1"`
+	Per           int    `json:"per,omitempty" jsonschema:"page size, max 50"`
 }
 
 type SearchDatasetsResult struct {
 	Total    int                    `json:"total"`
 	Datasets []types.DatasetSummary `json:"datasets"`
+	// MatchMode is "tags" when the winning attempt matched on tags alone
+	// (keywords did not literally hit); callers should label the results so
+	// users can tell a tag match from a content match.
+	MatchMode string `json:"match_mode,omitempty"`
 }
 
 func summarize(ds *types.Dataset) types.DatasetSummary {
@@ -181,6 +196,17 @@ func summarize(ds *types.Dataset) types.DatasetSummary {
 	return s
 }
 
+// searchAttempt is one cascade step. noLang marks a retry with the language
+// constraint (structured content_lang filter and language text group)
+// dropped; only used for LLM-guessed languages, never user-stated ones.
+type searchAttempt struct {
+	groups   [][]string
+	any      bool
+	dropTags bool
+	tagsOnly bool
+	noLang   bool
+}
+
 func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsArgs) (*SearchDatasetsResult, error) {
 	// Chinese/English get a structured content-language filter: English
 	// datasets never say "english" in name/description, so full-text matching
@@ -195,13 +221,14 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		keywords = stripContentLangTerms(keywords, contentLang)
 	}
 	kwGroups := buildKeywordGroups(keywords, args.KeywordExpansions)
-	var auxGroups [][]string
+	var modalityGroups, langGroups [][]string
 	if m := strings.ToLower(strings.TrimSpace(args.Modality)); m != "" {
-		auxGroups = append(auxGroups, expandToken(m))
+		modalityGroups = append(modalityGroups, expandToken(m))
 	}
 	if lang := strings.ToLower(strings.TrimSpace(args.Language)); lang != "" && contentLang == "" {
-		auxGroups = append(auxGroups, expandToken(lang))
+		langGroups = append(langGroups, expandToken(lang))
 	}
+	auxGroups := append(slices.Clone(modalityGroups), langGroups...)
 
 	createdAfter, err := parseDateBound(args.CreatedAfter, false)
 	if err != nil {
@@ -221,7 +248,14 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	}
 	sizeSort := args.Sort == "largest" || args.Sort == "smallest"
 
-	newFilter := func(groups [][]string, any bool, dropTags, tagsOnly bool) *types.RepoFilter {
+	newFilter := func(att searchAttempt) *types.RepoFilter {
+		groups, any, dropTags, tagsOnly := att.groups, att.any, att.dropTags, att.tagsOnly
+		// noLang retries drop the language constraint entirely, structured
+		// content_lang filter and language text group alike.
+		contentLang := contentLang
+		if att.noLang {
+			contentLang = ""
+		}
 		// Search mirrors the raw query text (language terms stripped when the
 		// structured filter covers them): it keeps the store layer on the
 		// full-text branch (which requires a non-empty Search) and
@@ -234,7 +268,7 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 			groups = nil
 		} else if search == "" && len(groups) > 0 {
 			search = strings.ToLower(strings.TrimSpace(args.Modality))
-			if contentLang == "" {
+			if contentLang == "" && !att.noLang {
 				search = strings.ToLower(strings.TrimSpace(search + " " + args.Language))
 			}
 			if search == "" {
@@ -301,6 +335,61 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 
 	allGroups := append(append([][]string{}, kwGroups...), auxGroups...)
 
+	// buildTier assembles one cascade pass. withLang=false produces the
+	// language-relaxed retry pass: same tiers minus the language text group,
+	// with noLang set so newFilter also drops the structured content_lang
+	// filter.
+	buildTier := func(withLang bool) []searchAttempt {
+		aux := modalityGroups
+		if withLang {
+			aux = auxGroups
+		}
+		all := append(append([][]string{}, kwGroups...), aux...)
+		var list []searchAttempt
+		if len(all) > 0 {
+			list = append(list, searchAttempt{groups: all, noLang: !withLang})
+			if len(aux) > 0 && len(kwGroups) > 0 {
+				// A modality the user typed verbatim is never dropped: the
+				// keyword-only attempt is what answered "多模态评估" with pure-text
+				// benchmarks when the LLM kept "multimodal" only in the modality
+				// field instead of the keywords.
+				if !args.ModalityHard {
+					list = append(list, searchAttempt{groups: kwGroups, noLang: !withLang})
+				}
+				if len(args.Tags) > 0 {
+					list = append(list, searchAttempt{groups: aux, noLang: !withLang})
+				}
+			}
+		}
+		if len(args.Tags) > 0 && len(kwGroups) > 0 {
+			list = append(list, searchAttempt{groups: kwGroups, dropTags: true, noLang: !withLang})
+		}
+		// A tags-only attempt drops the keyword constraint entirely, so it is
+		// legitimate only when there is nothing to drop (keywords empty or fully
+		// consumed by stopwords) or when every tag is user-stated (Hard) — an
+		// LLM-guessed tag must never replace the user's own keywords, but a tag
+		// the user literally asked for may: keyword search cannot reach datasets
+		// whose name/description/README is empty even though they carry the exact
+		// tag (图像分类 -> hf-internal-testing-imagefolder..., which has neither).
+		if len(args.Tags) > 0 && (len(kwGroups) == 0 || allTagsHard(args.Tags)) {
+			list = append(list, searchAttempt{tagsOnly: true, noLang: !withLang})
+			// Tag coverage is incomplete on the platform (e.g. HF task_ids never
+			// became tags), so an exact tag join under-recalls: a full-text
+			// search on the tag names themselves catches datasets whose README
+			// describes the task without carrying the tag.
+			var tagGroups [][]string
+			for _, t := range args.Tags {
+				if name := strings.TrimSpace(t.Name); name != "" {
+					tagGroups = append(tagGroups, []string{name})
+				}
+			}
+			if len(tagGroups) > 0 {
+				list = append(list, searchAttempt{groups: tagGroups, dropTags: true, noLang: !withLang})
+			}
+		}
+		return list
+	}
+
 	// Precision cascade with strict AND semantics only. The user's criteria
 	// are AND-connected by intent; when a combination does not exist the
 	// answer must say so instead of silently dropping a core condition
@@ -308,7 +397,8 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	// benchmarks). The only droppable constraints between attempts are the
 	// LLM-inferred ones (modality/language groups, guessed tags):
 	//  1. strict AND over keyword + modality/language groups (+ tag filters)
-	//  2. strict AND over keyword groups only (auxiliary groups dropped)
+	//  2. strict AND over keyword groups only (auxiliary groups dropped) —
+	//     skipped when the modality is user-stated (ModalityHard)
 	//  3. strict AND over auxiliary groups only (keywords dropped) — keywords
 	//     are the least reliable channel when the LLM also produced exact tag
 	//     filters from the real vocabulary
@@ -317,50 +407,17 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	//     genuine keyword matches (多选题: only one dataset carries the
 	//     multiple-choice tag while several READMEs describe the task)
 	//  5. tags only — exact tag joins with no text search at all; only when
-	//     there are no content keywords, see below
-	type attempt struct {
-		groups   [][]string
-		any      bool
-		dropTags bool
-		tagsOnly bool
-	}
-	var attempts []attempt
-	if len(allGroups) > 0 {
-		attempts = append(attempts, attempt{groups: allGroups})
-		if len(auxGroups) > 0 && len(kwGroups) > 0 {
-			attempts = append(attempts, attempt{groups: kwGroups})
-			if len(args.Tags) > 0 {
-				attempts = append(attempts, attempt{groups: auxGroups})
-			}
-		}
-	}
-	if len(args.Tags) > 0 && len(kwGroups) > 0 {
-		attempts = append(attempts, attempt{groups: kwGroups, dropTags: true})
-	}
-	// A tags-only attempt drops the keyword constraint entirely, so it is
-	// legitimate only when there is nothing to drop: keywords empty or fully
-	// consumed by stopwords (e.g. a pure "MIT 许可证" ask the LLM expressed
-	// via tags). Dropping real content keywords would answer "多模态评估"
-	// with datasets that merely carry an LLM-guessed tag — the silent
-	// relaxation the strict AND semantics forbid.
-	if len(args.Tags) > 0 && len(kwGroups) == 0 {
-		attempts = append(attempts, attempt{tagsOnly: true})
-		// Tag coverage is incomplete on the platform (e.g. HF task_ids never
-		// became tags), so an exact tag join under-recalls: a full-text
-		// search on the tag names themselves catches datasets whose README
-		// describes the task without carrying the tag.
-		var tagGroups [][]string
-		for _, t := range args.Tags {
-			if name := strings.TrimSpace(t.Name); name != "" {
-				tagGroups = append(tagGroups, []string{name})
-			}
-		}
-		if len(tagGroups) > 0 {
-			attempts = append(attempts, attempt{groups: tagGroups, dropTags: true})
-		}
+	//     there are no content keywords, or every tag is user-stated (Hard)
+	// An LLM-guessed language is soft like the other inferred constraints: the
+	// cascade runs first with it, then retries every tier without it (语音 ->
+	// librispeech, an English README the LLM labeled "chinese"). A language the
+	// user typed (LanguageHard) is never dropped.
+	attempts := buildTier(true)
+	if args.Language != "" && !args.LanguageHard && (contentLang != "" || len(langGroups) > 0) {
+		attempts = append(attempts, buildTier(false)...)
 	}
 	if len(attempts) == 0 {
-		attempts = append(attempts, attempt{})
+		attempts = append(attempts, searchAttempt{})
 	}
 
 	// Size orderings are also applied client-side: the full-text search path
@@ -371,7 +428,7 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		queryPer, queryPage = maxPerPage, 1
 	}
 	for i, att := range attempts {
-		filter := newFilter(att.groups, att.any, att.dropTags, att.tagsOnly)
+		filter := newFilter(att)
 		datasets, total, err := e.datasets.Index(ctx, filter, queryPer, queryPage, false)
 		if err != nil {
 			return nil, fmt.Errorf("search datasets: %w", err)
@@ -398,7 +455,7 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 		if att.tagsOnly && total > 0 && total < per && i < len(attempts)-1 {
 			next := attempts[i+1]
 			if !next.tagsOnly {
-				extra, extraTotal, err := e.datasets.Index(ctx, newFilter(next.groups, next.any, next.dropTags, false), queryPer, queryPage, false)
+				extra, extraTotal, err := e.datasets.Index(ctx, newFilter(searchAttempt{groups: next.groups, any: next.any, dropTags: next.dropTags, noLang: next.noLang}), queryPer, queryPage, false)
 				if err != nil {
 					return nil, fmt.Errorf("top up tags-only search datasets: %w", err)
 				}
@@ -417,6 +474,9 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 			}
 		}
 		result := &SearchDatasetsResult{Total: total}
+		if att.tagsOnly {
+			result.MatchMode = "tags"
+		}
 		for _, ds := range datasets {
 			result.Datasets = append(result.Datasets, summarize(ds))
 		}
@@ -528,14 +588,14 @@ func sortDatasetsBySize(datasets []types.DatasetSummary, sort string) {
 // tag filters, then the tags-only join. Existing hits keep their order; new
 // hits append. The total is the largest superset count observed, so the
 // answer never reports fewer matches than a single-constraint query found.
-func (e *ToolExecutor) topUpUnderfilled(ctx context.Context, newFilter func(groups [][]string, any, dropTags, tagsOnly bool) *types.RepoFilter, allGroups [][]string, datasets []*types.Dataset, total, per, queryPer, queryPage int) ([]*types.Dataset, int, error) {
+func (e *ToolExecutor) topUpUnderfilled(ctx context.Context, newFilter func(att searchAttempt) *types.RepoFilter, allGroups [][]string, datasets []*types.Dataset, total, per, queryPer, queryPage int) ([]*types.Dataset, int, error) {
 	seen := make(map[string]bool, len(datasets))
 	for _, ds := range datasets {
 		seen[ds.Path] = true
 	}
 	topUps := []*types.RepoFilter{
-		newFilter(allGroups, false, true, false),
-		newFilter(nil, false, false, true),
+		newFilter(searchAttempt{groups: allGroups, dropTags: true}),
+		newFilter(searchAttempt{tagsOnly: true}),
 	}
 	for _, filter := range topUps {
 		if len(datasets) >= per {
@@ -704,6 +764,12 @@ func (e *ToolExecutor) fillViewerInfo(ctx context.Context, namespace, name strin
 
 type ParseDatasetQueryArgs struct {
 	Query string `json:"query" jsonschema:"natural language dataset search query"`
+	// RawQuery is the user's current message before any conversation history
+	// was folded into Query. Deterministic constraint extraction (dates,
+	// explicit modality/language/tags) runs against it when present, so
+	// earlier turns cannot pin constraints the user has already moved away
+	// from (e.g. "那视频的呢" after an image search).
+	RawQuery string `json:"raw_query,omitempty" jsonschema:"the user's current message, when query contains folded conversation history"`
 }
 
 // ParseDatasetQueryResult mirrors SearchDatasetsArgs so callers can feed the
@@ -725,9 +791,16 @@ type ParseDatasetQueryResult struct {
 	KeywordExpansions []KeywordExpansion `json:"keyword_expansions,omitempty"`
 	Tags              []TagArg           `json:"tags,omitempty"`
 	Modality          string             `json:"modality,omitempty"`
-	Language          string             `json:"language,omitempty"`
-	MinSizeBytes      *int64             `json:"min_size_bytes,omitempty"`
-	MaxSizeBytes      *int64             `json:"max_size_bytes,omitempty"`
+	// ModalityHard is set when the modality word appeared verbatim in the
+	// user's message (deterministic extraction), not merely inferred by the
+	// LLM; hard modalities survive the search fallback cascade.
+	ModalityHard bool   `json:"modality_hard,omitempty"`
+	Language     string `json:"language,omitempty"`
+	// LanguageHard is set when the language word appeared verbatim in the
+	// user's message; hard languages survive the search fallback cascade.
+	LanguageHard bool   `json:"language_hard,omitempty"`
+	MinSizeBytes *int64 `json:"min_size_bytes,omitempty"`
+	MaxSizeBytes *int64 `json:"max_size_bytes,omitempty"`
 	// CreatedAfter/CreatedBefore bound the dataset creation date (YYYY-MM-DD).
 	CreatedAfter  string `json:"created_after,omitempty"`
 	CreatedBefore string `json:"created_before,omitempty"`
@@ -835,11 +908,15 @@ func parseTagVocab(tags []*database.Tag) string {
 }
 
 // fallbackParseResult builds the raw-keyword fallback used when the LLM is
-// unavailable or its output is unusable. Deterministic date expressions are
-// still honored so an LLM outage does not silently drop the date condition.
-func fallbackParseResult(query, reason string) *ParseDatasetQueryResult {
-	r := &ParseDatasetQueryResult{Keywords: query, Fallback: true, Reason: reason}
-	applyDateConstraint(r, query)
+// unavailable or its output is unusable. Deterministic constraints (dates,
+// explicit modality/language/tags) are still honored so an LLM outage does
+// not silently drop conditions the user stated outright. Keywords hold the
+// current message only — not the history-folded query, which full-text search
+// cannot use.
+func (e *ToolExecutor) fallbackParseResult(raw, reason string, vocab []*database.Tag) *ParseDatasetQueryResult {
+	r := &ParseDatasetQueryResult{Keywords: raw, Fallback: true, Reason: reason}
+	applyDateConstraint(r, raw)
+	applyExplicitConstraints(r, raw, vocab)
 	return r
 }
 
@@ -876,9 +953,21 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	if query == "" {
 		return nil, fmt.Errorf("query is required")
 	}
+	// Deterministic extraction (dates, explicit modality/language/tags) runs
+	// against the current message only, never the folded history.
+	raw := strings.TrimSpace(args.RawQuery)
+	if raw == "" {
+		raw = query
+	}
+	var vocab []*database.Tag
+	if e.tags != nil {
+		if allTags, err := e.tags.AllDatasetTags(ctx); err == nil {
+			vocab = allTags
+		}
+	}
 	endpoint, model, apiKey := e.ResolveLLMConfig(ctx)
 	if endpoint == "" {
-		return fallbackParseResult(query, "LLM not configured"), nil
+		return e.fallbackParseResult(raw, "LLM not configured", vocab), nil
 	}
 
 	timeout := time.Duration(e.cfg.AISearch.TimeoutMS) * time.Millisecond
@@ -892,12 +981,7 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	if apiKey != "" {
 		headers["Authorization"] = "Bearer " + apiKey
 	}
-	var tagVocab string
-	if e.tags != nil {
-		if allTags, err := e.tags.AllDatasetTags(ctx); err == nil {
-			tagVocab = parseTagVocab(allTags)
-		}
-	}
+	tagVocab := parseTagVocab(vocab)
 	content, err := e.llm.Chat(llmCtx, endpoint, "", headers, types.LLMReqBody{
 		Model: model,
 		Messages: []types.LLMMessage{
@@ -907,13 +991,13 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	})
 	if err != nil {
 		slog.Warn("parse dataset query via llm failed, fallback to keyword search", slog.Any("error", err))
-		return fallbackParseResult(query, "LLM request failed"), nil
+		return e.fallbackParseResult(raw, "LLM request failed", vocab), nil
 	}
 
 	parsed := &ParseDatasetQueryResult{}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(strings.Trim(content, "`"))), parsed); err != nil {
 		slog.Warn("parse llm structured output failed, fallback to keyword search", slog.Any("error", err))
-		return fallbackParseResult(query, "LLM output was not valid JSON"), nil
+		return e.fallbackParseResult(raw, "LLM output was not valid JSON", vocab), nil
 	}
 	// LLMs often emit explicit 0 for the size fields (the schema example shows
 	// numbers); a zero bound is not a real constraint and a zero max would
@@ -946,7 +1030,8 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	// Expansions are a best-effort recall aid: normalize them and drop junk
 	// entries rather than failing the search on malformed LLM output.
 	parsed.KeywordExpansions = sanitizeKeywordExpansions(parsed.KeywordExpansions)
-	applyDateConstraint(parsed, args.Query)
+	applyDateConstraint(parsed, raw)
+	applyExplicitConstraints(parsed, raw, vocab)
 	// Empty keywords with no filters is a valid browse/list-all intent; only
 	// the fallback paths above substitute the raw query as keywords.
 	return parsed, nil
