@@ -117,6 +117,63 @@ func TestApplyExplicitConstraints(t *testing.T) {
 	})
 }
 
+func TestInheritHistoryConstraints(t *testing.T) {
+	vocab := []*database.Tag{{Category: "task", Name: "multiple-choice"}}
+
+	t.Run("follow-up inherits the size bound from history", func(t *testing.T) {
+		p := &ParseDatasetQueryResult{Sort: "largest"}
+		inheritHistoryConstraints(p, []string{"小于10kb的数据集有哪些"}, nil)
+		require.NotNil(t, p.MaxSizeBytes)
+		require.Equal(t, int64(10240), *p.MaxSizeBytes)
+	})
+
+	t.Run("current message's own bound wins", func(t *testing.T) {
+		own := int64(20480)
+		p := &ParseDatasetQueryResult{MaxSizeBytes: &own}
+		inheritHistoryConstraints(p, []string{"小于10kb的数据集"}, nil)
+		require.Equal(t, int64(20480), *p.MaxSizeBytes)
+	})
+
+	t.Run("modality is inherited as hard; the current one wins", func(t *testing.T) {
+		p := &ParseDatasetQueryResult{Sort: "largest"}
+		inheritHistoryConstraints(p, []string{"语音数据集有哪些"}, nil)
+		require.Equal(t, "audio", p.Modality)
+		require.True(t, p.ModalityHard)
+
+		p = &ParseDatasetQueryResult{Modality: "image", ModalityHard: true}
+		inheritHistoryConstraints(p, []string{"语音数据集有哪些"}, nil)
+		require.Equal(t, "image", p.Modality)
+	})
+
+	t.Run("language, tags and dates are inherited", func(t *testing.T) {
+		p := &ParseDatasetQueryResult{}
+		inheritHistoryConstraints(p, []string{"10.12之后上传的多选题数据集"}, vocab)
+		require.Equal(t, []TagArg{{Category: "task", Name: "multiple-choice", Hard: true}}, p.Tags)
+		require.Equal(t, "2026-10-12", p.CreatedAfter)
+
+		p = &ParseDatasetQueryResult{}
+		inheritHistoryConstraints(p, []string{"英文的文本分类"}, nil)
+		require.Equal(t, "english", p.Language)
+		require.True(t, p.LanguageHard)
+	})
+
+	t.Run("keywords are never inherited", func(t *testing.T) {
+		p := &ParseDatasetQueryResult{}
+		inheritHistoryConstraints(p, []string{"火星土壤样本数据集"}, nil)
+		require.Empty(t, p.Keywords)
+	})
+
+	t.Run("fallback results and empty history are left alone", func(t *testing.T) {
+		p := &ParseDatasetQueryResult{Fallback: true, Keywords: "最大的呢"}
+		inheritHistoryConstraints(p, []string{"小于10kb的数据集"}, nil)
+		require.Nil(t, p.MaxSizeBytes)
+
+		p = &ParseDatasetQueryResult{}
+		inheritHistoryConstraints(p, nil, nil)
+		require.Nil(t, p.MaxSizeBytes)
+	})
+}
+
 func TestAllTagsHard(t *testing.T) {
 	require.False(t, allTagsHard(nil))
 	require.True(t, allTagsHard([]TagArg{{Hard: true}}))

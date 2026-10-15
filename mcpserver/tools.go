@@ -802,6 +802,10 @@ type ParseDatasetQueryArgs struct {
 	// earlier turns cannot pin constraints the user has already moved away
 	// from (e.g. "那视频的呢" after an image search).
 	RawQuery string `json:"raw_query,omitempty" jsonschema:"the user's current message, when query contains folded conversation history"`
+	// History holds the earlier user messages (oldest first) when Query has
+	// conversation context folded in. A follow-up that adds no criteria of its
+	// own ("最大的数据集是谁") inherits the constraints those messages stated.
+	History []string `json:"history,omitempty" jsonschema:"earlier user messages, oldest first, when query contains folded conversation history"`
 }
 
 // ParseDatasetQueryResult mirrors SearchDatasetsArgs so callers can feed the
@@ -899,6 +903,8 @@ Respond with a JSON object only, no markdown fences, no explanation. Schema:
 Intent rules: use "tags" when the user asks which tags or tag categories exist (e.g. "有哪些标签"); use "detail" when the user asks for the basic information of ONE specific named dataset — its purpose, modality, license, size or samples (e.g. "mmlu 这个数据集的基本信息", "介绍一下 ceval-exam", "opencompass/mmlu 的许可是什么", "这个数据集有什么用途" referring to a dataset named earlier) — set the dataset field to the name exactly as the user wrote it: the bare name unless the user explicitly wrote namespace/name, NEVER guess or invent a namespace; leave all filters empty; use "browse" ONLY when the user wants to list or browse datasets without any criteria (e.g. "有哪些数据集", "what datasets are available") — keywords and all filters MUST be empty for browse; a message that names any topic, modality or data type (e.g. "视频数据集", "图像分类的数据", "中文数据集有哪些") is always "search" with the corresponding keywords/modality/language filled in; a date or size constraint is a criterion too, so such queries are "search" (with empty keywords if there is nothing else, e.g. "2025年之后上传的数据集" -> intent=search, created_after=2025-01-01); use "other" when the message is not about datasets at all (greetings, small talk, or unrelated questions); otherwise use "search".
 Sort rules: ordering words are NOT search keywords — map them to the sort field instead (下载最多/最多下载/最热门 -> most_download, 收藏最多 -> most_favorite, 星标最多/最多 star -> most_star, 最近更新/最新 -> recently_update, 体积最大/数据量最大/最大的 -> largest, 体积最小/最小的 -> smallest, 热门趋势 -> trending). A query that only asks for an ordering (e.g. "下载最多的数据集有哪些", "most downloaded datasets") is "browse" with sort set; omit sort when the user does not ask for an ordering.
 Date rules: convert relative dates (上个月, 去年, 最近三个月) to absolute YYYY-MM-DD using the current date above; an open-ended range sets only one bound (2025年之后 -> created_after=2025-01-01). Distinguish creation from update: use created_after/created_before ONLY for creation/upload phrasing (创建/上传/导入/发布); use updated_after/updated_before for update phrasing (更新/最近更新, e.g. "今天更新的数据集" -> updated_after=<today>); when the user asks for recently updated datasets without a concrete date, set sort=recently_update and leave all date bounds empty.
+Size rules: convert sizes to bytes with 1024-based units (10kb -> 10240, 1.5GB -> 1610612736); 小于10kb -> max_size_bytes=10240, 大于2MB -> min_size_bytes=2097152.
+Follow-up rules: the user message may start with 对话上下文 (earlier conversation turns) followed by 当前问题 (the question to parse). When 当前问题 refers back to the previous results without stating new filter criteria (e.g. "最大的数据集是谁", "哪个最小", "它们有中文的吗"), inherit the filter conditions (size, dates, modality, language, tags) from the earlier user turns; drop an inherited condition only when 当前问题 states a different one. Parse ONLY 当前问题 otherwise — never treat history text as new keywords.
 %sWhen the query mentions a task type, license, or content language that matches a known tag, emit it as a tag filter with the exact category and name from the vocabulary (文本分类 -> task/text-classification, 目标检测 -> task/object-detection, 中文 -> language/zh, 英文 -> language/en). Prefer the modality field over task tags for pure modality words (语音/音频 -> audio, 图像/图片 -> image, 视频 -> video, 文本 -> text, 多模态 -> multimodal).
 Do not repeat in keywords what you already expressed via modality, language, sort or size filters. Task and license tags, however, have incomplete coverage on this platform (many datasets lack the tag even though their README describes the task), so when you emit a task or license tag, ALSO keep that concept in keywords with expansions — the tag narrows precisely where present, the keywords catch the rest. Keywords are only for the remaining free-text concepts. Omit fields you cannot infer.
 Keyword expansion rules: dataset names, descriptions and README docs on this platform are mostly english, so for every content keyword provide 1-5 equivalent or synonymous expressions in keyword_expansions, ALWAYS including the common english form (多选题 -> multiple choice, multiple-choice, mcq; 自动驾驶 -> autonomous driving, self-driving). The term must be a word that appears in keywords; skip keywords with no useful equivalents, and omit the whole field when there is nothing to expand; do not expand words already expressed via modality or language.`
@@ -948,8 +954,17 @@ func parseTagVocab(tags []*database.Tag) string {
 func (e *ToolExecutor) fallbackParseResult(raw, reason string, vocab []*database.Tag) *ParseDatasetQueryResult {
 	r := &ParseDatasetQueryResult{Keywords: raw, Fallback: true, Reason: reason}
 	applyDateConstraint(r, raw)
+	applySizeConstraint(r, raw)
 	applyExplicitConstraints(r, raw, vocab)
 	return r
+}
+
+// formatDateBound renders an optional date bound as YYYY-MM-DD.
+func formatDateBound(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.Format(time.DateOnly)
 }
 
 // applyDateConstraint overrides the result's date fields with the
@@ -962,21 +977,63 @@ func applyDateConstraint(parsed *ParseDatasetQueryResult, query string) {
 	if dc == nil {
 		return
 	}
-	format := func(t *time.Time) string {
-		if t == nil {
-			return ""
-		}
-		return t.Format(time.DateOnly)
-	}
 	parsed.CreatedAfter, parsed.CreatedBefore, parsed.UpdatedAfter, parsed.UpdatedBefore = "", "", "", ""
 	if dc.updated {
-		parsed.UpdatedAfter, parsed.UpdatedBefore = format(dc.after), format(dc.before)
+		parsed.UpdatedAfter, parsed.UpdatedBefore = formatDateBound(dc.after), formatDateBound(dc.before)
 	} else {
-		parsed.CreatedAfter, parsed.CreatedBefore = format(dc.after), format(dc.before)
+		parsed.CreatedAfter, parsed.CreatedBefore = formatDateBound(dc.after), formatDateBound(dc.before)
 	}
 	// an explicit date outranks the vague "recently updated" ordering
 	if parsed.Sort == "recently_update" {
 		parsed.Sort = ""
+	}
+}
+
+// inheritHistoryConstraints fills filter fields the current message left
+// empty with constraints the user stated in earlier turns, so a follow-up
+// like "最大的数据集是谁" stays inside the scope the conversation established
+// ("小于10kb的数据集" first). The fill is per-field: an explicit choice in the
+// current message always wins ("那视频的呢" overrides an inherited image
+// modality). Keywords are never inherited — free text does not transfer
+// between topics. Only deterministic extraction is used; constraints the LLM
+// guessed for earlier turns are not replayed.
+func inheritHistoryConstraints(parsed *ParseDatasetQueryResult, history []string, vocab []*database.Tag) {
+	if len(history) == 0 || parsed.Fallback {
+		return
+	}
+	now := time.Now()
+	for i := len(history) - 1; i >= 0; i-- {
+		msg := strings.TrimSpace(history[i])
+		if msg == "" {
+			continue
+		}
+		if parsed.MinSizeBytes == nil && parsed.MaxSizeBytes == nil {
+			if sc := extractSizeConstraint(msg); sc != nil {
+				parsed.MinSizeBytes, parsed.MaxSizeBytes = sc.min, sc.max
+			}
+		}
+		if parsed.Modality == "" {
+			if m := explicitModality(msg); m != "" {
+				parsed.Modality, parsed.ModalityHard = m, true
+			}
+		}
+		if parsed.Language == "" {
+			if l := explicitLanguage(msg); l != "" {
+				parsed.Language, parsed.LanguageHard = l, true
+			}
+		}
+		if len(parsed.Tags) == 0 {
+			parsed.Tags = matchExplicitTags(msg, vocab)
+		}
+		if parsed.CreatedAfter == "" && parsed.CreatedBefore == "" && parsed.UpdatedAfter == "" && parsed.UpdatedBefore == "" {
+			if dc := extractDateConstraint(msg, now); dc != nil {
+				if dc.updated {
+					parsed.UpdatedAfter, parsed.UpdatedBefore = formatDateBound(dc.after), formatDateBound(dc.before)
+				} else {
+					parsed.CreatedAfter, parsed.CreatedBefore = formatDateBound(dc.after), formatDateBound(dc.before)
+				}
+			}
+		}
 	}
 }
 
@@ -1063,7 +1120,9 @@ func (e *ToolExecutor) ParseDatasetQuery(ctx context.Context, args ParseDatasetQ
 	// entries rather than failing the search on malformed LLM output.
 	parsed.KeywordExpansions = sanitizeKeywordExpansions(parsed.KeywordExpansions)
 	applyDateConstraint(parsed, raw)
+	applySizeConstraint(parsed, raw)
 	applyExplicitConstraints(parsed, raw, vocab)
+	inheritHistoryConstraints(parsed, args.History, vocab)
 	// Empty keywords with no filters is a valid browse/list-all intent; only
 	// the fallback paths above substitute the raw query as keywords.
 	return parsed, nil

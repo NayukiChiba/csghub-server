@@ -72,6 +72,9 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		// deterministic constraint extraction must see the current message,
 		// not the folded history
 		RawQuery: message,
+		// earlier user turns let follow-ups inherit the constraints already
+		// stated ("最大的数据集是谁" after "小于10kb的数据集")
+		History: historyUserMessages(req.History),
 	})
 	if err != nil || parsed == nil {
 		// ParseDatasetQuery already falls back to keyword search on LLM
@@ -158,6 +161,18 @@ func contextualQuery(history []types.AIChatMessage, message string) string {
 	}
 	b.WriteString("当前问题：" + message)
 	return b.String()
+}
+
+// historyUserMessages returns the contents of the user turns, oldest first,
+// so the parser can inherit constraints for follow-up questions.
+func historyUserMessages(history []types.AIChatMessage) []string {
+	var msgs []string
+	for _, h := range history {
+		if h.Role == "user" && strings.TrimSpace(h.Content) != "" {
+			msgs = append(msgs, h.Content)
+		}
+	}
+	return msgs
 }
 
 // isBrowseIntent reports whether the parser returned no criteria at all —

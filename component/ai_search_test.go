@@ -440,3 +440,15 @@ func TestAISearchChat_TagOnlyMatchIsLabeled(t *testing.T) {
 	require.Equal(t, types.AIChatEventDatasets, events[1].Type)
 	require.Equal(t, "root/imagefolder", events[1].Datasets[0].Namespace+"/"+events[1].Datasets[0].Name)
 }
+
+func TestHistoryUserMessages(t *testing.T) {
+	history := []types.AIChatMessage{
+		{Role: "user", Content: "小于10kb的数据集有哪些"},
+		{Role: "assistant", Content: "为您找到 2 个…"},
+		{Role: "user", Content: "  "},
+		{Role: "system", Content: "ignored"},
+		{Role: "user", Content: "最大的是谁"},
+	}
+	require.Equal(t, []string{"小于10kb的数据集有哪些", "最大的是谁"}, historyUserMessages(history))
+	require.Nil(t, historyUserMessages(nil))
+}
