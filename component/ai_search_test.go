@@ -343,9 +343,8 @@ func TestAISearchChat_DetailIntent(t *testing.T) {
 	text := events[0].Text
 	require.Contains(t, text, "### 数据集 opencompass/mmlu")
 	require.Contains(t, text, "**用途**：大规模多任务语言理解评测集")
-	require.Contains(t, text, "| 属性 | 内容 |")
-	require.Contains(t, text, "| 模态 | 文本 |")
-	require.Contains(t, text, "| 许可 | MIT |")
+	require.Contains(t, text, "- **模态**：文本")
+	require.Contains(t, text, "- **许可**：MIT")
 	require.Contains(t, text, "default/test 共 100 行")
 	// sample rows render as a markdown table under the attribute table
 	require.Contains(t, text, "**样例数据**")

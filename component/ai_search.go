@@ -369,28 +369,29 @@ const defaultPer = 10
 const detailPurposePreview = 200
 
 // composeDetailAnswer renders the structured basic-info answer for one
-// dataset as a fixed markdown template: a heading, the purpose paragraph, an
-// attribute table (tasks/modality/license/size/downloads/creation), and a
-// sample-data table when the preview conversion provides rows.
+// dataset as a fixed markdown template: a heading, the purpose paragraph,
+// attribute lines (tasks/modality/license/size/downloads/creation), and a
+// sample-data table when the preview conversion provides rows. Attributes are
+// bold-label lines rather than a two-column table: in the narrow chat bubble
+// the label column wraps one character per line and looks broken.
 func composeDetailAnswer(d *mcpserver.DatasetDetail) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "### 数据集 %s/%s\n\n", d.Namespace, d.Name)
 	fmt.Fprintf(&b, "**用途**：%s\n\n", detailPurpose(d))
-	b.WriteString("| 属性 | 内容 |\n|---|---|\n")
 	if len(d.Tasks) > 0 {
-		fmt.Fprintf(&b, "| 任务类型 | %s |\n", strings.Join(d.Tasks, "、"))
+		fmt.Fprintf(&b, "- **任务类型**：%s\n", strings.Join(d.Tasks, "、"))
 	}
 	if m := modalityFromTasks(d.Tasks); m != "" {
-		fmt.Fprintf(&b, "| 模态 | %s |\n", m)
+		fmt.Fprintf(&b, "- **模态**：%s\n", m)
 	}
 	license := strings.TrimSpace(d.License)
 	if license == "" {
 		license = "未标注"
 	}
-	fmt.Fprintf(&b, "| 许可 | %s |\n", license)
-	fmt.Fprintf(&b, "| 数据规模 | %s |\n", detailSize(d))
-	fmt.Fprintf(&b, "| 下载量 | %d 次 |\n", d.Downloads)
-	fmt.Fprintf(&b, "| 创建时间 | %s |\n", d.CreatedAt)
+	fmt.Fprintf(&b, "- **许可**：%s\n", license)
+	fmt.Fprintf(&b, "- **数据规模**：%s\n", detailSize(d))
+	fmt.Fprintf(&b, "- **下载量**：%d 次\n", d.Downloads)
+	fmt.Fprintf(&b, "- **创建时间**：%s\n", d.CreatedAt)
 	if len(d.SampleColumns) > 0 && len(d.SampleRows) > 0 {
 		b.WriteString("\n**样例数据**：\n\n")
 		b.WriteString(formatSampleTable(d.SampleColumns, d.SampleRows))
