@@ -534,6 +534,55 @@ func TestExtremumTop(t *testing.T) {
 	require.Len(t, extremumTop(ds[:1], "most_download"), 1)
 }
 
+func TestAISearchChat_OutputCapLimitsCards(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	cfg.AISearch.ChatMaxResults = 2
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	comp, _ := newAISearchTestComponent(cfg, []*types.Dataset{
+		{Path: "root/a", Name: "a"},
+		{Path: "root/b", Name: "b"},
+		{Path: "root/c", Name: "c"},
+	}, 3, llmClient)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"demo"}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "demo"})
+	require.Len(t, events, 2)
+	// the over-cap answer names the total, shows only the capped cards, and
+	// points at narrowing/other routes instead of listing everything
+	require.Contains(t, events[0].Text, "为您找到 3 个相关数据集")
+	require.Contains(t, events[0].Text, "单次最多展示 2 个")
+	require.Contains(t, events[0].Text, "缩小范围")
+	require.Len(t, events[1].Datasets, 2)
+}
+
+func TestComposeChatAnswer_OverflowHint(t *testing.T) {
+	// browse over the cap: total + hint
+	browse := &mcpserver.ParseDatasetQueryResult{Sort: "most_download"}
+	out := composeChatAnswer(browse, &mcpserver.SearchDatasetsResult{Total: 15}, 10)
+	require.Contains(t, out, "平台目前共有 15 个数据集")
+	require.Contains(t, out, "单次最多展示 10 个")
+
+	// under the cap: no hint
+	out = composeChatAnswer(browse, &mcpserver.SearchDatasetsResult{Total: 5}, 10)
+	require.NotContains(t, out, "单次最多展示")
+
+	// zero results never carry the hint
+	out = composeChatAnswer(&mcpserver.ParseDatasetQueryResult{Keywords: "x"}, &mcpserver.SearchDatasetsResult{}, 10)
+	require.NotContains(t, out, "单次最多展示")
+}
+
+func TestChatMaxResultsClamp(t *testing.T) {
+	comp := &aiSearchComponentImpl{cfg: &config.Config{}}
+	require.Equal(t, 10, comp.chatMaxResults()) // zero config falls back to default
+	comp.cfg.AISearch.ChatMaxResults = 3
+	require.Equal(t, 3, comp.chatMaxResults())
+	comp.cfg.AISearch.ChatMaxResults = 500
+	require.Equal(t, mcpserver.MaxPerPage, comp.chatMaxResults()) // never above the search window
+}
+
 // Sample tables must stay valid markdown: pipes in the data are escaped and
 // ragged rows are normalized to the column count.
 func TestFormatSampleTable(t *testing.T) {

@@ -279,6 +279,10 @@ type Config struct {
 		LLMModel string `env:"STARHUB_SERVER_AI_SEARCH_LLM_MODEL" default:""`
 		// LLMAPIKey is sent as "Authorization: Bearer <key>" when non-empty.
 		LLMAPIKey string `env:"STARHUB_SERVER_AI_SEARCH_LLM_API_KEY" default:""`
+		// ChatMaxResults caps how many dataset cards one chat answer emits.
+		// Over-cap results are not listed; the answer asks the user to narrow
+		// the criteria or browse the datasets page instead.
+		ChatMaxResults int `env:"STARHUB_SERVER_AI_SEARCH_CHAT_MAX_RESULTS" default:"10"`
 	}
 
 	JWT struct {

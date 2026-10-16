@@ -112,7 +112,8 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 	// A superlative question ("下载最多的是哪个") needs the widest result
 	// window so ties with the top entry are not cut off by the page size; the
 	// tie block is truncated back down after the search.
-	per := 10
+	limit := c.chatMaxResults()
+	per := limit
 	if parsed.Extremum {
 		per = mcpserver.MaxPerPage
 	}
@@ -140,8 +141,13 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		result.Datasets = extremumTop(result.Datasets, parsed.Sort)
 		result.Total = len(result.Datasets)
 	}
+	// The answer emits at most limit cards; the overflow hint in the text
+	// tells the user how to narrow the search instead of paging.
+	if len(result.Datasets) > limit {
+		result.Datasets = result.Datasets[:limit]
+	}
 
-	if err := emit(types.AIChatEvent{Type: types.AIChatEventText, Text: composeChatAnswer(parsed, result)}); err != nil {
+	if err := emit(types.AIChatEvent{Type: types.AIChatEventText, Text: composeChatAnswer(parsed, result, limit)}); err != nil {
 		return err
 	}
 	if len(result.Datasets) == 0 {
@@ -204,10 +210,22 @@ func isBrowseIntent(parsed *mcpserver.ParseDatasetQueryResult) bool {
 		parsed.UpdatedBefore == ""
 }
 
+// chatMaxResults is the configured cap on dataset cards per answer, clamped
+// to a sane range; zero/negative config falls back to the default of 10.
+func (c *aiSearchComponentImpl) chatMaxResults() int {
+	limit := c.cfg.AISearch.ChatMaxResults
+	if limit <= 0 {
+		limit = 10
+	}
+	return min(limit, mcpserver.MaxPerPage)
+}
+
 // composeChatAnswer renders the deterministic text answer from the parse and
 // search results. Dataset cards are delivered separately via the datasets
 // event, so the text never links to datasets the search did not return.
-func composeChatAnswer(parsed *mcpserver.ParseDatasetQueryResult, result *mcpserver.SearchDatasetsResult) string {
+// limit is the output cap: when the total exceeds it, the answer asks the
+// user to narrow the criteria or browse the datasets page (no pagination).
+func composeChatAnswer(parsed *mcpserver.ParseDatasetQueryResult, result *mcpserver.SearchDatasetsResult, limit int) string {
 	var b strings.Builder
 	if parsed.Fallback {
 		b.WriteString("AI 解析暂不可用，已按关键词直接搜索。")
@@ -233,6 +251,9 @@ func composeChatAnswer(parsed *mcpserver.ParseDatasetQueryResult, result *mcpser
 		if result.MatchMode == "tags" {
 			b.WriteString("\n注：这些内容中没有直接出现您说的关键词，是按数据集标签匹配到的。")
 		}
+	}
+	if result.Total > limit {
+		fmt.Fprintf(&b, "\n结果较多（共 %d 个），单次最多展示 %d 个。可以增加筛选条件缩小范围，或到「数据集」页面按需筛选浏览。", result.Total, limit)
 	}
 	return b.String()
 }
