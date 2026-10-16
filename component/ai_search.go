@@ -369,30 +369,32 @@ const defaultPer = 10
 const detailPurposePreview = 200
 
 // composeDetailAnswer renders the structured basic-info answer for one
-// dataset: purpose, tasks/modality, license, size and a few sample rows.
+// dataset as a fixed markdown template: a heading, the purpose paragraph, an
+// attribute table (tasks/modality/license/size/downloads/creation), and a
+// sample-data table when the preview conversion provides rows.
 func composeDetailAnswer(d *mcpserver.DatasetDetail) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "数据集 %s/%s 的基本信息：", d.Namespace, d.Name)
-	b.WriteString("\n用途：" + detailPurpose(d))
+	fmt.Fprintf(&b, "### 数据集 %s/%s\n\n", d.Namespace, d.Name)
+	fmt.Fprintf(&b, "**用途**：%s\n\n", detailPurpose(d))
+	b.WriteString("| 属性 | 内容 |\n|---|---|\n")
 	if len(d.Tasks) > 0 {
-		b.WriteString("\n任务类型：" + strings.Join(d.Tasks, "、"))
+		fmt.Fprintf(&b, "| 任务类型 | %s |\n", strings.Join(d.Tasks, "、"))
 	}
 	if m := modalityFromTasks(d.Tasks); m != "" {
-		b.WriteString("\n模态：" + m)
+		fmt.Fprintf(&b, "| 模态 | %s |\n", m)
 	}
 	license := strings.TrimSpace(d.License)
 	if license == "" {
 		license = "未标注"
 	}
-	b.WriteString("\n许可：" + license)
-	b.WriteString("\n数据规模：" + detailSize(d))
+	fmt.Fprintf(&b, "| 许可 | %s |\n", license)
+	fmt.Fprintf(&b, "| 数据规模 | %s |\n", detailSize(d))
+	fmt.Fprintf(&b, "| 下载量 | %d 次 |\n", d.Downloads)
+	fmt.Fprintf(&b, "| 创建时间 | %s |\n", d.CreatedAt)
 	if len(d.SampleColumns) > 0 && len(d.SampleRows) > 0 {
-		b.WriteString("\n样例数据：")
-		for _, row := range d.SampleRows {
-			b.WriteString("\n" + formatSampleRow(d.SampleColumns, row))
-		}
+		b.WriteString("\n**样例数据**：\n\n")
+		b.WriteString(formatSampleTable(d.SampleColumns, d.SampleRows))
 	}
-	fmt.Fprintf(&b, "\n下载量 %d 次 · 创建于 %s", d.Downloads, d.CreatedAt)
 	return b.String()
 }
 
@@ -436,16 +438,39 @@ func detailSize(d *mcpserver.DatasetDetail) string {
 // sampleCellLimit caps one sample cell so long texts stay readable in chat.
 const sampleCellLimit = 60
 
-func formatSampleRow(cols []string, row []any) string {
-	cells := make([]string, 0, len(row))
-	for i, v := range row {
-		cell := truncateRunes(fmt.Sprint(v), sampleCellLimit)
-		if i < len(cols) {
-			cell = cols[i] + ": " + cell
-		}
-		cells = append(cells, cell)
+// formatSampleTable renders sample rows as a markdown table. Cells are
+// whitespace-collapsed, truncated, and pipe-escaped so a "|" in the data
+// cannot break the table; rows are padded/truncated to the column count.
+func formatSampleTable(cols []string, rows [][]any) string {
+	var b strings.Builder
+	writeRow := func(cells []string) {
+		b.WriteString("| " + strings.Join(cells, " | ") + " |\n")
 	}
-	return strings.Join(cells, " | ")
+	header := make([]string, len(cols))
+	for i, c := range cols {
+		header[i] = mdTableCell(c, sampleCellLimit)
+	}
+	writeRow(header)
+	sep := make([]string, len(cols))
+	for i := range sep {
+		sep[i] = "---"
+	}
+	writeRow(sep)
+	for _, row := range rows {
+		cells := make([]string, len(cols))
+		for i := range cells {
+			if i < len(row) {
+				cells[i] = mdTableCell(fmt.Sprint(row[i]), sampleCellLimit)
+			}
+		}
+		writeRow(cells)
+	}
+	return b.String()
+}
+
+// mdTableCell normalizes one value for a markdown table cell.
+func mdTableCell(s string, maxRunes int) string {
+	return strings.ReplaceAll(truncateRunes(s, maxRunes), "|", "\\|")
 }
 
 func truncateRunes(s string, maxRunes int) string {

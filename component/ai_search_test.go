@@ -341,12 +341,16 @@ func TestAISearchChat_DetailIntent(t *testing.T) {
 	events := collectEvents(t, comp, &types.AIChatRequest{Message: "mmlu 这个数据集的基本信息"})
 	require.Len(t, events, 2)
 	text := events[0].Text
-	require.Contains(t, text, "数据集 opencompass/mmlu 的基本信息")
-	require.Contains(t, text, "用途：大规模多任务语言理解评测集")
-	require.Contains(t, text, "模态：文本")
-	require.Contains(t, text, "许可：MIT")
+	require.Contains(t, text, "### 数据集 opencompass/mmlu")
+	require.Contains(t, text, "**用途**：大规模多任务语言理解评测集")
+	require.Contains(t, text, "| 属性 | 内容 |")
+	require.Contains(t, text, "| 模态 | 文本 |")
+	require.Contains(t, text, "| 许可 | MIT |")
 	require.Contains(t, text, "default/test 共 100 行")
-	require.Contains(t, text, "q: 1+1?")
+	// sample rows render as a markdown table under the attribute table
+	require.Contains(t, text, "**样例数据**")
+	require.Contains(t, text, "| q | a |")
+	require.Contains(t, text, "| 1+1? | 2 |")
 	require.Equal(t, types.AIChatEventDatasets, events[1].Type)
 	require.Equal(t, "opencompass/mmlu", events[1].Datasets[0].Namespace+"/"+events[1].Datasets[0].Name)
 }
@@ -387,7 +391,7 @@ func TestAISearchChat_DetailIntentWrongNamespaceFallsBackToBareName(t *testing.T
 
 	events := collectEvents(t, comp, &types.AIChatRequest{Message: "mmlu 这个数据集的基本信息"})
 	require.Len(t, events, 2)
-	require.Contains(t, events[0].Text, "数据集 csg_opencompass/mmlu 的基本信息")
+	require.Contains(t, events[0].Text, "### 数据集 csg_opencompass/mmlu")
 	require.Equal(t, "csg_opencompass/mmlu", events[1].Datasets[0].Namespace+"/"+events[1].Datasets[0].Name)
 }
 
@@ -469,4 +473,19 @@ func TestDescribeCriteria_SameDayWindowCollapses(t *testing.T) {
 func TestSortSuffix_CreationTimeSorts(t *testing.T) {
 	require.Equal(t, "（按创建时间从早到晚排序）", sortSuffix("oldest"))
 	require.Equal(t, "（按创建时间从晚到早排序）", sortSuffix("newest"))
+}
+
+// Sample tables must stay valid markdown: pipes in the data are escaped and
+// ragged rows are normalized to the column count.
+func TestFormatSampleTable(t *testing.T) {
+	out := formatSampleTable([]string{"q", "a"}, [][]any{
+		{"a|b", "x"},
+		{"only-one"},
+		{"1", "2", "extra-dropped"},
+	})
+	require.Contains(t, out, "| q | a |\n| --- | --- |\n")
+	require.Contains(t, out, "a\\|b")
+	require.Contains(t, out, "| only-one |  |")
+	require.Contains(t, out, "| 1 | 2 |")
+	require.NotContains(t, out, "extra-dropped")
 }
