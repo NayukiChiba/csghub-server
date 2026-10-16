@@ -474,6 +474,66 @@ func TestSortSuffix_CreationTimeSorts(t *testing.T) {
 	require.Equal(t, "（按创建时间从晚到早排序）", sortSuffix("newest"))
 }
 
+func TestAISearchChat_ExtremumReturnsTopAndTies(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	comp, _ := newAISearchTestComponent(cfg, []*types.Dataset{
+		{Path: "root/a", Name: "a", Downloads: 1},
+		{Path: "root/b", Name: "b", Downloads: 5},
+		{Path: "root/c", Name: "c", Downloads: 5},
+	}, 3, llmClient)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"browse","keywords":"","sort":"most_download"}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "下载最多的数据集是哪个？"})
+	require.Len(t, events, 2)
+	// the tie block answers the question, not the whole ranking
+	require.Contains(t, events[0].Text, "下载量最高的有 2 个数据集，均为 5 次下载")
+	require.Equal(t, types.AIChatEventDatasets, events[1].Type)
+	require.Len(t, events[1].Datasets, 2)
+	names := []string{events[1].Datasets[0].Name, events[1].Datasets[1].Name}
+	require.ElementsMatch(t, []string{"b", "c"}, names)
+}
+
+func TestAISearchChat_ExtremumSingleWinner(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	comp, _ := newAISearchTestComponent(cfg, []*types.Dataset{
+		{Path: "root/a", Name: "a", Downloads: 1},
+		{Path: "root/b", Name: "b", Downloads: 9},
+	}, 2, llmClient)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"intent":"browse","keywords":"","sort":"most_download"}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{Message: "哪个数据集下载量最高？"})
+	require.Len(t, events, 2)
+	require.Contains(t, events[0].Text, "下载量最高的是 **root/b**（9 次下载）。")
+	require.Len(t, events[1].Datasets, 1)
+	require.Equal(t, "b", events[1].Datasets[0].Name)
+}
+
+func TestExtremumTop(t *testing.T) {
+	ds := []types.DatasetSummary{
+		{Namespace: "root", Name: "a", Downloads: 7, CreatedAt: "2026-10-08"},
+		{Namespace: "root", Name: "b", Downloads: 7, CreatedAt: "2026-10-09"},
+		{Namespace: "root", Name: "c", Downloads: 3, CreatedAt: "2026-10-09"},
+	}
+	// ties on the sort key stay; the rest is cut
+	require.Len(t, extremumTop(ds, "most_download"), 2)
+	// different key, different tie block
+	require.Len(t, extremumTop(ds[1:], "oldest"), 2)
+	// sorts without a comparable summary value answer the top entry alone
+	require.Len(t, extremumTop(ds, "trending"), 1)
+	require.Len(t, extremumTop(ds, "most_star"), 1)
+	// degenerate windows pass through
+	require.Empty(t, extremumTop(nil, "most_download"))
+	require.Len(t, extremumTop(ds[:1], "most_download"), 1)
+}
+
 // Sample tables must stay valid markdown: pipes in the data are escaped and
 // ragged rows are normalized to the column count.
 func TestFormatSampleTable(t *testing.T) {

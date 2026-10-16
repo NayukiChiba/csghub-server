@@ -109,6 +109,13 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		return c.chatDatasetDetail(ctx, parsed.Dataset, emit)
 	}
 
+	// A superlative question ("下载最多的是哪个") needs the widest result
+	// window so ties with the top entry are not cut off by the page size; the
+	// tie block is truncated back down after the search.
+	per := 10
+	if parsed.Extremum {
+		per = mcpserver.MaxPerPage
+	}
 	result, err := c.exec.SearchDatasets(ctx, mcpserver.SearchDatasetsArgs{
 		Keywords:          parsed.Keywords,
 		KeywordExpansions: parsed.KeywordExpansions,
@@ -124,10 +131,14 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		UpdatedAfter:      parsed.UpdatedAfter,
 		UpdatedBefore:     parsed.UpdatedBefore,
 		Sort:              parsed.Sort,
-		Per:               10,
+		Per:               per,
 	})
 	if err != nil {
 		return fmt.Errorf("search datasets: %w", err)
+	}
+	if parsed.Extremum && len(result.Datasets) > 0 {
+		result.Datasets = extremumTop(result.Datasets, parsed.Sort)
+		result.Total = len(result.Datasets)
 	}
 
 	if err := emit(types.AIChatEvent{Type: types.AIChatEventText, Text: composeChatAnswer(parsed, result)}); err != nil {
@@ -204,16 +215,19 @@ func composeChatAnswer(parsed *mcpserver.ParseDatasetQueryResult, result *mcpser
 		b.WriteString("已将您的问题理解为：" + strings.TrimRight(reason, "。.!！") + "。")
 	}
 	switch {
-	case isBrowseIntent(parsed) && result.Total == 0:
+	case result.Total == 0 && isBrowseIntent(parsed):
 		b.WriteString("平台上目前还没有数据集。")
-	case isBrowseIntent(parsed):
-		fmt.Fprintf(&b, "平台目前共有 %d 个数据集%s：", result.Total, sortSuffix(parsed.Sort))
 	case result.Total == 0:
 		if c := describeCriteria(parsed); c != "" {
 			fmt.Fprintf(&b, "%s 的组合在平台上不存在，没有找到同时满足这些条件的数据集。可以减少条件或换个关键词再试。", c)
 		} else {
 			b.WriteString("没有找到符合条件的数据集。建议减少筛选条件，或换个关键词再试。")
 		}
+	case parsed.Extremum:
+		// 极值问题回答头名与同值并列，而不是罗列整个排序列表
+		b.WriteString(extremumAnswer(parsed.Sort, result.Datasets))
+	case isBrowseIntent(parsed):
+		fmt.Fprintf(&b, "平台目前共有 %d 个数据集%s：", result.Total, sortSuffix(parsed.Sort))
 	default:
 		fmt.Fprintf(&b, "为您找到 %d 个相关数据集%s：", result.Total, sortSuffix(parsed.Sort))
 		if result.MatchMode == "tags" {
@@ -221,6 +235,82 @@ func composeChatAnswer(parsed *mcpserver.ParseDatasetQueryResult, result *mcpser
 		}
 	}
 	return b.String()
+}
+
+// extremumTop truncates a sorted result window to the leading tie block: the
+// answer to "下载最多的是哪个" is the top dataset plus every dataset sharing
+// its value, not the whole ranking. Sorts without a comparable value on the
+// summary (trending, most_star) fall back to the top entry alone.
+func extremumTop(summaries []types.DatasetSummary, sort string) []types.DatasetSummary {
+	if len(summaries) <= 1 {
+		return summaries
+	}
+	var same func(a, b types.DatasetSummary) bool
+	switch sort {
+	case "most_download":
+		same = func(a, b types.DatasetSummary) bool { return a.Downloads == b.Downloads }
+	case "most_favorite":
+		same = func(a, b types.DatasetSummary) bool { return a.Likes == b.Likes }
+	case "largest", "smallest":
+		same = func(a, b types.DatasetSummary) bool { return a.Size == b.Size }
+	case "oldest", "newest":
+		same = func(a, b types.DatasetSummary) bool { return a.CreatedAt == b.CreatedAt }
+	case "recently_update":
+		same = func(a, b types.DatasetSummary) bool { return a.UpdatedAt == b.UpdatedAt }
+	default:
+		// trending/most_star: recom score and star count are not loaded onto
+		// the summary, so ties cannot be detected — answer the top one
+		return summaries[:1]
+	}
+	n := 1
+	for n < len(summaries) && same(summaries[0], summaries[n]) {
+		n++
+	}
+	return summaries[:n]
+}
+
+// extremumAnswer renders the answer to a superlative question: the leading
+// dataset of the ordering plus ties, with the winning value stated.
+func extremumAnswer(sort string, datasets []types.DatasetSummary) string {
+	label, value := extremumDimension(sort)
+	first := datasets[0]
+	name := first.Namespace + "/" + first.Name
+	if len(datasets) == 1 {
+		if value != nil {
+			return fmt.Sprintf("%s的是 **%s**（%s）。", label, name, value(first))
+		}
+		return fmt.Sprintf("%s的是 **%s**。", label, name)
+	}
+	if value != nil {
+		return fmt.Sprintf("%s的有 %d 个数据集，均为 %s：", label, len(datasets), value(first))
+	}
+	return fmt.Sprintf("%s的有 %d 个数据集：", label, len(datasets))
+}
+
+// extremumDimension maps a sort order to its Chinese dimension label and a
+// formatter for the winning value; a nil formatter means the value is not
+// loaded (star count) and the answer omits it.
+func extremumDimension(sort string) (string, func(types.DatasetSummary) string) {
+	switch sort {
+	case "most_download":
+		return "下载量最高", func(s types.DatasetSummary) string { return fmt.Sprintf("%d 次下载", s.Downloads) }
+	case "most_favorite":
+		return "收藏量最高", func(s types.DatasetSummary) string { return fmt.Sprintf("%d 次收藏", s.Likes) }
+	case "largest":
+		return "体积最大", func(s types.DatasetSummary) string { return "体积 " + formatBytes(s.Size) }
+	case "smallest":
+		return "体积最小", func(s types.DatasetSummary) string { return "体积 " + formatBytes(s.Size) }
+	case "oldest":
+		return "创建最早", func(s types.DatasetSummary) string { return "创建于 " + s.CreatedAt }
+	case "newest":
+		return "最新创建", func(s types.DatasetSummary) string { return "创建于 " + s.CreatedAt }
+	case "recently_update":
+		return "最近更新", func(s types.DatasetSummary) string { return "更新于 " + s.UpdatedAt }
+	case "most_star":
+		return "星标最多", nil
+	default: // trending
+		return "热度最高", nil
+	}
 }
 
 // describeCriteria renders the AND-connected criteria of a parsed query for

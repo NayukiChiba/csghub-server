@@ -181,6 +181,44 @@ func applyExplicitConstraints(parsed *ParseDatasetQueryResult, message string, v
 			parsed.Tags = append(parsed.Tags, hard)
 		}
 	}
+	// A superlative question only makes sense against an ordering; without a
+	// sort the LLM did not read it as a ranking request, so leave it a plain
+	// search.
+	if parsed.Sort != "" && explicitExtremum(message) {
+		parsed.Extremum = true
+	}
+}
+
+// extremumPronouns turn a sorted listing into a "which one is the most X"
+// question: the user wants the top entry (plus ties), not the full ranking.
+var extremumPronouns = []string{"哪个", "哪一", "哪几", "谁", "哪家", "什么"}
+
+// extremumSuperlatives are the english superlative markers ("most downloaded",
+// "largest"); the chinese marker 最 is checked separately.
+var extremumSuperlatives = []string{
+	"most", "largest", "biggest", "smallest", "highest", "lowest",
+	"earliest", "latest", "newest", "oldest",
+}
+
+// explicitExtremum reports whether the message asks a superlative question
+// ("下载最多的是哪个", "which dataset is the largest") rather than for a
+// sorted list ("下载最多的数据集有哪些"). Detection is deterministic: a
+// question pronoun plus a superlative marker.
+func explicitExtremum(message string) bool {
+	msg := strings.ToLower(message)
+	superlative := strings.Contains(msg, "最")
+	for i := 0; !superlative && i < len(extremumSuperlatives); i++ {
+		superlative = strings.Contains(msg, extremumSuperlatives[i])
+	}
+	if !superlative {
+		return false
+	}
+	for _, p := range extremumPronouns {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return strings.Contains(msg, "which") || strings.Contains(msg, "what")
 }
 
 // allTagsHard reports whether every tag filter is user-stated. A tag-only

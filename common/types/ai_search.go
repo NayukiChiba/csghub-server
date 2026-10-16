@@ -14,6 +14,8 @@ type DatasetSummary struct {
 	Size int64 `json:"size,omitempty"`
 	// CreatedAt is the repository creation date (YYYY-MM-DD).
 	CreatedAt string `json:"created_at,omitempty"`
+	// UpdatedAt is the repository update date (YYYY-MM-DD).
+	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
 // AIChatMessage is one message in the AI dataset chat history.

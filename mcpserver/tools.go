@@ -56,8 +56,11 @@ type DatasetViewer interface {
 const (
 	// readmePreviewLimit caps how many readme bytes get_dataset_detail returns.
 	readmePreviewLimit = 4000
-	maxPerPage         = 50
-	defaultPerPage     = 10
+	// MaxPerPage caps a single search page; also exported so the chat layer can
+	// fetch the widest window when it needs the full tie block of a
+	// superlative ("哪个最多") answer.
+	MaxPerPage     = 50
+	defaultPerPage = 10
 )
 
 // ToolExecutor executes the dataset search tools. It is shared by the MCP
@@ -188,6 +191,7 @@ func summarize(ds *types.Dataset) types.DatasetSummary {
 		Downloads:   ds.Downloads,
 		Likes:       ds.Likes,
 		CreatedAt:   ds.CreatedAt.Format(time.DateOnly),
+		UpdatedAt:   ds.UpdatedAt.Format(time.DateOnly),
 	}
 	for _, t := range ds.Tags {
 		s.Tags = append(s.Tags, t.Name)
@@ -351,8 +355,8 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	if per <= 0 {
 		per = defaultPerPage
 	}
-	if per > maxPerPage {
-		per = maxPerPage
+	if per > MaxPerPage {
+		per = MaxPerPage
 	}
 	page := args.Page
 	if page <= 0 {
@@ -471,7 +475,7 @@ func (e *ToolExecutor) SearchDatasets(ctx context.Context, args SearchDatasetsAr
 	// fetched and re-sorted by the requested field before paging.
 	queryPer, queryPage := per, page
 	if clientSort {
-		queryPer, queryPage = maxPerPage, 1
+		queryPer, queryPage = MaxPerPage, 1
 	}
 	for i, att := range attempts {
 		filter := newFilter(att)
@@ -926,6 +930,11 @@ type ParseDatasetQueryResult struct {
 	// most_download, most_favorite, most_star, largest, smallest); only set
 	// when the user asks for an ordering such as "下载最多" or "最大的数据集".
 	Sort string `json:"sort,omitempty"`
+	// Extremum marks a superlative question ("下载最多的是哪个", "which one is
+	// the largest"): the answer should be the leading entry of the Sort
+	// ordering plus ties, not the whole sorted list. Detected deterministically
+	// from the raw message, never inferred by the LLM.
+	Extremum bool `json:"extremum,omitempty"`
 	// Fallback is true when the LLM was unavailable or its output could not be
 	// parsed; Keywords then holds the raw query for plain keyword search.
 	Fallback bool   `json:"fallback"`

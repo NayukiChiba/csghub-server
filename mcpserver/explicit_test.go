@@ -275,3 +275,39 @@ func TestAllTagsHard(t *testing.T) {
 	require.True(t, allTagsHard([]TagArg{{Hard: true}}))
 	require.False(t, allTagsHard([]TagArg{{Hard: true}, {}}))
 }
+
+func TestExplicitExtremum(t *testing.T) {
+	cases := map[string]bool{
+		"下载最多的数据集是哪个？":                 true,
+		"哪个最多？":                        true,
+		"最大的是谁":                        true,
+		"哪个数据集体积最小":                    true,
+		"什么数据集下载量最高":                   true,
+		"which dataset is the largest": true,
+		// sorted listings, not superlative questions
+		"下载最多的数据集有哪些": false,
+		"语音数据集有哪些":    false,
+		"最近更新的数据集":    false,
+		"今天上传的数据集":    false,
+	}
+	for msg, want := range cases {
+		require.Equal(t, want, explicitExtremum(msg), "message %q", msg)
+	}
+}
+
+func TestApplyExplicitConstraints_Extremum(t *testing.T) {
+	// superlative phrasing + an ordering -> extremum answer
+	p := &ParseDatasetQueryResult{Sort: "most_download"}
+	applyExplicitConstraints(p, "下载最多的数据集是哪个？", nil)
+	require.True(t, p.Extremum)
+
+	// no ordering: the question stays a plain search
+	p = &ParseDatasetQueryResult{}
+	applyExplicitConstraints(p, "下载最多的数据集是哪个？", nil)
+	require.False(t, p.Extremum)
+
+	// ordering without superlative phrasing: a sorted listing
+	p = &ParseDatasetQueryResult{Sort: "most_download"}
+	applyExplicitConstraints(p, "下载最多的数据集有哪些", nil)
+	require.False(t, p.Extremum)
+}
