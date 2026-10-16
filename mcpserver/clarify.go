@@ -30,7 +30,9 @@ import (
 //     constraint makes the zero result trustworthy;
 //   - the current message has no topic terms of its own (a topical message
 //     defines its scope; nothing is ambiguous);
-//   - an earlier user turn provides a topic to clarify against.
+//   - an earlier user turn provides a topic to clarify against;
+//   - the message is not already a catalog-wide request ("所有数据集中…") —
+//     otherwise picking the "全平台" option could retrigger the same question.
 func ClarifyScopeQuestion(history []string, message string, parsed *ParseDatasetQueryResult) *types.AIChatQuestion {
 	if parsed == nil {
 		return nil
@@ -47,6 +49,11 @@ func ClarifyScopeQuestion(history []string, message string, parsed *ParseDataset
 		return nil
 	}
 	if hasNonLanguageTopicTerms(message) {
+		return nil
+	}
+	// Already a catalog-wide request (e.g. the user picked the "全平台"
+	// option and it still found nothing): asking again would loop.
+	if explicitGlobalScope(message) {
 		return nil
 	}
 	topic := lastTopicTerms(history)

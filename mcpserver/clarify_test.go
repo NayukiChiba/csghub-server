@@ -47,6 +47,28 @@ func TestClarifyScopeQuestion(t *testing.T) {
 		q = ClarifyScopeQuestion(nil, "哪个最小", &ParseDatasetQueryResult{Sort: "smallest"})
 		require.Nil(t, q)
 	})
+
+	t.Run("catalog-wide message is not re-clarified", func(t *testing.T) {
+		// the "全平台" option already widened the scope; a zero there must be
+		// reported honestly instead of looping the same question
+		q := ClarifyScopeQuestion(history, "所有数据集中，哪个最新？", &ParseDatasetQueryResult{Sort: "newest"})
+		require.Nil(t, q)
+	})
+}
+
+func TestInheritHistoryConstraints_GlobalScopeSkipsInheritance(t *testing.T) {
+	// "所有数据集中，哪个最新？" is the Send text of the clarify "全平台"
+	// option: inheriting the earlier topic keywords would silently re-narrow
+	// the catalog-wide search the user just asked for.
+	p := &ParseDatasetQueryResult{Sort: "newest"}
+	inheritHistoryConstraints(p, "所有数据集中，哪个最新？", []string{"有哪些音乐数据集？"}, nil)
+	require.Empty(t, p.Keywords)
+
+	// size constraints inherit too, so the global scope must skip them all
+	p = &ParseDatasetQueryResult{Sort: "newest"}
+	inheritHistoryConstraints(p, "不限范围，哪个最新？", []string{"小于10kb的语音数据集"}, nil)
+	require.Nil(t, p.MaxSizeBytes)
+	require.Empty(t, p.Modality)
 }
 
 func TestInheritHistoryConstraints_StopsAtTopicAnchor(t *testing.T) {

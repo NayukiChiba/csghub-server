@@ -1100,6 +1100,12 @@ func inheritHistoryConstraints(parsed *ParseDatasetQueryResult, raw string, hist
 	// message, which blocks keyword inheritance on its own, while the
 	// deterministic size/date/modality/tag constraints from earlier turns
 	// keep the follow-up scoped instead of widening to the whole catalog.
+	// An explicit global-scope phrase ("所有数据集中，…" — notably the
+	// clarify option's Send text) is the user widening the scope themselves:
+	// replaying earlier constraints would silently re-narrow it.
+	if explicitGlobalScope(raw) {
+		return
+	}
 	now := time.Now()
 	inheritKeywords := strings.TrimSpace(parsed.Keywords) == "" && !HasSearchTerms(raw)
 	topicSwitch := hasNonLanguageTopicTerms(raw)

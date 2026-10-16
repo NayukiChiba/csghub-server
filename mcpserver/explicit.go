@@ -87,6 +87,25 @@ func explicitLanguage(message string) string {
 	return ""
 }
 
+// globalScopePhrases explicitly widen the search to the whole catalog. The
+// clarify option "不限范围，在全平台找" sends such a phrase; the user may also
+// type one directly.
+var globalScopePhrases = []string{"所有数据集", "全部数据集", "全量数据集", "全平台", "整个平台", "不限范围", "all datasets"}
+
+// explicitGlobalScope reports whether the message explicitly asks for a
+// catalog-wide search. History inheritance and re-clarification must both
+// stay off for it: replaying earlier constraints would silently re-narrow a
+// scope the user just widened, and asking "刚才范围还是全平台" again loops.
+func explicitGlobalScope(message string) bool {
+	msg := strings.ToLower(message)
+	for _, p := range globalScopePhrases {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // maxExplicitTags caps deterministically matched tags per query.
 const maxExplicitTags = 3
 
