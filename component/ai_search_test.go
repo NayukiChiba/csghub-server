@@ -583,6 +583,55 @@ func TestChatMaxResultsClamp(t *testing.T) {
 	require.Equal(t, mcpserver.MaxPerPage, comp.chatMaxResults()) // never above the search window
 }
 
+func TestAISearchChat_ZeroResultFollowUpClarifies(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	comp, _ := newAISearchTestComponent(cfg, nil, 0, llmClient)
+
+	// the LLM folds the whole history and resurrects the superseded
+	// turn-1 topic plus a hallucinated tag — the AND search finds nothing
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"multimodal multiple choice","tags":[{"category":"task","name":"multiple-choice"}],"modality":"multimodal","language":"english"}`, nil).Once()
+
+	events := collectEvents(t, comp, &types.AIChatRequest{
+		Message: "这里面哪个数据规模最大？",
+		History: []types.AIChatMessage{
+			{Role: "user", Content: "我想要用于多模态的数据集"},
+			{Role: "assistant", Content: "没有找到符合条件的数据集"},
+			{Role: "user", Content: "好吧，有多选题数据吗？"},
+			{Role: "assistant", Content: "为您找到 4 个相关数据集"},
+		},
+	})
+	// instead of blaming the scope combination, the chat asks which scope
+	// was meant, with clickable self-contained options
+	require.Len(t, events, 1)
+	require.Equal(t, types.AIChatEventQuestion, events[0].Type)
+	require.NotNil(t, events[0].Question)
+	require.Len(t, events[0].Question.Options, 2)
+	require.Equal(t, "多选题数据集中，这里面哪个数据规模最大？", events[0].Question.Options[0].Send)
+	require.Equal(t, "所有数据集中，这里面哪个数据规模最大？", events[0].Question.Options[1].Send)
+}
+
+func TestAISearchChat_ZeroResultWithHardConstraintDoesNotClarify(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.AISearch.LLMEndpoint = "http://llm/v1/chat/completions"
+	llmClient := mockllm.NewMockLLMSvcClient(t)
+	comp, _ := newAISearchTestComponent(cfg, nil, 0, llmClient)
+
+	llmClient.EXPECT().Chat(mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(`{"keywords":"multiple choice","language":"spanish"}`, nil).Once()
+
+	// 西班牙语 is the user's own word: the zero is trustworthy, no question
+	events := collectEvents(t, comp, &types.AIChatRequest{
+		Message: "它们里面有西班牙语的吗",
+		History: []types.AIChatMessage{{Role: "user", Content: "有多选题数据吗"}},
+	})
+	require.Len(t, events, 1)
+	require.Equal(t, types.AIChatEventText, events[0].Type)
+	require.Contains(t, events[0].Text, "没有找到")
+}
+
 // Sample tables must stay valid markdown: pipes in the data are escaped and
 // ragged rows are normalized to the column count.
 func TestFormatSampleTable(t *testing.T) {

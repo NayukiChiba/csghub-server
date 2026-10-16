@@ -66,6 +66,7 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 	if message == "" {
 		return fmt.Errorf("message is required")
 	}
+	historyMsgs := historyUserMessages(req.History)
 
 	parsed, err := c.exec.ParseDatasetQuery(ctx, mcpserver.ParseDatasetQueryArgs{
 		Query: contextualQuery(req.History, message),
@@ -74,7 +75,7 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 		RawQuery: message,
 		// earlier user turns let follow-ups inherit the constraints already
 		// stated ("最大的数据集是谁" after "小于10kb的数据集")
-		History: historyUserMessages(req.History),
+		History: historyMsgs,
 	})
 	if err != nil || parsed == nil {
 		// ParseDatasetQuery already falls back to keyword search on LLM
@@ -145,6 +146,18 @@ func (c *aiSearchComponentImpl) Chat(ctx context.Context, req *types.AIChatReque
 	// tells the user how to narrow the search instead of paging.
 	if len(result.Datasets) > limit {
 		result.Datasets = result.Datasets[:limit]
+	}
+
+	// A zero-result follow-up with no constraints of its own is more likely a
+	// scope misunderstanding (the parser dragged in a superseded topic) than a
+	// genuine empty combination: ask which scope was meant, with clickable
+	// options, instead of reporting the zero.
+	if result.Total == 0 {
+		if q := mcpserver.ClarifyScopeQuestion(historyMsgs, message, parsed); q != nil {
+			slog.Info("ai dataset chat clarify", slog.String("message", truncateRunes(message, 200)),
+				slog.Int("options", len(q.Options)))
+			return emit(types.AIChatEvent{Type: types.AIChatEventQuestion, Question: q})
+		}
 	}
 
 	if err := emit(types.AIChatEvent{Type: types.AIChatEventText, Text: composeChatAnswer(parsed, result, limit)}); err != nil {

@@ -1170,6 +1170,13 @@ func inheritHistoryConstraints(parsed *ParseDatasetQueryResult, raw string, hist
 				}
 			}
 		}
+		// A topical history message anchors the current conversation segment:
+		// constraints older than it belong to a superseded topic and must not
+		// leak into the follow-up (多模态 from turn 1 pinning "哪个最大" asked
+		// after the user switched to 多选题 in turn 2).
+		if hasNonLanguageTopicTerms(msg) {
+			break
+		}
 	}
 }
 

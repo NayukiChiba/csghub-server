@@ -37,13 +37,33 @@ const (
 	// AIChatEventDatasets carries the datasets actually returned by search
 	// tools during this turn; clients must render dataset links only from it.
 	AIChatEventDatasets = "datasets"
+	// AIChatEventQuestion carries a clarification question with clickable
+	// options, emitted instead of an answer when the scope is ambiguous.
+	AIChatEventQuestion = "question"
 )
+
+// AIChatQuestionOption is one clickable answer to a clarification question.
+// Send is the message submitted when the user picks the option: a
+// self-contained rephrasing of the original question inside the chosen
+// scope, so the next turn parses deterministically without server-side state.
+type AIChatQuestionOption struct {
+	Label string `json:"label"`
+	Send  string `json:"send"`
+}
+
+// AIChatQuestion is a clarification prompt: the assistant asks back instead
+// of answering when the intended search scope is ambiguous.
+type AIChatQuestion struct {
+	Question string                 `json:"question"`
+	Options  []AIChatQuestionOption `json:"options"`
+}
 
 // AIChatEvent is one streamed event of the dataset AI chat.
 type AIChatEvent struct {
 	Type     string           `json:"type"`
 	Text     string           `json:"text,omitempty"`
 	Datasets []DatasetSummary `json:"datasets,omitempty"`
+	Question *AIChatQuestion  `json:"question,omitempty"`
 }
 
 // AISearchLLMConfig is the admin-editable LLM configuration for dataset AI
