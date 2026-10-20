@@ -15,51 +15,62 @@ import (
 )
 
 func TestDatasetViewerComponent_ViewParquetFile(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		migrated  bool
+		objectKey string
+	}{
+		{name: "legacy LFS", objectKey: "lfs/c5/18/5c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836"},
+		{name: "repository-scoped LFS", migrated: true, objectKey: "repos/79/02/7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451/c5185c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 
-	ctx := context.TODO()
-	dc := initializeTestDatasetViewerComponent(ctx, t)
+			ctx := context.TODO()
+			dc := initializeTestDatasetViewerComponent(ctx, t)
 
-	repo := &database.Repository{DefaultBranch: "main"}
-	dc.mocks.stores.RepoMock().EXPECT().FindByPath(ctx, types.DatasetRepo, "ns", "repo").Return(
-		repo, nil,
-	)
-	dc.mocks.components.repo.EXPECT().AllowReadAccessRepo(ctx, repo, "user").Return(true, nil)
+			repo := &database.Repository{ID: 7, DefaultBranch: "main", Migrated: tc.migrated}
+			dc.mocks.stores.RepoMock().EXPECT().FindByPath(ctx, types.DatasetRepo, "ns", "repo").Return(
+				repo, nil,
+			)
+			dc.mocks.components.repo.EXPECT().AllowReadAccessRepo(ctx, repo, "user").Return(true, nil)
 
-	dc.mocks.gitServer.EXPECT().GetRepoFileContents(mock.Anything, gitserver.GetRepoInfoByPathReq{
-		Namespace: "ns",
-		Name:      "repo",
-		Ref:       "main",
-		Path:      "foo",
-		RepoType:  types.DatasetRepo,
-	}).Return(&types.File{
-		LfsRelativePath: "a/b",
-		LfsSHA256:       "c5185c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836",
-	}, nil)
+			dc.mocks.gitServer.EXPECT().GetRepoFileContents(mock.Anything, gitserver.GetRepoInfoByPathReq{
+				Namespace: "ns",
+				Name:      "repo",
+				Ref:       "main",
+				Path:      "foo",
+				RepoType:  types.DatasetRepo,
+			}).Return(&types.File{
+				LfsRelativePath: "a/b",
+				LfsSHA256:       "c5185c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836",
+			}, nil)
 
-	dc.mocks.limitOffsetReader.EXPECT().RowsWithCount(ctx, []string{"lfs/c5/18/5c4794be2d8a9784d5753c9922db38df478ce11f9ed0b415b7304d896836"},
-		int64(10), int64(0)).Return([]string{"a", "b"}, []string{"c", "d"}, [][]any{
-		{1, 2, 3},
-	}, int64(100), nil)
+			dc.mocks.limitOffsetReader.EXPECT().RowsWithCount(ctx, []string{tc.objectKey},
+				int64(10), int64(0)).Return([]string{"a", "b"}, []string{"c", "d"}, [][]any{
+				{1, 2, 3},
+			}, int64(100), nil)
 
-	resp, err := dc.ViewParquetFile(ctx, &dvCom.ViewParquetFileReq{
-		Namespace:   "ns",
-		RepoName:    "repo",
-		Branch:      "main",
-		Path:        "foo",
-		Per:         10,
-		Page:        1,
-		CurrentUser: "user",
-	})
-	require.Nil(t, err)
-	require.Equal(t, &dvCom.ViewParquetFileResp{
-		Columns:     []string{"a", "b"},
-		ColumnsType: []string{"c", "d"},
-		Rows: [][]interface{}{
-			{1, 2, 3},
-		},
-		Total: 100,
-	}, resp)
+			resp, err := dc.ViewParquetFile(ctx, &dvCom.ViewParquetFileReq{
+				Namespace:   "ns",
+				RepoName:    "repo",
+				Branch:      "main",
+				Path:        "foo",
+				Per:         10,
+				Page:        1,
+				CurrentUser: "user",
+			})
+			require.Nil(t, err)
+			require.Equal(t, &dvCom.ViewParquetFileResp{
+				Columns:     []string{"a", "b"},
+				ColumnsType: []string{"c", "d"},
+				Rows: [][]interface{}{
+					{1, 2, 3},
+				},
+				Total: 100,
+			}, resp)
 
+		})
+	}
 }
 
 func TestDatasetViewerComponent_Rows(t *testing.T) {

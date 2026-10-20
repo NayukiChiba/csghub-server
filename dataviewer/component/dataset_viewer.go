@@ -101,6 +101,8 @@ func (c *datasetViewerComponentImpl) ViewParquetFile(ctx context.Context, req *d
 		return nil, errorx.ErrForbidden
 	}
 	req.Branch = r.DefaultBranch
+	req.RepoID = r.ID
+	req.Migrated = r.Migrated
 	objName, err := c.getParquetObject(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("no valid parquet file in request, %w", err)
