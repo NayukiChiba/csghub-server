@@ -21,7 +21,7 @@ minio_data
 local_only
 /jetstream
 .env
-memory
+/memory
 docker-compose-leida.yml
 run_account_local.sh
 run_callback_local.sh
