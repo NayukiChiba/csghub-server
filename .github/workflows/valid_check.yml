@@ -10,21 +10,38 @@ jobs:
   moderate_content:
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       issues: write
 
     steps:
+      - name: Check moderator configuration
+        id: moderator
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [[ -n "${LLM_API_KEY//[[:space:]]/}" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping optional moderation: LLM_API_KEY is not configured."
+          fi
+
       - name: Checkout repository
+        if: steps.moderator.outputs.enabled == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: steps.moderator.outputs.enabled == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install dependencies
+        if: steps.moderator.outputs.enabled == 'true'
         run: pip install requests openai
 
       - name: Run LLM Content Moderator
+        if: steps.moderator.outputs.enabled == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
