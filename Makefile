@@ -1,15 +1,18 @@
-.PHONY: test lint cover mock_wire mock_gen swag migrate_local
+.PHONY: build test lint cover mock_wire mock_gen swag migrate_local
 
-build:
+# Match the Swagger library version in go.mod; also works on a clean checkout.
+SWAG ?= go run github.com/swaggo/swag/cmd/swag@v1.16.6
+
+build: swag
 	go build -o ./bin/csghub-server ./cmd/csghub-server
 
-test:
+test: swag
 	go test ./...
 
-lint:
+lint: swag
 	golangci-lint run
 
-cover:
+cover: swag
 	go test -coverprofile=cover.out ./...
 	go tool cover -html=cover.out -o cover.html
 	open cover.html
@@ -30,7 +33,7 @@ mock_gen:
 	mockery
 
 swag:
-	swag init --pd -d cmd/csghub-server/cmd/start,api/router,api/handler,builder/store/database,common/types,accounting/handler,user/handler,moderation/handler,component,dataviewer/handler,aigateway/handler,aigateway/types,notification/handler -g server.go
+	$(SWAG) init --pd -d cmd/csghub-server/cmd/start,api/router,api/handler,builder/store/database,common/types,accounting/handler,user/handler,moderation/handler,component,dataviewer/handler,aigateway/handler,aigateway/types,notification/handler -g server.go
 
 migrate_local:
 	go run cmd/csghub-server/main.go migration migrate --config local.toml

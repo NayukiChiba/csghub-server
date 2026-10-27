@@ -6,6 +6,8 @@ COPY . .
 ARG CSGHUB_TAGS
 ARG CI_COMMIT_SHORT_SHA
 ARG IMAGE_TAG
+# Generated Swagger files are not tracked in Git and must exist before compilation.
+RUN make swag
 RUN CGO_ENABLED=1 GOOS=linux go build \
       -tags="$CSGHUB_TAGS" \
       -ldflags "-X opencsg.com/csghub-server/version.GitRevision=${CI_COMMIT_SHORT_SHA} -X opencsg.com/csghub-server/version.StarhubAPIVersion=${IMAGE_TAG}" \

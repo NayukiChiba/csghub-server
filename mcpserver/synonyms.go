@@ -119,10 +119,6 @@ var synonymKeysByLen = func() []string {
 	return keys
 }()
 
-func isCJK(r rune) bool {
-	return unicode.Is(unicode.Han, r)
-}
-
 // splitQueryTokens splits raw keywords on whitespace and punctuation.
 func splitQueryTokens(keywords string) []string {
 	return strings.FieldsFunc(keywords, func(r rune) bool {

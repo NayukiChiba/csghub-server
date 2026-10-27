@@ -19,11 +19,14 @@ jobs:
         with:
           go-version: "1.26"
       - uses: actions/checkout@v7
+      # Jobs have separate filesystems; the swagger job does not populate this checkout.
+      - name: Generate Swagger package
+        run: make swag
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
           args: --timeout=10m
-          version: latest
+          version: v2.15.0
       - name: GinContext
         run: go run linters/gincontext/main.go
   swagger:
@@ -41,9 +44,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Gen
-        run: |
-          go install github.com/swaggo/swag/cmd/swag@latest
-          make swag
+        run: make swag
   test:
     name: test
     strategy:
@@ -59,4 +60,4 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Test
-        run: go test ./...
+        run: make test

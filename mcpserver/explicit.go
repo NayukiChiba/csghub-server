@@ -14,15 +14,8 @@ import (
 // (observed: kimi drops "多模态" from keywords, secllm omits modality for
 // 图像分类). LLM-inferred constraints stay soft.
 
-// modalityCanonicalNames are the first elements of the modality synonym
-// groups in querySynonymGroups — the canonical value the search filter
-// expects for each modality.
-var modalityCanonicalNames = map[string]bool{
-	"image": true, "video": true, "audio": true,
-	"text": true, "3d": true, "multimodal": true,
-}
-
-// languageCanonicalNames works the same way for the natural-language groups.
+// languageCanonicalNames contains the canonical names of the natural-language
+// groups in querySynonymGroups.
 var languageCanonicalNames = map[string]bool{
 	"chinese": true, "english": true, "japanese": true, "korean": true,
 	"french": true, "german": true, "spanish": true, "russian": true,
