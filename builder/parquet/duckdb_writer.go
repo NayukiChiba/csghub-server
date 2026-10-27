@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -65,7 +67,31 @@ func (r *duckdbWriter) setupS3(ctx context.Context) error {
 	return nil
 }
 
+// Close releases per-activity DuckDB resources.
+func (r *duckdbWriter) Close() error { return r.db.Close() }
+
 func (r *duckdbWriter) ConvertToParquet(ctx context.Context, method string, objNames []string, thread int, path string) error {
+	if len(objNames) == 0 || thread < 1 {
+		return fmt.Errorf("conversion requires input files and positive thread count")
+	}
+	if method != "read_json_auto" && method != "read_csv_auto" {
+		return fmt.Errorf("unsupported conversion reader %q", method)
+	}
+	output, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if info, err := os.Lstat(output); err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
+		return fmt.Errorf("export path must be a directory")
+	}
+	// Convert into a fresh directory on every attempt. Failed retries must neither
+	// reuse partial files nor publish a mix of old and new shards.
+	staging, err := os.MkdirTemp(filepath.Dir(output), ".parquet-export-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging)
+
 	if slicesContainS3Path(objNames) {
 		if err := r.setupS3(ctx); err != nil {
 			return err
@@ -82,20 +108,60 @@ func (r *duckdbWriter) ConvertToParquet(ctx context.Context, method string, objN
 	} else {
 		fileStr = objNames[0]
 	}
+	options := ", union_by_name=true"
+	if method == "read_json_auto" {
+		limit := r.cfg.DataViewer.MaxJSONSize
+		if limit <= 0 {
+			limit = 128 << 20
+		}
+		options += fmt.Sprintf(", maximum_object_size=%d", limit)
+	}
 	exportCMD := fmt.Sprintf(`
 	SET preserve_insertion_order=false;
 	SET threads = %d; 
-	COPY (SELECT * FROM %s(%s)) TO '%s' (
+	COPY (SELECT * FROM %s(%s%s)) TO '%s' (
 		FORMAT 'PARQUET', 
 		CODEC 'Snappy', 
 		PER_THREAD_OUTPUT TRUE, 
 		FILENAME_PATTERN '{i}' 
 	);
-	`, thread, method, fileStr, path)
+	`, thread, method, fileStr, options, strings.ReplaceAll(staging+"/", "'", "''"))
 	slog.Debug("export parquet sql", slog.String("sql", exportCMD))
-	_, err := r.db.ExecContext(ctx, exportCMD)
+	_, err = r.db.ExecContext(ctx, exportCMD)
 	if err != nil {
 		return fmt.Errorf("failed to export parquet: %w", err)
+	}
+	return publishParquetExport(staging, output)
+}
+
+// Only replace converter-owned parquet shards. Refuse foreign entries instead
+// of recursively deleting a caller-supplied directory.
+func publishParquetExport(staging, output string) error {
+	if err := os.MkdirAll(output, 0o700); err != nil {
+		return err
+	}
+	old, err := os.ReadDir(output)
+	if err != nil {
+		return err
+	}
+	for _, f := range old {
+		if !f.Type().IsRegular() || filepath.Ext(f.Name()) != ".parquet" {
+			return fmt.Errorf("export directory contains non-parquet entry %q", f.Name())
+		}
+	}
+	for _, f := range old {
+		if err := os.Remove(filepath.Join(output, f.Name())); err != nil {
+			return err
+		}
+	}
+	fresh, err := os.ReadDir(staging)
+	if err != nil {
+		return err
+	}
+	for _, f := range fresh {
+		if err := os.Rename(filepath.Join(staging, f.Name()), filepath.Join(output, f.Name())); err != nil {
+			return err
+		}
 	}
 	return nil
 }

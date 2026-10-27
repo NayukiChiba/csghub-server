@@ -2,10 +2,12 @@ package workflows
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -114,7 +116,7 @@ func GetCacheRepoPath(ctx context.Context, cacheDir string, req types.UpdateView
 }
 
 func CopyJsonArray(writeFile *os.File, reader io.ReadCloser, limitSize int64) (int64, error) {
-	decoder := json.NewDecoder(reader)
+	decoder := json.NewDecoder(withoutUTF8BOM(reader))
 	token, err := decoder.Token()
 	if err != nil || token != json.Delim('[') {
 		return 0, fmt.Errorf("invalid json array object error: %w", err)
@@ -156,28 +158,50 @@ func CopyJsonArray(writeFile *os.File, reader io.ReadCloser, limitSize int64) (i
 	return copyedBytes, nil
 }
 
-func CopyFileContext(writeFile *os.File, reader io.ReadCloser, limitSize int64) (int64, error) {
-	var copyedBytes int64
-	scanner := bufio.NewScanner(reader)
-	writer := bufio.NewWriter(writeFile)
+// withoutUTF8BOM accepts UTF-8 BOM-prefixed JSON without altering sample content.
+func withoutUTF8BOM(reader io.Reader) *bufio.Reader {
+	buffered := bufio.NewReader(reader)
+	if prefix, _ := buffered.Peek(3); bytes.Equal(prefix, []byte{0xef, 0xbb, 0xbf}) {
+		_, _ = buffered.Discard(3)
+	}
+	return buffered
+}
 
-	for scanner.Scan() {
-		if copyedBytes >= limitSize {
+func CopyFileContext(writeFile *os.File, reader io.ReadCloser, limitSize int64) (int64, error) {
+	buffered := withoutUTF8BOM(reader)
+	var copied int64
+	for copied < limitSize {
+		var lineBytes int
+		// ReadSlice streams arbitrarily long lines without Scanner's 64 KiB cap.
+		// Finish the current record before applying the preview byte budget.
+		for {
+			data, err := buffered.ReadSlice('\n')
+			n, writeErr := writeFile.Write(data)
+			copied += int64(n)
+			lineBytes += n
+			if writeErr != nil {
+				return copied, writeErr
+			}
+			if errors.Is(err, bufio.ErrBufferFull) {
+				continue
+			}
+			if errors.Is(err, io.EOF) {
+				if lineBytes > 0 {
+					n, e := writeFile.Write([]byte{'\n'})
+					copied += int64(n)
+					if e != nil {
+						return copied, e
+					}
+				}
+				return copied, nil
+			}
+			if err != nil {
+				return copied, fmt.Errorf("read dataset content: %w", err)
+			}
 			break
 		}
-		line := scanner.Text()
-		n, err := fmt.Fprintln(writer, line)
-		if err != nil {
-			return copyedBytes, fmt.Errorf("write content by line error: %w", err)
-		}
-		err = writer.Flush()
-		if err != nil {
-			return 0, fmt.Errorf("flush data error: %w", err)
-		}
-		copyedBytes += int64(n)
 	}
-
-	return copyedBytes, nil
+	return copied, nil
 }
 
 func GetThreadNum(totalDataSize int64, maxThreadNum int) int {

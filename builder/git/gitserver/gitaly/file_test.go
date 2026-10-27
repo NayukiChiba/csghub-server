@@ -952,3 +952,20 @@ func TestGitalyFile_CreateRepoLarge(t *testing.T) {
 	require.Equal(t, actions[1], m.sends[1])
 	require.Equal(t, actions[2], m.sends[2])
 }
+
+func TestUpdateRepoFileStreamsLargeContent(t *testing.T) {
+	tester := newGitalyTester(t)
+	m := &MockGrpcStreamClientFull[*gitalypb.UserCommitFilesRequest, *gitalypb.UserCommitFilesResponse]{data: []*gitalypb.UserCommitFilesResponse{{}}}
+	tester.mocks.operationClient.EXPECT().UserCommitFiles(mock.Anything).Return(m, nil)
+	tester.mocks.repoStore.EXPECT().FindByPath(mock.Anything, types.DatasetRepo, "ns", "n").Return(&database.Repository{ID: 1}, nil)
+	content := bytes.Repeat([]byte("abcdefgh"), 1<<20)
+	require.NoError(t, tester.UpdateRepoFile(&types.UpdateFileReq{Namespace: "ns", Name: "n", Branch: "main", FilePath: "data.parquet", Content: string(content), RepoType: types.DatasetRepo}))
+	var received []byte
+	for _, req := range m.sends[2:] {
+		chunk := req.GetAction().GetContent()
+		require.LessOrEqual(t, len(chunk), 3<<20)
+		received = append(received, chunk...)
+	}
+	require.Equal(t, content, received)
+	require.Greater(t, len(m.sends), 3)
+}

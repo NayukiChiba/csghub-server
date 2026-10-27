@@ -409,15 +409,6 @@ func (c *Client) UpdateRepoFile(req *types.UpdateFileReq) (err error) {
 				},
 			},
 		},
-		{
-			UserCommitFilesRequestPayload: &gitalypb.UserCommitFilesRequest_Action{
-				Action: &gitalypb.UserCommitFilesAction{
-					UserCommitFilesActionPayload: &gitalypb.UserCommitFilesAction_Content{
-						Content: []byte(req.Content),
-					},
-				},
-			},
-		},
 	}
 	err = userCommitFilesClient.Send(actions[0])
 	if err != nil {
@@ -427,10 +418,17 @@ func (c *Client) UpdateRepoFile(req *types.UpdateFileReq) (err error) {
 	if err != nil {
 		return errorx.ErrGitCommitFilesFailed(err, errorx.Ctx())
 	}
-	err = userCommitFilesClient.Send(actions[2])
-	if err != nil {
-		return errorx.ErrGitCommitFilesFailed(err, errorx.Ctx())
+	for _, chunk := range chunkBytes([]byte(req.Content), 3<<20) {
+		err = userCommitFilesClient.Send(&gitalypb.UserCommitFilesRequest{
+			UserCommitFilesRequestPayload: &gitalypb.UserCommitFilesRequest_Action{Action: &gitalypb.UserCommitFilesAction{
+				UserCommitFilesActionPayload: &gitalypb.UserCommitFilesAction_Content{Content: chunk},
+			}},
+		})
+		if err != nil {
+			return errorx.ErrGitCommitFilesFailed(err, errorx.Ctx())
+		}
 	}
+
 	_, err = userCommitFilesClient.CloseAndRecv()
 	if err != nil {
 		return errorx.ErrGitCommitFilesFailed(err, errorx.Ctx())

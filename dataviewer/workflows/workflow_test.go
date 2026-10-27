@@ -1,6 +1,8 @@
 package workflows
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/mock"
@@ -289,4 +291,20 @@ func TestWorkflow_DataviewerWorkflow(t *testing.T) {
 		require.True(t, tester.env.IsWorkflowCompleted())
 		require.NoError(t, tester.env.GetWorkflowError())
 	})
+}
+
+func TestWorkflowFailurePersistsTerminalStatus(t *testing.T) {
+	tester, err := newWorkflowTester(t)
+	require.NoError(t, err)
+	cfg, err := config.LoadConfig()
+	require.NoError(t, err)
+	cfg.DataViewer.ActivityMaximumAttempts = 1
+	req := types.UpdateViewerReq{Namespace: "root", Name: "broken", Branch: "main", RepoType: types.DatasetRepo}
+	tester.mocks.mockact.EXPECT().BeginViewerJob(mock.Anything).Return(fmt.Errorf("reader unavailable"))
+	tester.mocks.mockact.EXPECT().UpdateWorkflowStatus(mock.Anything, mock.MatchedBy(func(r dvCom.UpdateWorkflowStatusReq) bool {
+		return r.Req == req && !r.ShouldUpdateViewer && strings.Contains(r.WorkflowErrMsg, "reader unavailable")
+	})).Return(nil).Once()
+	tester.env.ExecuteWorkflow(DataViewerUpdateWorkflow, dvCom.WorkflowUpdateParams{Req: req, Config: cfg})
+	require.True(t, tester.env.IsWorkflowCompleted())
+	require.Error(t, tester.env.GetWorkflowError())
 }

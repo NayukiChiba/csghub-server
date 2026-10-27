@@ -75,12 +75,15 @@ func DataViewerUpdateWorkflow(ctx workflow.Context, updateReq dvCom.WorkflowUpda
 
 	sessionCtx, err := workflow.CreateSession(ctx, so)
 	if err != nil {
+		statusCtx, _ := workflow.NewDisconnectedContext(ctx)
+		updateWorkflowStatus(statusCtx, updateReq, err, false)
 		return fmt.Errorf("create workflow session error: %w", err)
 	}
 	defer workflow.CompleteSession(sessionCtx)
 
 	shouldUpdateViewer, err := runWorkFlow(sessionCtx, updateReq)
-	updateWorkflowStatus(sessionCtx, updateReq, err, shouldUpdateViewer)
+	statusCtx, _ := workflow.NewDisconnectedContext(ctx)
+	updateWorkflowStatus(statusCtx, updateReq, err, shouldUpdateViewer)
 	if err != nil {
 		return fmt.Errorf("run data viewer workflow error: %w", err)
 	}

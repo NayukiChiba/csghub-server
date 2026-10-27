@@ -482,72 +482,13 @@ func (dva *dataViewerActivityImpl) CopyParquetFiles(ctx context.Context, copyReq
 			count := 0
 			if split.Origins != nil {
 				for idx, orginfile := range split.Origins {
-					getFileContentReq := gitserver.GetRepoInfoByPathReq{
-						Namespace: copyReq.Req.Namespace,
-						Name:      copyReq.Req.Name,
-						Ref:       copyReq.Req.Branch,
-						Path:      orginfile.RepoFile,
-						RepoType:  copyReq.Req.RepoType,
-					}
-					f, err := dva.gitServer.GetRepoFileContents(context.Background(), getFileContentReq)
-					if err != nil {
-						slog.Error("failed to get file content", slog.Any("file", orginfile.RepoFile),
-							slog.Any("branch", copyReq.Req.Branch), slog.Any("req", copyReq.Req), slog.Any("error", err))
-						return nil, fmt.Errorf("failed to get file %s content in branch %s, cause: %w", orginfile.RepoFile,
-							copyReq.Req.Branch, err)
-					}
 					newFileName := fmt.Sprintf("%s/%s/%05d.parquet", info.ConfigName, split.Name, idx)
-					_, exists := repoAllFiles[newFileName]
-					if exists {
-						updateReq := &types.UpdateFileReq{
-							Username:        GitDefaultUserName,
-							Email:           GitDefaultUserEmail,
-							Message:         fmt.Sprintf("update %s file", newFileName),
-							FilePath:        newFileName,
-							Namespace:       copyReq.Req.Namespace,
-							Name:            copyReq.Req.Name,
-							Branch:          copyReq.NewBranch,
-							Content:         f.Content,
-							OriginalContent: []byte(f.Content),
-							RepoType:        copyReq.Req.RepoType,
-						}
-						err = dva.gitServer.UpdateRepoFile(updateReq)
-						if err != nil {
-							slog.Error("failed to update file in branch", slog.Any("newfile", newFileName),
-								slog.Any("newBranch", copyReq.NewBranch), slog.Any("req", copyReq.Req), slog.Any("error", err))
-							return nil, fmt.Errorf("failed to update file %s in new branch %s, cause: %w",
-								newFileName, copyReq.NewBranch, err)
-						}
-					} else {
-						createReq := &types.CreateFileReq{
-							Username:  GitDefaultUserName,
-							Email:     GitDefaultUserEmail,
-							Message:   fmt.Sprintf("submit %s file", newFileName),
-							Content:   f.Content,
-							Branch:    copyReq.NewBranch,
-							Namespace: copyReq.Req.Namespace,
-							Name:      copyReq.Req.Name,
-							FilePath:  newFileName,
-							RepoType:  copyReq.Req.RepoType,
-						}
-						err = dva.gitServer.CreateRepoFile(createReq)
-						if err != nil {
-							slog.Error("failed to create file in branch", slog.Any("newfile", newFileName),
-								slog.Any("newBranch", copyReq.NewBranch), slog.Any("req", copyReq.Req), slog.Any("error", err))
-							return nil, fmt.Errorf("failed to create new file %s in new branch %s, cause: %w",
-								newFileName, copyReq.NewBranch, err)
-						}
+					copied, objectKey, err := dva.copyParquetOrigin(ctx, copyReq, orginfile, newFileName, repoAllFiles)
+					if err != nil {
+						return nil, err
 					}
-					newFiles = append(newFiles, dvCom.FileObject{
-						RepoFile:        newFileName,
-						Size:            orginfile.Size,
-						Lfs:             orginfile.Lfs,
-						LfsRelativePath: orginfile.LfsRelativePath,
-						LfsSHA256:       orginfile.LfsSHA256,
-					})
-					objectKey := common.BuildLfsPath(copyReq.Req.RepoID, orginfile.LfsSHA256, copyReq.Req.Migrated)
+					newFiles = append(newFiles, copied)
 					objectNames = append(objectNames, objectKey)
-					// objectNames = append(objectNames, filepath.Join("lfs", orginfile.LfsRelativePath))
 				}
 				_, _, _, rowCount, countErr := dva.parquetS3Reader.RowsWithCount(ctx, objectNames, 0, 0)
 				count, err = int(rowCount), countErr
@@ -767,7 +708,7 @@ func (dva *dataViewerActivityImpl) downloadFile(ctx context.Context, req types.U
 }
 
 func (dva *dataViewerActivityImpl) downloadLfsFile(ctx context.Context, req types.UpdateViewerReq, localFileFullPath string, orginFile dvCom.FileObject, loadFile *dvCom.FileObject, fileExtName string) error {
-	objectKey := common.BuildLfsPath(req.RepoID, strings.ReplaceAll(orginFile.LfsRelativePath, "/", ""), req.Migrated)
+	objectKey := common.SafeBuildLfsPath(req.RepoID, orginFile.LfsSHA256, orginFile.LfsRelativePath, req.Migrated)
 	loadFile.ObjectKey = objectKey
 
 	if !dva.cfg.DataViewer.DownloadLfsFile {
@@ -780,11 +721,18 @@ func (dva *dataViewerActivityImpl) downloadLfsFile(ctx context.Context, req type
 	if err != nil {
 		return fmt.Errorf("fail to get lfs file download url error: %w", err)
 	}
-	resp, err := http.Get(signedUrl.String())
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, signedUrl.String(), nil)
 	if err != nil {
-		return fmt.Errorf("failed to do http request url %s, error: %w", signedUrl.String(), err)
+		return fmt.Errorf("create LFS download request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("failed to download LFS object %s: %w", objectKey, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download LFS object %s: HTTP %d", objectKey, resp.StatusCode)
+	}
 
 	writeFile, err := os.Create(localFileFullPath)
 	if err != nil {
@@ -794,7 +742,7 @@ func (dva *dataViewerActivityImpl) downloadLfsFile(ctx context.Context, req type
 
 	err = dva.copyFileContent(writeFile, resp.Body, orginFile, loadFile, fileExtName)
 	if err != nil {
-		return fmt.Errorf("failed to save local file %s for repo file %s from url: %s, error: %w", localFileFullPath, orginFile.RepoFile, signedUrl.String(), err)
+		return fmt.Errorf("failed to save local file %s for repo file %s: %w", localFileFullPath, orginFile.RepoFile, err)
 	}
 
 	return nil
@@ -832,11 +780,15 @@ func (dva *dataViewerActivityImpl) downloadNormalFile(ctx context.Context, local
 
 func (dva *dataViewerActivityImpl) copyFileContent(writeFile *os.File, reader io.ReadCloser, orginFile dvCom.FileObject, loadFile *dvCom.FileObject, fileExtName string) error {
 	if (orginFile.Size - orginFile.DownloadSize) <= MinFileSizeGap {
-		_, err := io.Copy(writeFile, reader)
+		var source io.Reader = reader
+		if fileExtName == FileExtName.Json || fileExtName == FileExtName.Jsonl || fileExtName == FileExtName.Csv {
+			source = withoutUTF8BOM(reader)
+		}
+		copied, err := io.Copy(writeFile, source)
 		if err != nil {
 			return fmt.Errorf("failed to copy the whole file content error: %w", err)
 		}
-		loadFile.DownloadSize = loadFile.Size
+		loadFile.DownloadSize = copied
 		return nil
 	}
 
@@ -862,6 +814,9 @@ func (dva *dataViewerActivityImpl) ConvertToParquetFiles(ctx context.Context, co
 	writer, err := parquet.NewS3Writer(ctx, dva.cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create duckdb reader, cause: %w", err)
+	}
+	if closer, ok := writer.(io.Closer); ok {
+		defer closer.Close()
 	}
 	for _, subset := range convertReq.DownloadCard.Subsets {
 		for _, split := range subset.Splits {
@@ -1199,7 +1154,7 @@ func (dva *dataViewerActivityImpl) UpdateWorkflowStatus(ctx context.Context, sta
 	job, err := dva.viewerStore.GetJob(ctx, workflowID)
 	if err != nil {
 		slog.Error("get workflow for ending", slog.Any("workflowID", workflowID), slog.Any("err", err))
-		return nil
+		return fmt.Errorf("get workflow for ending: %w", err)
 	}
 
 	if len(status.WorkflowErrMsg) > 0 {
@@ -1214,7 +1169,7 @@ func (dva *dataViewerActivityImpl) UpdateWorkflowStatus(ctx context.Context, sta
 
 	_, err = dva.viewerStore.UpdateJob(ctx, *job)
 	if err != nil {
-		slog.Error("update workflow result for ending", slog.Any("workflowID", workflowID), slog.Any("job", job), slog.Any("error", err))
+		return fmt.Errorf("update workflow result for ending: %w", err)
 	}
 
 	if len(status.WorkflowErrMsg) > 0 || !status.ShouldUpdateViewer {
@@ -1223,14 +1178,13 @@ func (dva *dataViewerActivityImpl) UpdateWorkflowStatus(ctx context.Context, sta
 
 	viewer, err := dva.viewerStore.GetViewerByRepoID(ctx, status.Req.RepoID)
 	if err != nil {
-		slog.Error("get viewer workflow for ending", slog.Any("status", status), slog.Any("err", err))
-		return nil
+		return fmt.Errorf("get viewer workflow for ending: %w", err)
 	}
 
 	viewer.WorkflowID = workflowID
 	_, err = dva.viewerStore.UpdateViewer(ctx, *viewer)
 	if err != nil {
-		slog.Error("update viewer for workflow ending", slog.Any("status", status), slog.Any("viewer", viewer), slog.Any("error", err))
+		return fmt.Errorf("update viewer for workflow ending: %w", err)
 	}
 	return nil
 }
