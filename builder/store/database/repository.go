@@ -126,6 +126,7 @@ type repoStoreImpl struct {
 }
 
 type RepoStore interface {
+	DatasetRowSummary(ctx context.Context, scope RepositoryAccessScope, filter *types.RepoFilter) (*types.DatasetRowSummary, error)
 	// CreateRepoTx(ctx context.Context, tx bun.Tx, input Repository) (*Repository, error)
 	CreateRepo(ctx context.Context, input Repository) (*Repository, error)
 	UpdateRepo(ctx context.Context, input Repository) (*Repository, error)
@@ -1136,11 +1137,59 @@ func (s *repoStoreImpl) publicToUser(ctx context.Context, repoType types.Reposit
 		return s.publicToUserTrending(ctx, repoType, filter, per, page, scope)
 	}
 
+	q, needDistinct, err := s.repositoryListQuery(ctx, repoType, filter, scope)
+	if err != nil {
+		return nil, 0, err
+	}
+	if q == nil {
+		return []*Repository{}, 0, nil
+	}
+	q.Model(&repos).Relation("Tags")
+
+	if needDistinct {
+		applyRepoDedup(q, repoType, filter.Sort)
+	}
+
+	filter.Search = strings.TrimSpace(filter.Search)
+	if filter.Search != "" {
+		filter.Search = strings.ToLower(filter.Search)
+		if !filter.UserPurchased && scope != nil && (scope.Mode == RepositoryAccessReadable && len(scope.ReadableRepositoryIDs) == 0 || scope.Mode == RepositoryAccessPublic) {
+			repos, count, err = s.SearchRepoWithCache(ctx, q, repoType, filter, per, page)
+		} else {
+			repos, count, err = s.searchRepoWithoutCache(ctx, q, filter, per, page)
+		}
+		if err == nil && s.DbDriver == "pg" {
+			err = s.loadSearchResultTags(ctx, repos)
+		}
+		err = errorx.HandleDBError(err, errorx.Ctx().
+			Set("repo_type", repoType).
+			Set("filter", filter),
+		)
+		return
+	}
+
+	applyRepoOrder(q, repoType, filter.Sort, needDistinct)
+
+	count, err = s.countRepoList(ctx, q, per, page)
+	err = errorx.HandleDBError(err, errorx.Ctx().
+		Set("repo_type", repoType).
+		Set("filter", filter),
+	)
+	if err != nil {
+		return
+	}
+
+	err = q.Limit(per).Offset((page - 1) * per).Scan(ctx)
+
+	return
+}
+
+// repositoryListQuery shares visibility and filters between the list and dataset statistics.
+func (s *repoStoreImpl) repositoryListQuery(ctx context.Context, repoType types.RepositoryType, filter *types.RepoFilter, scope *RepositoryAccessScope) (*bun.SelectQuery, bool, error) {
 	q := s.db.Operator.Core.
 		NewSelect().
 		Column("repository.*").
-		Model(&repos).
-		Relation("Tags")
+		Model((*Repository)(nil))
 
 	q.Where("repository.repository_type = ?", repoType)
 	if filter.Owner != "" {
@@ -1229,12 +1278,15 @@ func (s *repoStoreImpl) publicToUser(ctx context.Context, repoType types.Reposit
 			Where("value < 0"). // Negative value indicates purchase
 			Scan(ctx, &purchasedDatasetIDs)
 
-		if err == nil && len(purchasedDatasetIDs) > 0 {
+		if err != nil {
+			return nil, false, fmt.Errorf("query purchased datasets: %w", err)
+		}
+		if len(purchasedDatasetIDs) > 0 {
 			// Filter datasets where related_dataset_id is in the purchased dataset IDs
 			q.Where("datasets.related_dataset_id IN (?)", bun.In(purchasedDatasetIDs))
 		} else {
 			// If no purchased datasets, return empty result
-			return []*Repository{}, 0, nil
+			return nil, false, nil
 		}
 	}
 
@@ -1257,42 +1309,7 @@ func (s *repoStoreImpl) publicToUser(ctx context.Context, repoType types.Reposit
 		needDistinct = true
 	}
 
-	if needDistinct {
-		applyRepoDedup(q, repoType, filter.Sort)
-	}
-
-	filter.Search = strings.TrimSpace(filter.Search)
-	if filter.Search != "" {
-		filter.Search = strings.ToLower(filter.Search)
-		if !filter.UserPurchased && scope != nil && (scope.Mode == RepositoryAccessReadable && len(scope.ReadableRepositoryIDs) == 0 || scope.Mode == RepositoryAccessPublic) {
-			repos, count, err = s.SearchRepoWithCache(ctx, q, repoType, filter, per, page)
-		} else {
-			repos, count, err = s.searchRepoWithoutCache(ctx, q, filter, per, page)
-		}
-		if err == nil && s.DbDriver == "pg" {
-			err = s.loadSearchResultTags(ctx, repos)
-		}
-		err = errorx.HandleDBError(err, errorx.Ctx().
-			Set("repo_type", repoType).
-			Set("filter", filter),
-		)
-		return
-	}
-
-	applyRepoOrder(q, repoType, filter.Sort, needDistinct)
-
-	count, err = s.countRepoList(ctx, q, per, page)
-	err = errorx.HandleDBError(err, errorx.Ctx().
-		Set("repo_type", repoType).
-		Set("filter", filter),
-	)
-	if err != nil {
-		return
-	}
-
-	err = q.Limit(per).Offset((page - 1) * per).Scan(ctx)
-
-	return
+	return q, needDistinct, nil
 }
 
 func (s *repoStoreImpl) publicToUserTrending(ctx context.Context, repoType types.RepositoryType, filter *types.RepoFilter, per, page int, scope *RepositoryAccessScope) (repos []*Repository, count int, err error) {
