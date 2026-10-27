@@ -109,6 +109,10 @@ func (r *duckdbWriter) ConvertToParquet(ctx context.Context, method string, objN
 		fileStr = objNames[0]
 	}
 	options := ", union_by_name=true"
+	if method == "read_csv_auto" {
+		// CSV has no declared types; preserve textual values across heterogeneous files.
+		options += ", all_varchar=true"
+	}
 	if method == "read_json_auto" {
 		limit := r.cfg.DataViewer.MaxJSONSize
 		if limit <= 0 {

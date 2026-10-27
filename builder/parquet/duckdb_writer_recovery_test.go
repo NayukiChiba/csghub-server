@@ -67,3 +67,17 @@ func TestConversionAcceptsLargeJSONAndDifferentColumns(t *testing.T) {
 	require.NoError(t, w.db.QueryRow("SELECT count(*) FROM read_parquet(?)", filepath.Join(output, "*.parquet")).Scan(&count))
 	require.Equal(t, 2, count)
 }
+
+func TestCSVConversionPreservesMixedTimestampRepresentations(t *testing.T) {
+	w := newRecoveryWriter(t)
+	root := t.TempDir()
+	a := filepath.Join(root, "a.csv")
+	b := filepath.Join(root, "b.csv")
+	require.NoError(t, os.WriteFile(a, []byte("timestamp,id\n2026-03-18 01:02:03,001\n"), 0600))
+	require.NoError(t, os.WriteFile(b, []byte("timestamp,id\n1773820897000,002\n"), 0600))
+	output := filepath.Join(root, "output")
+	require.NoError(t, w.ConvertToParquet(context.Background(), "read_csv_auto", []string{fmt.Sprintf("'%s'", a), fmt.Sprintf("'%s'", b)}, 1, output))
+	var count int
+	require.NoError(t, w.db.QueryRow("SELECT count(*) FROM read_parquet(?) WHERE (id='001' AND timestamp='2026-03-18 01:02:03') OR (id='002' AND timestamp='1773820897000')", filepath.Join(output, "*.parquet")).Scan(&count))
+	require.Equal(t, 2, count)
+}
