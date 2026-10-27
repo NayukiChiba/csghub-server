@@ -559,6 +559,66 @@ func (_c *MockRepoStore_CreateRepo_Call) RunAndReturn(run func(context.Context, 
 	return _c
 }
 
+// DatasetRowSummary provides a mock function with given fields: ctx, scope, filter
+func (_m *MockRepoStore) DatasetRowSummary(ctx context.Context, scope database.RepositoryAccessScope, filter *types.RepoFilter) (*types.DatasetRowSummary, error) {
+	ret := _m.Called(ctx, scope, filter)
+
+	if len(ret) == 0 {
+		panic("no return value specified for DatasetRowSummary")
+	}
+
+	var r0 *types.DatasetRowSummary
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, database.RepositoryAccessScope, *types.RepoFilter) (*types.DatasetRowSummary, error)); ok {
+		return rf(ctx, scope, filter)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, database.RepositoryAccessScope, *types.RepoFilter) *types.DatasetRowSummary); ok {
+		r0 = rf(ctx, scope, filter)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*types.DatasetRowSummary)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, database.RepositoryAccessScope, *types.RepoFilter) error); ok {
+		r1 = rf(ctx, scope, filter)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockRepoStore_DatasetRowSummary_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'DatasetRowSummary'
+type MockRepoStore_DatasetRowSummary_Call struct {
+	*mock.Call
+}
+
+// DatasetRowSummary is a helper method to define mock.On call
+//   - ctx context.Context
+//   - scope database.RepositoryAccessScope
+//   - filter *types.RepoFilter
+func (_e *MockRepoStore_Expecter) DatasetRowSummary(ctx interface{}, scope interface{}, filter interface{}) *MockRepoStore_DatasetRowSummary_Call {
+	return &MockRepoStore_DatasetRowSummary_Call{Call: _e.mock.On("DatasetRowSummary", ctx, scope, filter)}
+}
+
+func (_c *MockRepoStore_DatasetRowSummary_Call) Run(run func(ctx context.Context, scope database.RepositoryAccessScope, filter *types.RepoFilter)) *MockRepoStore_DatasetRowSummary_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(database.RepositoryAccessScope), args[2].(*types.RepoFilter))
+	})
+	return _c
+}
+
+func (_c *MockRepoStore_DatasetRowSummary_Call) Return(_a0 *types.DatasetRowSummary, _a1 error) *MockRepoStore_DatasetRowSummary_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockRepoStore_DatasetRowSummary_Call) RunAndReturn(run func(context.Context, database.RepositoryAccessScope, *types.RepoFilter) (*types.DatasetRowSummary, error)) *MockRepoStore_DatasetRowSummary_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // DeleteAllFiles provides a mock function with given fields: ctx, repoID
 func (_m *MockRepoStore) DeleteAllFiles(ctx context.Context, repoID int64) error {
 	ret := _m.Called(ctx, repoID)

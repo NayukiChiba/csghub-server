@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -126,34 +125,13 @@ func (h *DatasetHandler) Create(ctx *gin.Context) {
 // @Failure      500  {object}  types.APIInternalServerError "Internal server error"
 // @Router       /datasets [get]
 func (h *DatasetHandler) Index(ctx *gin.Context) {
-	filter := new(types.RepoFilter)
-	filter.Tags = parseTagReqs(ctx)
-	filter.Username = httpbase.GetCurrentUser(ctx)
 	per, page, err := common.GetPerAndPageFromContext(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx.Request.Context(), "Bad request format", "error", err)
 		httpbase.BadRequestWithExt(ctx, err)
 		return
 	}
-	filter = getFilterFromContext(ctx, filter)
-	filter.RepoSizeMin, filter.RepoSizeMax, err = parseInt64RangeFromContext(ctx, "repo_size_min", "repo_size_max")
+	filter, err := datasetFilterFromContext(ctx)
 	if err != nil {
-		slog.ErrorContext(ctx.Request.Context(), "Bad repo size range request format,", slog.Any("error", err))
-		httpbase.BadRequestWithExt(ctx, errorx.ReqParamInvalid(err, errorx.Ctx().Set("query", "repo_size_range")))
-		return
-	}
-	if !slices.Contains(types.DatasetSorts, filter.Sort) {
-		err = fmt.Errorf("sort parameter must be one of %v", types.DatasetSorts)
-		err = errorx.ReqParamInvalid(err, errorx.Ctx().Set("query", "sort_filter"))
-		slog.ErrorContext(ctx.Request.Context(), "Bad sort request format,", slog.Any("error", err))
-		httpbase.BadRequestWithExt(ctx, err)
-		return
-	}
-
-	if filter.Source != "" && !slices.Contains(types.Sources, filter.Source) {
-		err = fmt.Errorf("source parameter must be one of %v", types.Sources)
-		err = errorx.ReqParamInvalid(err, errorx.Ctx().Set("query", "source_filter"))
-		slog.ErrorContext(ctx.Request.Context(), "Bad source request format,", slog.Any("error", err))
 		httpbase.BadRequestWithExt(ctx, err)
 		return
 	}

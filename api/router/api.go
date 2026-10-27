@@ -848,6 +848,7 @@ func createDatasetRoutes(
 	datasetsGroup := apiGroup.Group("/datasets")
 	// allow access without login
 	datasetsGroup.GET("", dsHandler.Index)
+	datasetsGroup.GET("/row-summary", dsHandler.RowSummary)
 	// must login
 	datasetsGroup.Use(middleware.RepoType(types.DatasetRepo), middlewareCollection.Repo.RepoExists)
 	{

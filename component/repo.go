@@ -125,6 +125,7 @@ type repoComponentImpl struct {
 }
 
 type RepoComponent interface {
+	DatasetRowSummary(ctx context.Context, filter *types.RepoFilter) (*types.DatasetRowSummary, error)
 	CreateRepo(ctx context.Context, req types.CreateRepoReq) (*gitserver.CreateRepoResp, *database.Repository, *gitserver.CommitFilesReq, error)
 	UpdateRepo(ctx context.Context, req types.UpdateRepoReq) (*database.Repository, error)
 	DeleteRepo(ctx context.Context, req types.DeleteRepoReq) (*database.Repository, error)
