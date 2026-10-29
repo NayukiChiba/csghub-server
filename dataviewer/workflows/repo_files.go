@@ -42,12 +42,13 @@ func IsValidParquetFile(entryName string) bool {
 }
 
 func IsValidJsonFile(entryName string) bool {
-	return strings.HasSuffix(strings.ToLower(entryName), FileExtName.Jsonl) ||
-		strings.HasSuffix(strings.ToLower(entryName), FileExtName.Json)
+	ext, _ := datasetFileFormat(entryName)
+	return ext == FileExtName.Jsonl || ext == FileExtName.Json
 }
 
 func IsValidCSVFile(entryName string) bool {
-	return strings.HasSuffix(strings.ToLower(entryName), FileExtName.Csv)
+	ext, _ := datasetFileFormat(entryName)
+	return ext == FileExtName.Csv
 }
 
 // mediaExtensions lists previewable multimedia file extensions (image, audio, video).

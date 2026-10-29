@@ -566,6 +566,8 @@ func (dva *dataViewerActivityImpl) getExistingRepoFiles(ctx context.Context, req
 
 func (dva *dataViewerActivityImpl) DownloadSplitFiles(ctx context.Context, downloadReq dvCom.DownloadFileReq) (*dvCom.DownloadCard, error) {
 	var subsets []dvCom.DownloadSubset
+	remaining := dva.cfg.DataViewer.ConvertLimitSize
+	hasCompressed := false
 	cacheRepoPath := GetCacheRepoPath(ctx, dva.cfg.DataViewer.CacheDir, downloadReq.Req)
 	_, err := os.Stat(cacheRepoPath)
 	if err != nil && !os.IsNotExist(err) {
@@ -596,6 +598,10 @@ func (dva *dataViewerActivityImpl) DownloadSplitFiles(ctx context.Context, downl
 			newFiles := []dvCom.FileObject{}
 			for idx, file := range split.Origins {
 				extName := filepath.Ext(file.RepoFile)
+				if format, compression := datasetFileFormat(file.RepoFile); compression != "" {
+					extName = format + compression
+					hasCompressed = true
+				}
 				localFileName := fmt.Sprintf("%05d%s", idx, extName)
 				downloadObj, err := dva.downloadFile(ctx, downloadReq.Req, file, &dvCom.FileObject{
 					RepoFile:      file.RepoFile,
@@ -613,6 +619,13 @@ func (dva *dataViewerActivityImpl) DownloadSplitFiles(ctx context.Context, downl
 					return nil, fmt.Errorf("failed to download file %s in branch %s, cause: %w",
 						file.RepoFile, downloadReq.Req.Branch, err)
 				}
+				if err := decompressDatasetFile(ctx, downloadObj, remaining); err != nil {
+					return nil, fmt.Errorf("prepare dataset file %s: %w", file.RepoFile, err)
+				}
+				if hasCompressed && downloadObj.DownloadSize > remaining {
+					return nil, fmt.Errorf("dataset including compressed files exceeds conversion byte limit")
+				}
+				remaining -= downloadObj.DownloadSize
 				newFiles = append(newFiles, *downloadObj)
 			}
 			splitPath := fmt.Sprintf("%s/%s/%s", cacheRepoPath, info.ConfigName, split.Name)
@@ -737,6 +750,9 @@ func (dva *dataViewerActivityImpl) downloadLfsFile(ctx context.Context, req type
 	loadFile.ObjectKey = objectKey
 
 	if !dva.cfg.DataViewer.DownloadLfsFile {
+		if _, compression := datasetFileFormat(orginFile.RepoFile); compression != "" {
+			return fmt.Errorf("compressed dataset files require DataViewer LFS downloads to be enabled")
+		}
 		slog.Warn("skip download lfs file", slog.Any("file", orginFile))
 		return nil
 	}
@@ -804,6 +820,15 @@ func (dva *dataViewerActivityImpl) downloadNormalFile(ctx context.Context, local
 }
 
 func (dva *dataViewerActivityImpl) copyFileContent(writeFile *os.File, reader io.ReadCloser, orginFile dvCom.FileObject, loadFile *dvCom.FileObject, fileExtName string) error {
+	if _, compression := datasetFileFormat(orginFile.RepoFile); compression != "" {
+		// Compressed bytes cannot be truncated at a record boundary.
+		if orginFile.DownloadSize < orginFile.Size {
+			return fmt.Errorf("compressed source exceeds the download budget")
+		}
+		copied, err := io.Copy(writeFile, reader)
+		loadFile.DownloadSize = copied
+		return err
+	}
 	if (orginFile.Size - orginFile.DownloadSize) <= MinFileSizeGap {
 		var source io.Reader = reader
 		if fileExtName == FileExtName.Json || fileExtName == FileExtName.Jsonl || fileExtName == FileExtName.Csv {
