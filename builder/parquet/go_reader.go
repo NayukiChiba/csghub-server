@@ -67,6 +67,11 @@ func NewParquetGoReader(ioClient IOClient, tracer trace.Tracer, bucket string) *
 func (p *ParquetGoReader) build(ctx context.Context, files []*pfile, limit, offset int64) []groupReader {
 	_, span := p.tracer.Start(ctx, "calculate required groups")
 	defer span.End()
+	// Counts come from file metadata. Constructing a row reader here would
+	// unnecessarily decode values and can panic on valid NULL logical columns.
+	if limit == 0 {
+		return nil
+	}
 
 	var done bool
 	// recalculate required groups

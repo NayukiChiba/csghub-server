@@ -166,3 +166,13 @@ func TestGoReader_MultimodalNestedColumns(t *testing.T) {
 	require.Equal(t, base64.StdEncoding.EncodeToString(videoBytes), data[0][3])
 	require.Equal(t, []any{"cat", "speech"}, data[0][4])
 }
+
+// nulls.parquet is generated with PyArrow from a null-typed column and two IDs.
+func TestParquetCountOnlyDoesNotDecodeNullColumns(t *testing.T) {
+	reader := initReader()
+	columns, _, rows, total, err := reader.RowsWithCount(context.Background(), []string{"test_data/nulls.parquet"}, 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, []string{"missing", "id"}, columns)
+	require.Empty(t, rows)
+	require.Equal(t, int64(2), total)
+}
