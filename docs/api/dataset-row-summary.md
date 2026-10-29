@@ -70,6 +70,7 @@ curl --get 'http://127.0.0.1/api/v1/datasets/row-summary' \
 ## 统计口径和刷新
 
 - 数据来自 DataViewer 当前完成任务保存的 `card_data.rows_num`，覆盖其解析的所有 subset/split。
+- DataViewer 的扫描与转换限制仍生效：默认最多扫描 5000 个文件，转换范围上限为 5 GiB。`complete` 仅说明匹配数据集都有可用统计，不保证源仓库的全部文件均已解析；它不是全量覆盖率标志。解析失败恢复及配置见 [DataViewer 行数统计恢复](../zh-CN/dataviewer-recovery.md)。
 - 不下载仓库文件，不遍历样本，不在每次筛选时重新运行解析任务；数据库一次查询筛选出的元数据，再逐条累计。
 - 按数据集累计，不对不同仓库之间相同的样本做去重；同一数据集的 subset/split 如果内容重叠，沿用 DataViewer 的行数口径。
 - 文件发生变化后，须待 DataViewer 更新完成，新的行数才会进入统计。因此“实时”指筛选变化后立即重新请求当前已持久化的统计，不是实时扫描文件。
