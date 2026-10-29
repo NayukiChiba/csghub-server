@@ -585,8 +585,10 @@ type Config struct {
 	}
 
 	DataViewer struct {
-		CSVHeader   string `env:"OPENCSG_DATAVIEWER_CSV_HEADER" default:"true"`                // true, false, or auto
-		MaxJSONSize int64  `env:"OPENCSG_DATAVIEWER_MAX_JSON_OBJECT_SIZE" default:"134217728"` // 128 MiB per JSON object
+		CSVHeader             string `env:"OPENCSG_DATAVIEWER_CSV_HEADER" default:"true"`                    // true, false, or auto
+		MaxJSONSize           int64  `env:"OPENCSG_DATAVIEWER_MAX_JSON_OBJECT_SIZE" default:"134217728"`     // 128 MiB per JSON object
+		JSONInferenceMaxBytes int64  `env:"OPENCSG_DATAVIEWER_JSON_INFERENCE_MAX_BYTES" default:"67108864"`  // 64 MiB per conversion
+		ConversionMemoryLimit int64  `env:"OPENCSG_DATAVIEWER_CONVERSION_MEMORY_LIMIT" default:"2147483648"` // 2 GiB DuckDB buffer budget
 
 		Host                                    string `env:"OPENCSG_DATAVIEWER_SERVER_HOST" default:"http://localhost"`
 		Port                                    int    `env:"OPENCSG_DATAVIEWER_SERVER_PORT" default:"8093"`

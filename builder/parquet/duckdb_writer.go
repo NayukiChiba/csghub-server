@@ -111,15 +111,41 @@ func (r *duckdbWriter) ConvertToParquet(ctx context.Context, method string, objN
 		if limit <= 0 {
 			limit = 128 << 20
 		}
-		// Inspect all cached records so late schema changes are not missed.
-		// Pin date formats rather than borrowing one from unrelated nested fields.
-		options := fmt.Sprintf(", union_by_name=true, maximum_object_size=%d, sample_size=-1, timestampformat='%s', dateformat='%s'", limit, "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d")
-		query := fmt.Sprintf("SELECT * FROM read_json_auto([%s]%s)", strings.Join(objNames, ","), options)
+		query := r.jsonExportQuery(objNames, limit)
 		if err := r.exportQuery(ctx, query, thread, staging); err != nil {
 			return err
 		}
 	}
 	return publishParquetExport(staging, output)
+}
+
+// Full JSON type inference can retain many times the input size in native
+// memory. Large or remote sources are streamed as complete JSON records instead.
+func (r *duckdbWriter) jsonExportQuery(objects []string, objectLimit int64) string {
+	budget := r.cfg.DataViewer.JSONInferenceMaxBytes
+	if budget <= 0 {
+		budget = 64 << 20
+	}
+	if !jsonInputsFitInferenceBudget(objects, budget) {
+		return fmt.Sprintf("SELECT json AS record FROM read_json_objects([%s], format='auto', maximum_object_size=%d)", strings.Join(objects, ","), objectLimit)
+	}
+	options := fmt.Sprintf(", union_by_name=true, maximum_object_size=%d, sample_size=-1, timestampformat='%s', dateformat='%s'", objectLimit, "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d")
+	return fmt.Sprintf("SELECT * FROM read_json_auto([%s]%s)", strings.Join(objects, ","), options)
+}
+
+func jsonInputsFitInferenceBudget(objects []string, budget int64) bool {
+	for _, object := range objects {
+		if len(object) < 2 || object[0] != '\'' || object[len(object)-1] != '\'' {
+			return false
+		}
+		path := strings.ReplaceAll(object[1:len(object)-1], "''", "'")
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > budget {
+			return false
+		}
+		budget -= info.Size()
+	}
+	return true
 }
 
 // CSV files may use different column counts or dialects. DuckDB's multi-file
@@ -163,12 +189,17 @@ func (r *duckdbWriter) exportCSVFiles(ctx context.Context, objects []string, thr
 }
 
 func (r *duckdbWriter) exportQuery(ctx context.Context, query string, threads int, path string) error {
+	memoryLimit := r.cfg.DataViewer.ConversionMemoryLimit
+	if memoryLimit <= 0 {
+		memoryLimit = 2 << 30
+	}
 	command := fmt.Sprintf(`
+	SET memory_limit = '%dB';
 	SET preserve_insertion_order=false;
 	SET threads = %d;
 	COPY (%s) TO '%s' (
-		FORMAT 'PARQUET', CODEC 'Snappy', PER_THREAD_OUTPUT TRUE, FILENAME_PATTERN '{i}'
-	);`, threads, query, strings.ReplaceAll(path+"/", "'", "''"))
+		FORMAT 'PARQUET', CODEC 'Snappy', PER_THREAD_OUTPUT TRUE, FILENAME_PATTERN '{i}', ROW_GROUP_SIZE 2048
+	);`, memoryLimit, threads, query, strings.ReplaceAll(path+"/", "'", "''"))
 	if _, err := r.db.ExecContext(ctx, command); err != nil {
 		return fmt.Errorf("failed to export parquet: %w", err)
 	}

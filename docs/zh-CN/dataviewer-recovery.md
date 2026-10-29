@@ -6,7 +6,9 @@
 ## 已修复的解析路径
 
 - 转换在独立临时目录中执行，成功后替换旧 Parquet 分片。重试不复用半成品，不把残留分片重复计数；转换失败时保留上一份输出。
-- JSON 多文件按列名合并，扫描缓存范围内的全部记录来判断类型，避免后半段类型变化导致失败；日期和时间仅按固定格式推断，其他表示保留为字符串。CSV 按文件分别识别分隔符并转换，预览按列名合并；保留原始文本值，避免不同文件同名列的日期、整数等类型推断冲突。CSV 默认首行为表头，`OPENCSG_DATAVIEWER_CSV_HEADER=false` 可配置无表头文件，`auto` 保留 DuckDB 自动猜测行为；同为纯文本的表头与首条数据无法可靠自动区分，应按数据源约定选择。JSON 单对象读取上限默认 128 MiB，可通过 `OPENCSG_DATAVIEWER_MAX_JSON_OBJECT_SIZE` 调整；仍严格报告解析错误，不跳过坏记录来凑出行数。
+- 小型 JSON 输入按列名合并，扫描缓存范围内的全部记录来判断类型，避免后半段类型变化导致失败；日期和时间仅按固定格式推断，其他表示保留为字符串。CSV 按文件分别识别分隔符并转换，预览按列名合并；保留原始文本值，避免不同文件同名列的日期、整数等类型推断冲突。CSV 默认首行为表头，`OPENCSG_DATAVIEWER_CSV_HEADER=false` 可配置无表头文件，`auto` 保留 DuckDB 自动猜测行为；同为纯文本的表头与首条数据无法可靠自动区分，应按数据源约定选择。JSON 单对象读取上限默认 128 MiB，可通过 `OPENCSG_DATAVIEWER_MAX_JSON_OBJECT_SIZE` 调整；仍严格报告解析错误，不跳过坏记录来凑出行数。
+- 为避免全量类型推断耗尽内存，只有总大小不超过 `OPENCSG_DATAVIEWER_JSON_INFERENCE_MAX_BYTES`（默认 64 MiB）的本地输入采用完整类型推断。更大或大小未知的远程 JSON 输入流式保留每条完整原始记录，输出单列 `record`，不做类型推断；JSON 数组和 JSONL 仍按实际记录计数，字段和值不丢弃，但预览列布局会改变。
+- DuckDB 缓冲内存预算由 `OPENCSG_DATAVIEWER_CONVERSION_MEMORY_LIMIT` 控制，默认 2 GiB；Parquet 每个 row group 为 2048 行以限制批次大小。此配置不是整个进程的 RSS 硬上限，解析器和其他分配仍需监控；单对象大小上限仍生效。
 - UTF-8 BOM 在下载的 JSON/JSONL/CSV 中移除。按行复制支持超过 64 KiB 的记录，并向上传播读取错误。
 - 单文件压缩表格支持 `.json.gz`、`.jsonl.gz`、`.csv.gz` 及相应 `.zst` 后缀（大小写不敏感）。识别真实数据格式后，在本地缓存流式解压，再复用现有转换、上传和计数流程；不把 `.tar.gz` 或任意压缩包当成表格。
 - 压缩来源必须完整下载并通过解码校验，不能按压缩字节截断。跨所有 subset/split 累计解压后的转换字节数，仍受 `OPENCSG_DATAVIEWER_CONVERT_LIMIT_SIZE` 限制；超限、损坏、取消时明确失败，不提交解压半成品。Zstandard 流式窗口上限为 128 MiB，使用现有依赖，没有升级版本。压缩 LFS 数据要求启用 `OPENCSG_DATAVIEWER_DOWNLOAD_LFS_FILE`。
@@ -30,4 +32,4 @@
 
 DuckDB 参数参考：[JSON 读取](https://duckdb.org/docs/1.4/data/json/loading_json)、[COPY](https://duckdb.org/docs/1.4/sql/statements/copy)。本次以项目实际依赖的 Go DuckDB 驱动执行回归测试，而非仅依赖在线文档版本。
 
-JSON 完整类型扫描增加一次推断读取，受现有转换缓存上限约束；不启用 `ignore_errors`。混合时间格式问题也可见 [DuckDB 上游问题说明](https://github.com/duckdb/duckdb/issues/14004)，实际行为以本仓库固定版本的回归测试为准。
+JSON 完整类型扫描仅用于大小受限的本地输入；大文件使用原始记录流式路径，不启用 `ignore_errors`。混合时间格式问题也可见 [DuckDB 上游问题说明](https://github.com/duckdb/duckdb/issues/14004)，实际行为以本仓库固定版本的回归测试为准。
