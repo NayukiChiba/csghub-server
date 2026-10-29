@@ -102,40 +102,74 @@ func (r *duckdbWriter) ConvertToParquet(ctx context.Context, method string, objN
 			return fmt.Errorf("failed to setup json for duckdb, cause:%w", err)
 		}
 	}
-	fileStr := ""
-	if len(objNames) > 1 {
-		fileStr = "[" + strings.Join(objNames, ",") + "]"
-	} else {
-		fileStr = objNames[0]
-	}
-	options := ", union_by_name=true"
 	if method == "read_csv_auto" {
-		// CSV has no declared types; preserve textual values across heterogeneous files.
-		options += ", all_varchar=true"
-	}
-	if method == "read_json_auto" {
+		if err := r.exportCSVFiles(ctx, objNames, thread, staging); err != nil {
+			return err
+		}
+	} else {
 		limit := r.cfg.DataViewer.MaxJSONSize
 		if limit <= 0 {
 			limit = 128 << 20
 		}
-		options += fmt.Sprintf(", maximum_object_size=%d", limit)
-	}
-	exportCMD := fmt.Sprintf(`
-	SET preserve_insertion_order=false;
-	SET threads = %d; 
-	COPY (SELECT * FROM %s(%s%s)) TO '%s' (
-		FORMAT 'PARQUET', 
-		CODEC 'Snappy', 
-		PER_THREAD_OUTPUT TRUE, 
-		FILENAME_PATTERN '{i}' 
-	);
-	`, thread, method, fileStr, options, strings.ReplaceAll(staging+"/", "'", "''"))
-	slog.Debug("export parquet sql", slog.String("sql", exportCMD))
-	_, err = r.db.ExecContext(ctx, exportCMD)
-	if err != nil {
-		return fmt.Errorf("failed to export parquet: %w", err)
+		// Inspect all cached records so late schema changes are not missed.
+		// Pin date formats rather than borrowing one from unrelated nested fields.
+		options := fmt.Sprintf(", union_by_name=true, maximum_object_size=%d, sample_size=-1, timestampformat='%s', dateformat='%s'", limit, "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d")
+		query := fmt.Sprintf("SELECT * FROM read_json_auto([%s]%s)", strings.Join(objNames, ","), options)
+		if err := r.exportQuery(ctx, query, thread, staging); err != nil {
+			return err
+		}
 	}
 	return publishParquetExport(staging, output)
+}
+
+// CSV files may use different column counts or dialects. DuckDB's multi-file
+// reader can reuse the first file's dialect even with union_by_name enabled.
+func (r *duckdbWriter) exportCSVFiles(ctx context.Context, objects []string, threads int, staging string) error {
+	header := r.cfg.DataViewer.CSVHeader
+	if header == "" {
+		header = "true"
+	}
+	if header != "true" && header != "false" && header != "auto" {
+		return fmt.Errorf("invalid CSV header mode %q: expected true, false, or auto", header)
+	}
+	options := ", all_varchar=true"
+	if header != "auto" {
+		options += ", header=" + header
+	}
+	for i, object := range objects {
+		dir := filepath.Join(staging, fmt.Sprintf("csv-%d", i))
+		query := fmt.Sprintf("SELECT * FROM read_csv_auto(%s%s)", object, options)
+		if err := r.exportQuery(ctx, query, threads, dir); err != nil {
+			return err
+		}
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, file := range files {
+			name := fmt.Sprintf("%d-%s", i, file.Name())
+			if err := os.Rename(filepath.Join(dir, file.Name()), filepath.Join(staging, name)); err != nil {
+				return err
+			}
+		}
+		if err := os.Remove(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *duckdbWriter) exportQuery(ctx context.Context, query string, threads int, path string) error {
+	command := fmt.Sprintf(`
+	SET preserve_insertion_order=false;
+	SET threads = %d;
+	COPY (%s) TO '%s' (
+		FORMAT 'PARQUET', CODEC 'Snappy', PER_THREAD_OUTPUT TRUE, FILENAME_PATTERN '{i}'
+	);`, threads, query, strings.ReplaceAll(path+"/", "'", "''"))
+	if _, err := r.db.ExecContext(ctx, command); err != nil {
+		return fmt.Errorf("failed to export parquet: %w", err)
+	}
+	return nil
 }
 
 // Only replace converter-owned parquet shards. Refuse foreign entries instead

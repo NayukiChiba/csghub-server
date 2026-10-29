@@ -6,11 +6,12 @@
 ## 已修复的解析路径
 
 - 转换在独立临时目录中执行，成功后替换旧 Parquet 分片。重试不复用半成品，不把残留分片重复计数；转换失败时保留上一份输出。
-- JSON/CSV 多文件按列名合并；CSV 保留原始文本值，避免不同文件同名列的日期、整数等类型推断冲突。JSON 单对象读取上限默认 128 MiB，可通过 `OPENCSG_DATAVIEWER_MAX_JSON_OBJECT_SIZE` 调整；仍严格报告解析错误，不跳过坏记录来凑出行数。
+- JSON 多文件按列名合并，扫描缓存范围内的全部记录来判断类型，避免后半段类型变化导致失败；日期和时间仅按固定格式推断，其他表示保留为字符串。CSV 按文件分别识别分隔符并转换，预览按列名合并；保留原始文本值，避免不同文件同名列的日期、整数等类型推断冲突。CSV 默认首行为表头，`OPENCSG_DATAVIEWER_CSV_HEADER=false` 可配置无表头文件，`auto` 保留 DuckDB 自动猜测行为；同为纯文本的表头与首条数据无法可靠自动区分，应按数据源约定选择。JSON 单对象读取上限默认 128 MiB，可通过 `OPENCSG_DATAVIEWER_MAX_JSON_OBJECT_SIZE` 调整；仍严格报告解析错误，不跳过坏记录来凑出行数。
 - UTF-8 BOM 在下载的 JSON/JSONL/CSV 中移除。按行复制支持超过 64 KiB 的记录，并向上传播读取错误。
 - 普通 Git 中的 Parquet 文件先以内容哈希存入对象存储，预览分支使用 LFS 指针；原分支和原数据不变。已有 LFS 文件继续复用原对象。
 - 下载 LFS 文件优先使用实际 SHA-256 生成对象路径，并检查 HTTP 状态；404 响应不会作为数据写入缓存。
 - Git 文件更新与创建一样分块传输，避免一次发送超过 gRPC 限制。
+- Parquet 嵌套字段通过文件 schema 判断类型，不把数字或含符号的合法 JSON 键转换为 Go 结构体字段名，避免反射 panic。
 - 工作流在会话创建失败、会话取消或活动失败后，使用独立状态回写上下文；数据库写入错误会反馈给活动重试。
 
 ## 恢复顺序
@@ -24,3 +25,5 @@
 现有扫描文件数和转换字节数限制仍生效；此接口口径是 DataViewer 已解析的样本，不能据此声称绕过限制完成了整个源仓库的全量扫描。
 
 DuckDB 参数参考：[JSON 读取](https://duckdb.org/docs/1.4/data/json/loading_json)、[COPY](https://duckdb.org/docs/1.4/sql/statements/copy)。本次以项目实际依赖的 Go DuckDB 驱动执行回归测试，而非仅依赖在线文档版本。
+
+JSON 完整类型扫描增加一次推断读取，受现有转换缓存上限约束；不启用 `ignore_errors`。混合时间格式问题也可见 [DuckDB 上游问题说明](https://github.com/duckdb/duckdb/issues/14004)，实际行为以本仓库固定版本的回归测试为准。

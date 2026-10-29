@@ -585,7 +585,8 @@ type Config struct {
 	}
 
 	DataViewer struct {
-		MaxJSONSize int64 `env:"OPENCSG_DATAVIEWER_MAX_JSON_OBJECT_SIZE" default:"134217728"` // 128 MiB per JSON object
+		CSVHeader   string `env:"OPENCSG_DATAVIEWER_CSV_HEADER" default:"true"`                // true, false, or auto
+		MaxJSONSize int64  `env:"OPENCSG_DATAVIEWER_MAX_JSON_OBJECT_SIZE" default:"134217728"` // 128 MiB per JSON object
 
 		Host                                    string `env:"OPENCSG_DATAVIEWER_SERVER_HOST" default:"http://localhost"`
 		Port                                    int    `env:"OPENCSG_DATAVIEWER_SERVER_PORT" default:"8093"`

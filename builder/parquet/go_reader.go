@@ -187,16 +187,11 @@ func previewColumnType(field parquet.Field) string {
 	if field.Leaf() {
 		return field.Type().Kind().String()
 	}
-	if field.Type().String() == "LIST" {
+	if field.Type().String() == "LIST" || field.Repeated() {
 		return "LIST"
 	}
-	fieldType := field.GoType()
-	for fieldType.Kind() == reflect.Pointer {
-		fieldType = fieldType.Elem()
-	}
-	if fieldType.Kind() == reflect.Slice || fieldType.Kind() == reflect.Array {
-		return "LIST"
-	}
+	// Parquet field names are not Go identifiers. Building a reflected struct
+	// just to classify a group panics on valid names such as "0" or "a-b".
 	return "STRUCT"
 }
 
