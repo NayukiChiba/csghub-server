@@ -1283,6 +1283,9 @@ func TestRepoComponent_SDKListFiles(t *testing.T) {
 	repo.mocks.gitServer.EXPECT().GetTree(
 		mock.Anything, types.GetTreeRequest{Namespace: "ns", Name: "n", Ref: "main", RepoType: "model", Limit: 500, Recursive: true},
 	).Return(&types.GetRepoFileTreeResp{Files: files, Cursor: ""}, nil)
+	repo.mocks.gitServer.EXPECT().GetRepoLastCommit(
+		mock.Anything, gitserver.GetRepoLastCommitReq{Namespace: "ns", Name: "n", Ref: "main", RepoType: "model"},
+	).Return(&types.Commit{ID: "b2a7c9d"}, nil)
 
 	fs, err := repo.SDKListFiles(ctx, types.ModelRepo, "ns", "n", "main", "user")
 	require.Nil(t, err)
@@ -1290,6 +1293,7 @@ func TestRepoComponent_SDKListFiles(t *testing.T) {
 		Tags:     []string{},
 		ID:       "ns/n",
 		Siblings: []types.SDKFile{{}},
+		SHA:      "b2a7c9d",
 	}, fs)
 
 }

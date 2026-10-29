@@ -1880,6 +1880,18 @@ func (c *repoComponentImpl) SDKListFiles(ctx context.Context, repoType types.Rep
 		ref = repo.DefaultBranch
 	}
 
+	// HF-compatible repo info must expose the resolved commit OID: HF SDKs use it as
+	// the parent commit when uploading, and a branch name fails their OID validation.
+	lastCommit, err := c.git.GetRepoLastCommit(ctx, gitserver.GetRepoLastCommitReq{
+		Namespace: namespace,
+		Name:      name,
+		Ref:       ref,
+		RepoType:  repoType,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get %s repository last commit, error: %w", repoType, err)
+	}
+
 	filePaths, err := GetFilePaths(ctx, namespace, name, "", repoType, ref, c.git.GetTree)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get all %s files, error: %w", repoType, err)
@@ -1895,7 +1907,7 @@ func (c *repoComponentImpl) SDKListFiles(ctx context.Context, repoType types.Rep
 		Downloads: repo.DownloadCount,
 		Likes:     repo.Likes,
 		Tags:      []string{},
-		SHA:       repo.DefaultBranch,
+		SHA:       lastCommit.ID,
 	}, nil
 }
 
