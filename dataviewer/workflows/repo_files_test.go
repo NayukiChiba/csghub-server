@@ -29,6 +29,24 @@ func TestRepoFiles_appendFile(t *testing.T) {
 	require.Equal(t, 1, len(fileClass.JsonlFiles))
 }
 
+func TestScanExcludesMacOSSidecarsWithoutConsumingDatasetBudget(t *testing.T) {
+	files := &dvCom.RepoFilesClass{
+		AllFiles: make(map[string]*dvCom.RepoFile), ParquetFiles: make(map[string]*dvCom.RepoFile),
+		JsonlFiles: make(map[string]*dvCom.RepoFile), CsvFiles: make(map[string]*dvCom.RepoFile),
+		MediaFiles: make(map[string]*dvCom.RepoFile),
+	}
+	for _, name := range []string{"train/._data.jsonl", "._test.parquet", "__MACOSX/data.csv", "nested/__MACOSX/picture.png", ".DS_Store"} {
+		appendFile(&types.File{Name: filepath.Base(name), Path: name, Size: 4096}, files, 100)
+	}
+	appendFile(&types.File{Name: "data.jsonl", Path: "train/data.jsonl", Size: 80}, files, 100)
+	require.Len(t, files.AllFiles, 1)
+	require.Contains(t, files.JsonlFiles, "train/data.jsonl")
+	require.Equal(t, int64(80), files.TotalJsonSize)
+	require.Zero(t, files.TotalParquetSize)
+	require.Zero(t, files.TotalCsvSize)
+	require.Zero(t, files.TotalMediaSize)
+}
+
 func TestIsValidMediaFile(t *testing.T) {
 	valid := []string{
 		"videos/00001.mp4", "data/clip.MP4", "img/cat.jpg", "img/cat.JPEG", "a.png",

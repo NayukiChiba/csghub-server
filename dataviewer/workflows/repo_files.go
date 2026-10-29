@@ -3,6 +3,7 @@ package workflows
 import (
 	"context"
 	"fmt"
+	"path"
 	"strings"
 
 	"opencsg.com/csghub-server/builder/git/gitserver"
@@ -140,6 +141,9 @@ func getAllFiles(req dvCom.RepoFilesReq, fileClass *dvCom.RepoFilesClass) error 
 }
 
 func appendFile(file *types.File, fileClass *dvCom.RepoFilesClass, limitSize int64) {
+	if isDatasetSidecar(file.Path) || isDatasetSidecar(file.Name) {
+		return
+	}
 	repoFile := &dvCom.RepoFile{
 		File:         file,
 		DownloadSize: file.Size,
@@ -216,4 +220,19 @@ func appendFile(file *types.File, fileClass *dvCom.RepoFilesClass, limitSize int
 		fileClass.TotalMediaSize += fileClass.MediaFiles[file.Path].DownloadSize
 		return
 	}
+}
+
+// macOS resource forks carry the data file's suffix but contain filesystem
+// metadata, not records. Exclude them before classification and size accounting.
+func isDatasetSidecar(name string) bool {
+	base := path.Base(name)
+	if strings.HasPrefix(base, "._") || base == ".DS_Store" {
+		return true
+	}
+	for _, directory := range strings.Split(name, "/") {
+		if directory == "__MACOSX" {
+			return true
+		}
+	}
+	return false
 }

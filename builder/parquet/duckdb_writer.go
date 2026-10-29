@@ -97,11 +97,6 @@ func (r *duckdbWriter) ConvertToParquet(ctx context.Context, method string, objN
 			return err
 		}
 	}
-	if method == "read_json_auto" {
-		if _, err := r.db.ExecContext(ctx, "INSTALL json; LOAD json;"); err != nil {
-			return fmt.Errorf("failed to setup json for duckdb, cause:%w", err)
-		}
-	}
 	if method == "read_csv_auto" {
 		if err := r.exportCSVFiles(ctx, objNames, thread, staging); err != nil {
 			return err
@@ -111,12 +106,39 @@ func (r *duckdbWriter) ConvertToParquet(ctx context.Context, method string, objN
 		if limit <= 0 {
 			limit = 128 << 20
 		}
-		query := r.jsonExportQuery(objNames, limit)
-		if err := r.exportQuery(ctx, query, thread, staging); err != nil {
+		if err := r.exportJSONFiles(ctx, objNames, thread, staging, limit); err != nil {
 			return err
 		}
 	}
 	return publishParquetExport(staging, output)
+}
+
+func (r *duckdbWriter) exportJSONFiles(ctx context.Context, objects []string, threads int, staging string, limit int64) error {
+	paths, local := localJSONPaths(objects)
+	budget := r.cfg.DataViewer.JSONInferenceMaxBytes
+	if budget <= 0 {
+		budget = 64 << 20
+	}
+	if local && !jsonInputsFitInferenceBudget(objects, budget) {
+		return writeJSONRecords(ctx, paths, staging, limit)
+	}
+	if _, err := r.db.ExecContext(ctx, "INSTALL json; LOAD json;"); err != nil {
+		return fmt.Errorf("failed to setup json for duckdb: %w", err)
+	}
+	err := r.exportQuery(ctx, r.jsonExportQuery(objects, limit), threads, staging)
+	if err == nil || !local || !strings.Contains(err.Error(), "Out of Memory Error:") {
+		return err
+	}
+	// A small but very wide/nested schema can also exhaust inference memory.
+	// Retain complete records, and discard only this attempt's temporary shards.
+	slog.WarnContext(ctx, "JSON type inference exceeded memory budget; preserving raw records")
+	if err := os.RemoveAll(staging); err != nil {
+		return err
+	}
+	if err := os.Mkdir(staging, 0700); err != nil {
+		return err
+	}
+	return writeJSONRecords(ctx, paths, staging, limit)
 }
 
 // Full JSON type inference can retain many times the input size in native
@@ -129,6 +151,9 @@ func (r *duckdbWriter) jsonExportQuery(objects []string, objectLimit int64) stri
 	if !jsonInputsFitInferenceBudget(objects, budget) {
 		return fmt.Sprintf("SELECT json AS record FROM read_json_objects([%s], format='auto', maximum_object_size=%d)", strings.Join(objects, ","), objectLimit)
 	}
+	// These local files together fit in budget, so no record can be larger.
+	// Avoid large native reader allocations when operators raise the raw limit.
+	objectLimit = min(objectLimit, budget)
 	options := fmt.Sprintf(", union_by_name=true, maximum_object_size=%d, sample_size=-1, timestampformat='%s', dateformat='%s'", objectLimit, "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%d")
 	return fmt.Sprintf("SELECT * FROM read_json_auto([%s]%s)", strings.Join(objects, ","), options)
 }
