@@ -136,6 +136,7 @@ func (r *duckdbWriter) exportCSVFiles(ctx context.Context, objects []string, thr
 	if header != "auto" {
 		options += ", header=" + header
 	}
+	sequence := 0
 	for i, object := range objects {
 		dir := filepath.Join(staging, fmt.Sprintf("csv-%d", i))
 		query := fmt.Sprintf("SELECT * FROM read_csv_auto(%s%s)", object, options)
@@ -147,10 +148,12 @@ func (r *duckdbWriter) exportCSVFiles(ctx context.Context, objects []string, thr
 			return err
 		}
 		for _, file := range files {
-			name := fmt.Sprintf("%d-%s", i, file.Name())
+			// UploadParquetFiles uses a numeric stem to assign repository paths.
+			name := fmt.Sprintf("%d.parquet", sequence)
 			if err := os.Rename(filepath.Join(dir, file.Name()), filepath.Join(staging, name)); err != nil {
 				return err
 			}
+			sequence++
 		}
 		if err := os.Remove(dir); err != nil {
 			return err

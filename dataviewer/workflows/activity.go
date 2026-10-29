@@ -328,12 +328,37 @@ func (dva *dataViewerActivityImpl) CheckIfNeedRebuild(ctx context.Context, check
 	}
 
 	newMD5 := GetCardDataMD5(checkParam.Card)
-	if viewer.DataviewerJob.CardMD5 == newMD5 {
+	if viewer.DataviewerJob.CardMD5 == newMD5 && hasReusableViewerMetadata(viewer.DataviewerJob) {
 		slog.Warn("card data md5 not changed, no need to rebuild", slog.Any("req", checkParam.Req),
 			slog.Any("card", checkParam.Card), slog.Any("newMD5", newMD5))
 		return false, nil
 	}
 	return true, nil
+}
+
+// A successful status and unchanged sources are insufficient if a previous
+// upload silently omitted all shards. Such results must be rebuilt.
+func hasReusableViewerMetadata(job *database.DataviewerJob) bool {
+	if job == nil || job.Status != types.WorkflowDone {
+		return false
+	}
+	var card struct {
+		Rows         *int64              `json:"rows_num"`
+		DatasetInfos []dvCom.DatasetInfo `json:"dataset_info"`
+	}
+	if err := json.Unmarshal([]byte(job.CardData), &card); err != nil || card.Rows == nil || *card.Rows < 0 {
+		return false
+	}
+	hasFiles := false
+	for _, info := range card.DatasetInfos {
+		for _, split := range info.Splits {
+			if len(split.Origins) > 0 && len(split.Files) == 0 {
+				return false
+			}
+			hasFiles = hasFiles || len(split.Files) > 0
+		}
+	}
+	return hasFiles
 }
 
 func (dva *dataViewerActivityImpl) CreateParquetBranch(ctx context.Context, req types.UpdateViewerReq) (string, error) {
@@ -890,7 +915,7 @@ func collectUploadParquetPaths(uploadReq dvCom.UploadParquetReq) ([]string, erro
 				fileNameSeq := fileName[:len(fileName)-len(extName)]
 				fileNameSeqInt, err := strconv.Atoi(fileNameSeq)
 				if err != nil {
-					continue
+					return nil, fmt.Errorf("invalid exported parquet shard name %q: %w", fileName, err)
 				}
 				newFileName := fmt.Sprintf("%05d%s", fileNameSeqInt, extName)
 				paths = append(paths, fmt.Sprintf("%s/%s/%s", subset.ConfigName, split.Name, newFileName))
@@ -945,8 +970,7 @@ func (dva *dataViewerActivityImpl) UploadParquetFiles(ctx context.Context, uploa
 					fileNameSeq := fileName[:len(fileName)-len(extName)]
 					fileNameSeqInt, err := strconv.Atoi(fileNameSeq)
 					if err != nil {
-						slog.Warn("invalid file name to int error", slog.Any("fileName", fileName), slog.Any("ExportPath", split.ExportPath), slog.Any("error", err))
-						continue
+						return nil, fmt.Errorf("invalid exported parquet shard name %q: %w", fileName, err)
 					}
 					fileInfo, err := entry.Info()
 					if err != nil {
